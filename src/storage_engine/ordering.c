@@ -24,6 +24,17 @@ static uint64_t doubleToBits(double d) {
     return bits;
 }
 
+/*
+reverses byte order of the first len bytes of buf in place.
+*/
+static void reverseNBytes(char* buf, int len) {
+    for (int i = 0, j = len - 1; i < j; i++, j--) {
+        char tmp = buf[i];
+        buf[i] = buf[j];
+        buf[j] = tmp;
+    }
+}
+
 static uint64_t reverseBits64(uint64_t x) {
     x = (x >> 32) | (x << 32);
     x = ((x & 0xFFFF0000FFFF0000ULL) >> 16) | ((x & 0x0000FFFF0000FFFFULL) << 16);
@@ -46,7 +57,7 @@ static page_num numericalPageNum(uint64_t key, ordering_type type) {
 converts a primary key value into an internal ordering key
 floats -> type punned to 64bit integers, sign-bit adjusted for correct unsigned ordering
 ints -> casted to unsigned 64bit integers (-1 -> 2^64 - 1) and bit inverted for dispersion
-strings -> extended if necessary to TEXT_KEY_LENGTH_MINIMUM bytes using STX padding
+strings -> extended if necessary to TEXT_KEY_LENGTH_MINIMUM bytes using STX padding, then byte-reversed for dispersion (see reverseKeyBytes)
 uints -> casted to unsigned 64bit integers
 callocs pageNum and offset for text primary keys
 */
@@ -86,6 +97,7 @@ ordering_key pkToOk(value pk) {
 			} else {
 				strncpy(key, pk.as.text, len);
 			}
+			reverseKeyBytes(key, paddedLen);
 			out.pageNum.type = ORDERING_STRING;
 			memset(out.pageNum.as.string, 0, sizeof(out.pageNum.as.string));
 			strncpy(out.pageNum.as.string, key, paddedLen - OFFSET_BITS);

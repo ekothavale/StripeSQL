@@ -682,7 +682,11 @@ static interpret_result run() {
 					printf("Entry with primary key: ");
 					printPK(pk);
 					printf(" already exists\n");
-				} else insertRecord(&r, ik, t);
+				} else if (!insertRecord(&r, ik, t)) {
+					printf("Failed to insert entry with primary key: ");
+					printPK(pk);
+					printf(" (page full)\n");
+				}
 				free(entries);  // page owns the data pointers; release only the metadata array
 				break;
 			}
