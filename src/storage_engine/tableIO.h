@@ -98,6 +98,7 @@ void condenseStripe(table* t);
 void condenseAll(table* t);
 
 // for testing purposes
-
+address currentPageStripeStart(table* t);
+address currentNodeStripeStart(table* t);
 
 #endif

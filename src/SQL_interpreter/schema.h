@@ -33,6 +33,7 @@ table names are stored as hashes and all column names are length prefixed
 #define SCHEMA_PATH "tables/schema.scma"
 #define SCHEMA_MAGIC 0xFFBB8844
 
+
 // Public API — callable from outside this translation unit
 // (readEntries and writeEntries are file-scoped static helpers)
 void initSchema();

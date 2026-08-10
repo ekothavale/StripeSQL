@@ -54,12 +54,16 @@ static void close_table_keep_file(table* t) {
     freeTable(t);
 }
 
-/* Compute the file offset at which the current stripes end — the boundary
-   at which allocPage/allocNode triggers a new stripe. */
-static uint64_t stripe_boundary(table* t) {
-    return (uint64_t)t->metalen
-         + (uint64_t)t->pageStripes * t->pageStripeLen * t->pageSize
-         + (uint64_t)t->nodeStripes * t->nodeStripeLen * t->nodeSize;
+/* Compute the file offset at which the current page/node stripe ends — the
+   boundary at which allocPage/allocNode triggers a new stripe. Page and node
+   addressing are independent (see currentPageStripeStart/
+   currentNodeStripeStart in tableIO.c), so these are two separate
+   computations, not a single shared boundary. */
+static uint64_t page_stripe_boundary(table* t) {
+    return (uint64_t)currentPageStripeStart(t) + (uint64_t)t->pageStripeLen * t->pageSize;
+}
+static uint64_t node_stripe_boundary(table* t) {
+    return (uint64_t)currentNodeStripeStart(t) + (uint64_t)t->nodeStripeLen * t->nodeSize;
 }
 
 // ##########################################################################################################################################
@@ -291,8 +295,12 @@ static table make_test_table(void) {
     t.pageNodeRatio = 2;
     t.pageSize = TEST_PAGE_SIZE;
     t.nodeSize = TEST_NODE_SIZE;
-    t.pageFree = t.metalen;
-    t.nodeFree = (uint64_t)t.metalen + (uint64_t)t.pageStripes * t.pageStripeLen * t.pageSize;
+    // layout is [node stripe][pageNodeRatio page stripes] per unit — node
+    // stripe 1 starts immediately after the header, page stripe 1 right
+    // after that (matches createTable(); see currentPageStripeStart/
+    // currentNodeStripeStart in tableIO.c)
+    t.nodeFree = t.metalen;
+    t.pageFree = (uint64_t)t.metalen + (uint64_t)t.nodeStripeLen * t.nodeSize;
     t.root = 0;
     t.M = M_GLOBAL;
     // Inline dirty-table initialisation (setStacks is static in tableIO.c)
@@ -585,7 +593,7 @@ void test_alloc_page_stripe(void) {
     printf("  test_alloc_page_stripe ... ");
     table t = make_test_table();
 
-    uint64_t boundary = stripe_boundary(&t);
+    uint64_t boundary = page_stripe_boundary(&t);
     t.pageFree = boundary;
     int old_stripes = t.pageStripes;
 
@@ -606,7 +614,7 @@ void test_alloc_page_after_stripe(void) {
     printf("  test_alloc_page_after_stripe ... ");
     table t = make_test_table();
 
-    uint64_t boundary = stripe_boundary(&t);
+    uint64_t boundary = page_stripe_boundary(&t);
     t.pageFree = boundary;
 
     allocPage(&t);                       // crosses boundary, pageStripes++
@@ -639,14 +647,20 @@ void test_alloc_node_stripe(void) {
     printf("  test_alloc_node_stripe ... ");
     table t = make_test_table();
 
-    uint64_t boundary = stripe_boundary(&t);
+    uint64_t boundary = node_stripe_boundary(&t);
     t.nodeFree = boundary;
     int old_stripes = t.nodeStripes;
 
     address addr = allocNode(&t);
 
-    assert(addr          == boundary);
+    // Unlike pages (pageNodeRatio stripes per unit), a node stripe is always
+    // exactly 1 per unit, so crossing a node-stripe boundary always starts a
+    // brand new unit — the new stripe does NOT start at the old stripe's
+    // end (boundary), it starts after that whole unit's page-stripe
+    // allotment too. Check against the freshly-recomputed current node
+    // stripe start rather than the pre-rollover boundary value.
     assert(t.nodeStripes == old_stripes + 1);
+    assert(addr          == currentNodeStripeStart(&t));
 
     free_test_table(&t);
     printf("PASS\n");
@@ -656,13 +670,13 @@ void test_alloc_node_after_stripe(void) {
     printf("  test_alloc_node_after_stripe ... ");
     table t = make_test_table();
 
-    uint64_t boundary = stripe_boundary(&t);
+    uint64_t boundary = node_stripe_boundary(&t);
     t.nodeFree = boundary;
 
-    allocNode(&t);
-    address next = allocNode(&t);
+    address first = allocNode(&t);      // crosses boundary, nodeStripes++
+    address next  = allocNode(&t);      // should be first + nodeSize
 
-    assert(next == boundary + TEST_NODE_SIZE);
+    assert(next == first + TEST_NODE_SIZE);
 
     free_test_table(&t);
     printf("PASS\n");
@@ -922,9 +936,12 @@ void test_create_table_fields(void) {
     assert(t->M         == M_GLOBAL);
     assert(t->root      == 0);
     assert(t->metalen   == METALEN * 4);
-    assert(t->pageFree  == (address)(METALEN * 4));
-    assert(t->nodeFree  == (address)(METALEN * 4)
-                         + (address)t->pageStripes * t->pageStripeLen * t->pageSize);
+    // layout is [node stripe][pageNodeRatio page stripes] per unit — node
+    // stripe 1 starts immediately after the header, page stripe 1 right
+    // after that
+    assert(t->nodeFree  == (address)(METALEN * 4));
+    assert(t->pageFree  == (address)(METALEN * 4)
+                         + (address)t->nodeStripeLen * t->nodeSize);
     deleteTable(t);
     printf("PASS\n");
 }

@@ -390,19 +390,18 @@ static uint64_t hashAddress(address key) {
 
 /*
 finds an entry in the given entries array for the given key
-resolves collisions via quadratic probing
+resolves collisions via linear probing
 compares the actual key (not just its hash) so hash collisions can't misidentify a match
 returns the matching entry if key is present, else the first empty slot found
 */
 static addr_entry* findAddrEntry(address key, addr_entry* entries, int capacity) {
 	uint64_t hash = hashAddress(key);
-	uint64_t velocity = 0;
-	for (;;) {
-		uint64_t index = (hash + velocity * velocity) % capacity;
+	for (uint64_t i = 0; i < (uint64_t)capacity; i++) {
+		uint64_t index = (hash + i) % capacity;
 		addr_entry* found = &entries[index];
 		if (found->key == key || found->key == 0) return found;
-		velocity++;
 	}
+	return NULL; // unreachable: capacity always exceeds count, so an empty slot always exists
 }
 
 /*
@@ -506,9 +505,12 @@ table* createTable(char* tablename) {
 	t->pageSize      = PAGE_SIZE;
 	t->nodeSize      = 49 + M_GLOBAL * (8 + PAGE_NUM_DISK_SIZE); // 49B fixed header + M children (8B) + M keys (PAGE_NUM_DISK_SIZE)
 	t->M             = M_GLOBAL;
-	t->pageFree      = t->metalen;
-	t->nodeFree      = (uint64_t)t->metalen
-	                 + (uint64_t)t->pageStripes * t->pageStripeLen * t->pageSize;
+	// layout is [node stripe][pageNodeRatio page stripes] per unit — node
+	// stripe 1 starts immediately after the header, page stripe 1 right
+	// after that (see unitStart/currentPageStripeStart/currentNodeStripeStart)
+	t->nodeFree      = t->metalen;
+	t->pageFree      = (uint64_t)t->metalen
+	                 + (uint64_t)t->nodeStripeLen * t->nodeSize;
 	t->root          = 0;
 	t->name          = strdup(tablename);
 
@@ -906,7 +908,7 @@ void deleteObject(address address, table* t) {
 }
 
 /*
-Empties a table's write tables and makes the changes to the file on disk
+empties a table's write tables and makes the changes to the file on disk
 */
 void commit(table* t) {
 	for (int i = 0; i < t->pageDirty.capacity; i++) {
@@ -992,25 +994,68 @@ page | page | ... | page
 
 header at beginning of file
 a node stripe will always be first
-then M page stripes will follow
+then pageNodeRatio page stripes will follow
+
+this group is a "unit". Page addressing and node
+addressing are each a pure function of their own stripe count and
+pageNodeRatio so that pages and nodes can be allocated at completely
+different rates without their addressing ever computing an overlapping
+address for either type.
 */
+
+/*
+total bytes occupied by one full unit: 1 node stripe + pageNodeRatio page stripes
+*/
+static uint64_t unitByteSize(table* t) {
+	return (uint64_t)t->nodeStripeLen * t->nodeSize
+	     + (uint64_t)t->pageNodeRatio * t->pageStripeLen * t->pageSize;
+}
+
+/*
+byte offset where the given (0-indexed) unit begins
+*/
+static address unitStart(table* t, int unitIndex) {
+	return t->metalen + (uint64_t)unitIndex * unitByteSize(t);
+}
+
+/*
+start address of the current (t->pageStripes-th, 1-indexed) page stripe
+exposed (non-static) for test use
+*/
+address currentPageStripeStart(table* t) {
+	int stripeIdx = t->pageStripes - 1; // 0-indexed
+	int unitIndex = stripeIdx / t->pageNodeRatio;
+	int posInUnit = stripeIdx % t->pageNodeRatio;
+	return unitStart(t, unitIndex)
+	     + (uint64_t)t->nodeStripeLen * t->nodeSize
+	     + (uint64_t)posInUnit * t->pageStripeLen * t->pageSize;
+}
+
+/*
+start address of the current (t->nodeStripes-th, 1-indexed) node stripe
+exposed (non-static) for test use
+*/
+address currentNodeStripeStart(table* t) {
+	int unitIndex = t->nodeStripes - 1; // 0-indexed
+	return unitStart(t, unitIndex);
+}
 
 // allocate new stripe
 /*
 allocates a new stripe and sets table.pageFree to that address
 */
 static void newPageStripe(table* t) {
-	t->pageFree = t->metalen + t->pageStripes * t->pageStripeLen * t->pageSize + t->nodeStripes * t->nodeStripeLen * t->nodeSize;
 	t->pageStripes++;
+	t->pageFree = currentPageStripeStart(t);
 }
 
 static void newNodeStripe(table* t) {
-	t->nodeFree = t->metalen + t->pageStripes * t->pageStripeLen * t->pageSize + t->nodeStripes * t->nodeStripeLen * t->nodeSize;
 	t->nodeStripes++;
+	t->nodeFree = currentNodeStripeStart(t);
 }
 
 address allocPage(table* t) {
-	if (t->pageFree == t->metalen + t->pageStripes * t->pageStripeLen * t->pageSize) {
+	if (t->pageFree >= currentPageStripeStart(t) + (uint64_t)t->pageStripeLen * t->pageSize) {
 		newPageStripe(t);
 	}
 	address out = t->pageFree;
@@ -1019,7 +1064,7 @@ address allocPage(table* t) {
 }
 
 address allocNode(table* t) {
-	if (t->nodeFree == t->metalen + t->pageStripes * t->pageStripeLen * t->pageSize + t->nodeStripes * t->nodeStripeLen * t->nodeSize) {
+	if (t->nodeFree >= currentNodeStripeStart(t) + (uint64_t)t->nodeStripeLen * t->nodeSize) {
 		newNodeStripe(t);
 	}
 	address out = t->nodeFree;
