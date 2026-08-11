@@ -18,7 +18,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 
 #include "generator.h"
 #include "../common.h"
-#include "hashtable.h"
+#include "schema.h"
 #include <strings.h>
 
 #define MAX_IDENT_LEN 256
@@ -421,10 +421,11 @@ static void munchExpr(ast_node* node, chunk* c, hashtable* ht, schema* s) {
 // ##########################################################################################################################################
 // MUNCH STATEMENT
 
-static void munchStmt(ast_node* node, chunk* c, hashtable* ht) {
+// returns false if a statement references a table with no known schema
+static bool munchStmt(ast_node* node, chunk* c, hashtable* ht) {
 	switch(node->type) {
 		case TYPE_QUERY: {
-			munchStmt(node->children[0], c, ht);
+			if (!munchStmt(node->children[0], c, ht)) return false;
 			writeChunk(c, OP_HALT, 0);
 			break;
 		}
@@ -455,6 +456,10 @@ static void munchStmt(ast_node* node, chunk* c, hashtable* ht) {
 			char tname[MAX_IDENT_LEN];
 			tokenToStr(node->children[1]->tok, tname);
 			schema* s = lookupSchema(tname, ht);
+			if (!s) {
+				printf("Error: table '%s' does not exist\n", tname);
+				return false;
+			}
 
 			// get primary key index
 			uint8_t pkIdx = getPkIdx(s);
@@ -550,6 +555,10 @@ static void munchStmt(ast_node* node, chunk* c, hashtable* ht) {
 			tokenToStr(node->children[0]->tok, tname);
 			uint32_t hash = hashString(tname, strlen(tname));
 			schema* s = readHT(hash, ht);
+			if (!s) {
+				printf("Error: table '%s' does not exist\n", tname);
+				return false;
+			}
 
 			// obtain primary key index
 			uint8_t pkIdx = getPkIdx(s);
@@ -598,6 +607,10 @@ static void munchStmt(ast_node* node, chunk* c, hashtable* ht) {
 			char tname[MAX_IDENT_LEN];
 			tokenToStr(node->children[0]->tok, tname);
 			schema* s = lookupSchema(tname, ht);
+			if (!s) {
+				printf("Error: table '%s' does not exist\n", tname);
+				return false;
+			}
 
 			uint8_t pkIdx = getPkIdx(s);
 
@@ -661,6 +674,10 @@ static void munchStmt(ast_node* node, chunk* c, hashtable* ht) {
 			char tname[MAX_IDENT_LEN];
 			tokenToStr(node->children[0]->tok, tname);
 			schema* s = lookupSchema(tname, ht);
+			if (!s) {
+				printf("Error: table '%s' does not exist\n", tname);
+				return false;
+			}
 
 			uint8_t pkIdx = getPkIdx(s);
 
@@ -816,11 +833,13 @@ static void munchStmt(ast_node* node, chunk* c, hashtable* ht) {
 		default:
 			break;
 	}
+	return true;
 }
 
 /*
-takes the given AST and converts it to bytecode, filling a chunk
+takes the given AST and converts it to bytecode, filling a chunk.
+returns false if a statement references a table with no known schema.
 */
-void generate(ast_node* root, chunk* c, hashtable* schema) {
-	munchStmt(root, c, schema);
+bool generate(ast_node* root, chunk* c, hashtable* schema) {
+	return munchStmt(root, c, schema);
 }

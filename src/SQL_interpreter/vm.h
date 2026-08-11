@@ -20,7 +20,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 #define VM_H
 
 #include "chunk.h"
-#include "hashtable.h"
+#include "schema.h"
 #include "../value.h"
 #include "../storage_engine/bplus.h"
 #include "../storage_engine/tableIO.h"

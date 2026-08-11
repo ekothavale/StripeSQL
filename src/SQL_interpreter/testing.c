@@ -1,3 +1,21 @@
+/*
+Copyright (c) 2026 Ethan Kothavale
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software
+and associated documentation files (the "Software"), to deal in the Software without restriction,
+including without limitation the rights to use, copy, modify, merge, publish, distribute,
+sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
+BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+*/
+
 #include "testing.h"
 
 // ##########################################################################################################################################
@@ -301,9 +319,14 @@ static hashtable make_test_table(void) {
 static schema make_schema(const char* name, int col_count) {
     schema s;
     s.hash      = hashString(name, (int)strlen(name));
-    s.tablename = (char*)name;
-    s.colNames  = NULL;
-    s.colTypes  = NULL;
+    s.tablename = strdup(name);
+    s.colNames  = malloc(col_count * sizeof(char*));
+    for (int i = 0; i < col_count; i++) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "col%d", i);
+        s.colNames[i] = strdup(buf);
+    }
+    s.colTypes  = calloc(col_count, 1);
     s.count     = col_count;
     return s;
 }
@@ -406,6 +429,13 @@ void test_insert_ht_overwrites() {
     assert(found        != NULL);
     assert(found->count == 5);   // s2 overwrote s1
     assert(t.count      == 2);   // raw insert count, not unique-entry count
+    // insertHT() doesn't free a slot's previous contents on overwrite — the
+    // table only references s2 now, so s1's own heap fields are still ours
+    // to free (freeHashTable() below only reaches s2's, via the live slot)
+    for (int i = 0; i < s1.count; i++) free(s1.colNames[i]);
+    free(s1.colNames);
+    free(s1.colTypes);
+    free(s1.tablename);
     freeHashTable(&t);
 }
 
@@ -518,13 +548,28 @@ static const char* schema_path(void) {
 
 // --- loadSchema ---
 
-void test_load_schema_null_on_missing() {
+void test_load_schema_bootstraps_on_missing() {
+    // loadSchema() self-heals a missing schema file rather than failing: it's
+    // the only place in the codebase that calls initSchema(), and interpret()
+    // treats a NULL return as a hard load error, so a fresh checkout (tables/
+    // is gitignored) would be unable to run even a first CREATE TABLE if this
+    // returned NULL instead.
     remove(schema_path());  // guarantee file is absent
-    hashtable* ht  = loadSchema();
-    hashtable* ht2 = loadSchema();  // second call is equally NULL
-    assert(ht  == NULL);
-    assert(ht2 == NULL);
-    assert(ht  == ht2);  // both callers get NULL
+    hashtable* ht = loadSchema();
+    assert(ht != NULL);          // missing file is bootstrapped, not an error
+    assert(ht->count    == 0);
+    assert(ht->capacity == 0);
+    assert(ht->entries  == NULL);
+    FILE* check = fopen(schema_path(), "rb");
+    assert(check != NULL);       // loadSchema() created the file on disk
+    fclose(check);
+    free(ht);
+
+    hashtable* ht2 = loadSchema();  // file now exists; second call loads it back
+    assert(ht2 != NULL);
+    assert(ht2->count == 0);
+    free(ht2);
+    remove(schema_path());
 }
 
 void test_load_schema_null_on_bad_magic() {
@@ -604,15 +649,17 @@ void test_save_load_schema_with_cols_and_types() {
 
     schema s;
     s.hash      = hashString("users", 5);
-    s.tablename = "users";
+    s.tablename = strdup("users");
     s.colNames  = cols;
     s.colTypes  = types;
     s.count     = 2;
 
+    // insertHT() shallow-copies s's pointers into t's storage, so t now owns
+    // tablename/colNames/colTypes; freeHashTable() below frees them — no
+    // separate free of s/cols/types here, that would double-free
     insertHT(&s, &t);
     saveSchema(&t);
     freeHashTable(&t);
-    free(cols[0]); free(cols[1]); free(cols); free(types);
 
     hashtable* loaded = loadSchema();
     assert(loaded != NULL);
@@ -626,10 +673,9 @@ void test_save_load_schema_with_cols_and_types() {
     assert((uint8_t)found->colTypes[0] == 2);
     assert((uint8_t)found->colTypes[1] == 0);
 
-    for (int i = 0; i < found->count; i++) free(found->colNames[i]);
-    free(found->colNames);
-    free(found->colTypes);
-    free(found->tablename);
+    // found aliases directly into loaded->entries (readHT/findEntry return a
+    // pointer into the table, not a copy), so freeHashTable() below already
+    // frees its fields — freeing them here too would double-free
     freeHashTable(loaded);
     free(loaded);
     remove(schema_path());
@@ -638,7 +684,7 @@ void test_save_load_schema_with_cols_and_types() {
 // --- master ---
 
 void test_schema() {
-    test_load_schema_null_on_missing();
+    test_load_schema_bootstraps_on_missing();
     test_load_schema_null_on_bad_magic();
     test_save_schema_no_crash();
     test_save_schema_writes_magic();
@@ -1204,16 +1250,19 @@ static bool has_opcode(chunk* c, uint8_t op) {
     return false;
 }
 
-// Build a pre-allocated hashtable with a "users" schema (id, name).
+// Build a pre-allocated hashtable with a "users" schema (id PK int, name text).
 static hashtable make_users_ht(void) {
     hashtable ht = make_test_table();
-    static char* cols[] = { "id", "name" };
-    schema s = {
-        .hash = hashString("users", 5),
-        .tablename = "users",
-        .colNames = cols,
-        .count = 2,
-    };
+    schema s;
+    s.hash        = hashString("users", 5);
+    s.tablename   = strdup("users");
+    s.colNames    = malloc(2 * sizeof(char*));
+    s.colNames[0] = strdup("id");
+    s.colNames[1] = strdup("name");
+    s.colTypes    = malloc(2);
+    s.colTypes[0] = (CONSTRAINT_PRIMARY_KEY   << 5) | SQL_INT;
+    s.colTypes[1] = (CONSTRAINT_UNCONSTRAINED << 5) | SQL_TEXT;
+    s.count       = 2;
     insertHT(&s, &ht);
     return ht;
 }
@@ -1238,7 +1287,11 @@ void test_generate_select_emits_scan_opcodes(void) {
     freeAST(ast); freeChunk(&c); freeHashTable(&ht);
 }
 
-void test_generate_select_where_emits_filter(void) {
+void test_generate_select_where_pk_uses_key_search(void) {
+    // WHERE on the primary key is recognized by checkWhereForPK() and takes
+    // the direct-lookup fast path (OP_KEY_SEARCH) instead of a linear scan
+    // with a filter, so the condition itself is never compiled through
+    // munchExpr — no OP_EQUAL / OP_JUMP_FALSE is emitted for it.
     tokenized t = lexQuery("select * from users where id = 1");
     ast_node* ast = compile(t);
     free(t.tokens);
@@ -1247,10 +1300,11 @@ void test_generate_select_where_emits_filter(void) {
     chunk c; initChunk(&c);
     generate(ast, &c, &ht);
 
-    // WHERE id = 1 must produce a comparison and a conditional jump
-    assert(has_opcode(&c, OP_COLUMN));
-    assert(has_opcode(&c, OP_EQUAL));
-    assert(has_opcode(&c, OP_JUMP_FALSE));
+    assert(has_opcode(&c, OP_OPEN_SCAN));
+    assert(has_opcode(&c, OP_KEY_SEARCH));
+    assert(!has_opcode(&c, OP_EQUAL));
+    assert(!has_opcode(&c, OP_JUMP_FALSE));
+    assert(c.code[c.count - 1] == OP_HALT);
 
     freeAST(ast); freeChunk(&c); freeHashTable(&ht);
 }
@@ -1260,7 +1314,7 @@ void test_generate_insert_emits_insert_row(void) {
     ast_node* ast = compile(t);
     free(t.tokens);
 
-    hashtable ht = make_test_table();
+    hashtable ht = make_users_ht();
     chunk c; initChunk(&c);
     generate(ast, &c, &ht);
 
@@ -1344,7 +1398,7 @@ void test_generate_expr_arithmetic(void) {
     ast_node* ast = compile(t);
     free(t.tokens);
 
-    hashtable ht = make_test_table();
+    hashtable ht = make_users_ht();
     chunk c; initChunk(&c);
     generate(ast, &c, &ht);
 
@@ -1361,7 +1415,7 @@ void test_generate_expr_logical_and(void) {
     ast_node* ast = compile(t);
     free(t.tokens);
 
-    hashtable ht = make_test_table();
+    hashtable ht = make_users_ht();
     chunk c; initChunk(&c);
     generate(ast, &c, &ht);
 
@@ -1375,7 +1429,7 @@ void test_generate_expr_logical_and(void) {
 
 void test_generator(void) {
     test_generate_select_emits_scan_opcodes();
-    test_generate_select_where_emits_filter();
+    test_generate_select_where_pk_uses_key_search();
     test_generate_insert_emits_insert_row();
     test_generate_delete_emits_delete_row();
     test_generate_update_emits_update_col();
@@ -1478,12 +1532,19 @@ void test_vm_free_no_crash(void) {
 
 // --- interpret ---
 
-void test_interpret_no_schema_returns_load_error(void) {
-    // No .scma file exists at ../../tables/schema.scma relative to the build
-    // directory, so loadSchema() returns NULL and interpret() short-circuits.
-    assert(interpret("select * from users").ir == INTERPRET_LOAD_ERROR);
-    assert(interpret("insert into users values (1)").ir == INTERPRET_LOAD_ERROR);
-    assert(interpret("create table t (id int)").ir == INTERPRET_LOAD_ERROR);
+void test_interpret_missing_table_returns_compile_error(void) {
+    // loadSchema() self-heals a missing schema file instead of returning NULL
+    // (see test_load_schema_bootstraps_on_missing), so querying a table that
+    // simply isn't registered in that (now valid, empty) schema no longer
+    // reaches INTERPRET_LOAD_ERROR — it's caught by generate()'s table-exists
+    // check instead, which reports a normal compile error rather than letting
+    // munchStmt dereference a NULL schema.
+    remove(schema_path());  // start from a fresh, self-healed schema
+    assert(interpret("select * from ghost").ir == INTERPRET_COMPILE_ERROR);
+    assert(interpret("insert into ghost values (1)").ir == INTERPRET_COMPILE_ERROR);
+    assert(interpret("update ghost set x = 1 where id = 1").ir == INTERPRET_COMPILE_ERROR);
+    assert(interpret("delete from ghost where id = 1").ir == INTERPRET_COMPILE_ERROR);
+    remove(schema_path());
 }
 
 // --- master ---
@@ -1494,7 +1555,7 @@ void test_vm(void) {
     test_vm_push_pop_bool();
     test_vm_push_pop_null();
     test_vm_free_no_crash();
-    test_interpret_no_schema_returns_load_error();
+    test_interpret_missing_table_returns_compile_error();
     printf("All VM tests passed.\n");
 }
 

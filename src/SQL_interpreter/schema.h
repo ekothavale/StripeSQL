@@ -28,14 +28,46 @@ table names are stored as hashes and all column names are length prefixed
 #define SCHEMA_H
 
 #include "../common.h"
-#include "hashtable.h"
 
 #define SCHEMA_PATH "tables/schema.scma"
 #define SCHEMA_MAGIC 0xFFBB8844
 
+#define MAX_LOAD_FACTOR 0.8 // load factor at which the hash table is resized
+
+typedef enum column_constraint{
+	CONSTRAINT_UNCONSTRAINED,
+	CONSTRAINT_NOT_NULL,
+	CONSTRAINT_PRIMARY_KEY,
+	CONSTRAINT_UNQUE,
+	CONSTRAINT_FOREIGN_KEY,
+	CONSTRAINT_CHECK,
+	CONSTRAINT_DEFAULT
+} column_constraints;
+
+typedef struct schema {
+	char** colNames; // names of columns
+	char* colTypes;// types of columns - first three bits are constraints - last five bits are sql types
+	char* tablename; // corresponding name of table (key)
+	uint32_t hash; // hash of key to id the entry
+	int count; // number of columns in the entry
+} schema;
+
+typedef struct hashtable {
+	int count;
+	int capacity;
+	schema* entries;
+} hashtable;
 
 // Public API — callable from outside this translation unit
-// (readEntries and writeEntries are file-scoped static helpers)
+// (FNV1_A, findEntry, and adjustCapacity are file-scoped static helpers)
+void initHashTable(hashtable* table);
+void freeHashTable(hashtable* table);
+uint32_t hashString(const char* key, int len);
+void insertHT(schema* e, hashtable* table);
+schema* readHT(uint32_t, hashtable* table);
+void deleteHT(uint32_t, hashtable* table);
+
+// Public API — callable from outside this translation unit
 void initSchema();
 hashtable* loadSchema();
 void saveSchema(hashtable* schema);

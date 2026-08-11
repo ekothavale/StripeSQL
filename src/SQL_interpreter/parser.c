@@ -390,7 +390,7 @@ static ast_node* orderClause() {
 	ast_node* node = makeNode(TYPE_ORDER_CLAUSE);
 	ast_node* item = makeNode(TYPE_LIST_NODE);
 	item->children[0] = expr();
-	if (peek() == TOKEN_DESC) { advance(); item->flag = true; }
+	if (peek() == TOKEN_DESC) { advance(); item->flag = FLAG_DESC; }
 	else if (peek() == TOKEN_ASC) { advance(); }
 	ast_node* head = item;
 	ast_node* tail = item;

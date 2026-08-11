@@ -22,12 +22,14 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 #include "chunk.h"
 #include "../common.h"
 #include "parser.h"
-#include "hashtable.h"
+#include "schema.h"
 
 // Public API — callable from outside this translation unit
 // (reverse_bits32, pkToIk, tokenToStr, lookupSchema, lookupColIdx,
 //  writeStaticConst, emitJump, patchJump, emitBackJump, munchExpr, munchStmt
 //  are file-scoped static helpers)
-void generate(ast_node* root, chunk* c, hashtable* schema);
+// returns false if a statement references a table with no known schema
+// (caller should treat this as a compile error and discard the chunk)
+bool generate(ast_node* root, chunk* c, hashtable* schema);
 
 #endif

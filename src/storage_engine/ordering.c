@@ -57,7 +57,7 @@ static page_num numericalPageNum(uint64_t key, ordering_type type) {
 converts a primary key value into an internal ordering key
 floats -> type punned to 64bit integers, sign-bit adjusted for correct unsigned ordering
 ints -> casted to unsigned 64bit integers (-1 -> 2^64 - 1) and bit inverted for dispersion
-strings -> extended if necessary to TEXT_KEY_LENGTH_MINIMUM bytes using STX padding, then byte-reversed for dispersion (see reverseKeyBytes)
+strings -> extended if necessary to TEXT_KEY_LENGTH_MINIMUM bytes using STX padding, then byte-reversed for dispersion (see reverseNBytes)
 uints -> casted to unsigned 64bit integers
 callocs pageNum and offset for text primary keys
 */
@@ -97,7 +97,7 @@ ordering_key pkToOk(value pk) {
 			} else {
 				strncpy(key, pk.as.text, len);
 			}
-			reverseKeyBytes(key, paddedLen);
+			reverseNBytes(key, paddedLen);
 			out.pageNum.type = ORDERING_STRING;
 			memset(out.pageNum.as.string, 0, sizeof(out.pageNum.as.string));
 			strncpy(out.pageNum.as.string, key, paddedLen - OFFSET_BITS);

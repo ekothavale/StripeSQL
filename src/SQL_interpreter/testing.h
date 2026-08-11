@@ -23,7 +23,6 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 #include <stdio.h>
 #include <unistd.h>
 #include "chunk.h"
-#include "hashtable.h"
 #include "schema.h"
 #include "lexer.h"
 #include "parser.h"

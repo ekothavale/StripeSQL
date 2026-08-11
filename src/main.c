@@ -232,8 +232,9 @@ static void runFile(const char* path) {
         return;
     }
     char* query;
+    int queriesProcessed = 0;
+    clock_gettime(CLOCK_MONOTONIC, &start); // start timer
     while (pos < len) {
-        clock_gettime(CLOCK_MONOTONIC, &start); // start timer
 
         // obtain and interpret query
         query = isolateQuery(&pos, len, source);
@@ -258,17 +259,17 @@ static void runFile(const char* path) {
             break;
         }
         if (result.print) printResult(result);
-
-        clock_gettime(CLOCK_MONOTONIC, &end); // end timer
-        printTime(&start, &end);
+        queriesProcessed++;
     }
+    clock_gettime(CLOCK_MONOTONIC, &end); // end timer
+    if (queriesProcessed > 0) printTime(&start, &end);
     // cleanup
     free(source);
     if (exCode) exit(exCode);
 }
 
 int main(int argc, char** argv) {
-    /*test_page();
+    test_page();
     test_tableio();
     test_table_mgmt();
     test_btree();
@@ -279,7 +280,7 @@ int main(int argc, char** argv) {
     test_hashtable();
     test_schema();
     test_generator();
-    test_vm();*/
+    test_vm();
 
     if (argc == 1) {
         repl();

@@ -133,10 +133,9 @@ The following features are next on the todo list, roughly in priority order:
 |---|-------------|
 | 1 | Entering a blank line in the REPL causes a segfault. As a workaround, always enter a valid SQL statement or `Ctrl-D` to exit. |
 | 2 | `readNode` and `readPage` silently swallow I/O errors instead of returning a failure code to the caller. |
-| 3 | The primary key string limit is 24 characters (see `SYNTAX.md`). Longer primary key values will be truncated silently. |
-| 4 | A table can have at most 250 columns. |
-| 5 | Column reordering in `INSERT` and `SELECT` is not supported — column order in a query must match the order declared in `CREATE TABLE`. |
-| 6 | A fatal error partway through a transaction (e.g. a compile error, which calls `exit()`) does not auto-`DISCARD` — the transaction's open table handles are simply leaked without committing or writing back. |
+| 3 | Column reordering in `INSERT` and `SELECT` is not supported — column order in a query must match the order declared in `CREATE TABLE`. |
+| 4 | A fatal error partway through a transaction (e.g. a compile error, which calls `exit()`) does not auto-`DISCARD` — the transaction's open table handles are simply leaked without committing or writing back. |
+| 5 | There is no page overflow policy. Database records are dispersed across but if too many records are assigned to a page, insertion becomes impossible until the page is emptied. |
 
 ---
 
