@@ -1185,11 +1185,11 @@ static void free_page_contents(slotted_page* p) {
     free(p->entries);
 }
 
-/* Return a tree pre-loaded with pages 1..5 and one split already performed. */
+/* Return a tree pre-loaded with pages 1..(M_GLOBAL+1) and one split already performed. */
 static table* create_split_tree(char* name) {
     table* t = createTree(name, pn(1));
     assert(t != NULL);
-    insert_pages(t, 2, 4);
+    insert_pages(t, 2, M_GLOBAL);  // pages 2..(M_GLOBAL+1); M_GLOBAL+1 total forces the root to split
     return t;
 }
 
@@ -1447,8 +1447,11 @@ void test_btree_insert_existing_page(void) {
 
 /*
 Inserting M+1 pages must split the root leaf into an internal node with two
-leaf children.  With M_GLOBAL=4 this requires 5 total pages (1 from
-createTree plus 4 more from findAndInsert).
+leaf children. The leaf pre-emptively splits once it reaches M_GLOBAL
+children (isNodeFull); splitNode hands the first M_GLOBAL-HALF_M pages to the
+left half and the rest to the right half, and the (M_GLOBAL+1)-th page (the
+one that triggered the split) is then routed to whichever half covers it —
+always the right half here, since pages are inserted in increasing order.
 */
 void test_btree_split_structure(void) {
     printf("  test_btree_split_structure ... ");
@@ -1459,8 +1462,8 @@ void test_btree_split_structure(void) {
     assert(!root.isLeaf);
     assert(root.childCount == 2);
     assert(left.isLeaf  && right.isLeaf);
-    assert(left.childCount  == 2);   // pages 1, 2
-    assert(right.childCount == 3);   // pages 3, 4, 5
+    assert(left.childCount  == M_GLOBAL - HALF_M);  // pages 1..(M_GLOBAL-HALF_M)
+    assert(right.childCount == HALF_M + 1);         // remaining pages, plus the one that triggered the split
 
     deleteTree(t);
     printf("PASS\n");
@@ -1471,7 +1474,7 @@ void test_btree_split_find_all(void) {
     printf("  test_btree_split_find_all ... ");
     table* t = create_split_tree("bt_sfa");
 
-    for (uint32_t i = 1; i <= 5; i++)
+    for (uint32_t i = 1; i <= M_GLOBAL + 1; i++)
         assert(findPage(pn(i), t) != 0);
 
     deleteTree(t);
@@ -1527,41 +1530,58 @@ void test_btree_delete_page(void) {
 When a leaf node sits at exactly HALF_M children and its next sibling has
 more than HALF_M, deleting a page must trigger a borrow rather than a merge.
 
-Setup: 5 pages → split gives left=[1,2] right=[3,4,5].
-Deleting page 1 (left is at HALF_M=2) must borrow page 3 from the right,
-yielding left=[2,3], right=[4,5] and updating the root separator from 2→3.
+Setup: create_split_tree gives left=[1..leftCount] right=[leftCount+1..total],
+where leftCount = M_GLOBAL - HALF_M and total = M_GLOBAL + 1. leftCount
+equals HALF_M for even M_GLOBAL, but HALF_M+1 for odd M_GLOBAL (M+1 splits
+evenly into two HALF_M+1 halves when M is odd) — that extra "slack" child
+means the first delete from left merely lands it at HALF_M (still valid, no
+rebalance) rather than pushing it below HALF_M, so for odd M_GLOBAL a priming
+delete is needed first to actually reach the HALF_M boundary that triggers
+deletePage's rebalance check. Once left is at exactly HALF_M going into a
+delete, and right still has HALF_M+1 (> HALF_M, a valid lender per
+isValidBorrow), left borrows right's smallest page, yielding
+left=[slack+2..leftCount+1], right=[leftCount+2..total], and the root
+separator updates to leftCount+1 (left's new max).
 */
 void test_btree_delete_triggers_borrow(void) {
     printf("  test_btree_delete_triggers_borrow ... ");
     table* t = create_split_tree("bt_dtb");
+    uint32_t total     = M_GLOBAL + 1;
+    uint32_t leftCount = M_GLOBAL - HALF_M;
+    uint32_t slack     = leftCount - HALF_M;  // 0 for even M_GLOBAL, 1 for odd
 
-    assert(findAndDelete(pn(1), t));
+    // priming deletes: absorbed by left's post-split slack above HALF_M
+    // without triggering a rebalance (only needed for odd M_GLOBAL)
+    for (uint32_t i = 1; i <= slack; i++)
+        assert(findAndDelete(pn(i), t));
 
-    // Root separator key must be updated to 3 (new max of left leaf)
+    // left is now at exactly HALF_M; this delete triggers the borrow
+    assert(findAndDelete(pn(slack + 1), t));
+
+    // Root separator key must be updated to leftCount+1 (new max of left leaf)
     node root = {0};
     readNode(t->root, &root, t);
-    assert(comparePageNums(root.keys[0], pn(3)) == 0);
-
-    // Left leaf must contain pages 2 and 3 (page 3 was borrowed from right)
     node left = {0};
     readNode(root.children[0], &left, t);
-    assert(left.childCount == 2);
-    assert(comparePageNums(left.keys[0], pn(2)) == 0);
-    assert(comparePageNums(left.keys[1], pn(3)) == 0);
-
-    // Right leaf must now hold only pages 4 and 5
     node right = {0};
     readNode(root.children[1], &right, t);
-    assert(right.childCount == 2);
-    assert(comparePageNums(right.keys[0], pn(4)) == 0);
-    assert(comparePageNums(right.keys[1], pn(5)) == 0);
+    assert(comparePageNums(root.keys[0], pn(leftCount + 1)) == 0);
+
+    // Left leaf must contain pages (slack+2)..(leftCount+1) (leftCount+1 was borrowed from right)
+    assert(left.childCount == HALF_M);
+    for (uint32_t i = 0; i < HALF_M; i++)
+        assert(comparePageNums(left.keys[i], pn(slack + 2 + i)) == 0);
+
+    // Right leaf must now hold only pages (leftCount+2)..total
+    assert(right.childCount == HALF_M);
+    for (uint32_t i = 0; i < right.childCount; i++)
+        assert(comparePageNums(right.keys[i], pn(leftCount + 2 + i)) == 0);
 
     // Both deleted and surviving pages accessible by findPage
-    assert(findPage(pn(1), t) == 0);
-    assert(findPage(pn(2), t) != 0);
-    assert(findPage(pn(3), t) != 0);
-    assert(findPage(pn(4), t) != 0);
-    assert(findPage(pn(5), t) != 0);
+    for (uint32_t i = 1; i <= slack + 1; i++)
+        assert(findPage(pn(i), t) == 0);
+    for (uint32_t i = slack + 2; i <= total; i++)
+        assert(findPage(pn(i), t) != 0);
 
     deleteTree(t);
     printf("PASS\n");
@@ -1571,30 +1591,39 @@ void test_btree_delete_triggers_borrow(void) {
 When no sibling can lend a child, deleting a page must trigger a merge and
 collapse the tree to a single leaf root.
 
-Setup: borrow test state (left=[2,3] right=[4,5]).  Deleting page 2 drops
-the left leaf below HALF_M with no valid borrow target, so left and right
-merge and the now-single-child internal root collapses.
+Setup: borrow test's end state (left=[slack+2..leftCount+1],
+right=[leftCount+2..total], both now at exactly HALF_M children). Deleting
+left's new smallest (slack+2) drops left below HALF_M with no valid borrow
+target — right is at exactly HALF_M, not more than HALF_M, so isValidBorrow
+fails — so left and right merge and the now-single-child internal root
+collapses into the merged leaf, holding pages (slack+3)..total in order.
 */
 void test_btree_delete_triggers_merge(void) {
     printf("  test_btree_delete_triggers_merge ... ");
     table* t = create_split_tree("bt_dtm");
-    findAndDelete(pn(1), t);       // borrow: left=[2,3] right=[4,5]
-    assert(findAndDelete(pn(2), t));
+    uint32_t total     = M_GLOBAL + 1;
+    uint32_t leftCount = M_GLOBAL - HALF_M;
+    uint32_t slack     = leftCount - HALF_M;  // 0 for even M_GLOBAL, 1 for odd
 
-    // After merge + root collapse the root must be a leaf
+    for (uint32_t i = 1; i <= slack; i++)
+        findAndDelete(pn(i), t);            // priming (odd M_GLOBAL only)
+    findAndDelete(pn(slack + 1), t);        // triggers a borrow, per test_btree_delete_triggers_borrow
+    assert(findAndDelete(pn(slack + 2), t)); // left's new smallest after borrow; triggers the merge
+
+    uint32_t deletedCount = slack + 2;
+
+    // After merge + root collapse the root must be a leaf holding the surviving pages
     node root = {0};
     readNode(t->root, &root, t);
     assert(root.isLeaf);
-    assert(root.childCount == 3);
-    assert(comparePageNums(root.keys[0], pn(3)) == 0);
-    assert(comparePageNums(root.keys[1], pn(4)) == 0);
-    assert(comparePageNums(root.keys[2], pn(5)) == 0);
+    assert(root.childCount == total - deletedCount);
+    for (uint32_t i = 0; i < root.childCount; i++)
+        assert(comparePageNums(root.keys[i], pn(deletedCount + 1 + i)) == 0);
 
-    assert(findPage(pn(1), t) == 0);
-    assert(findPage(pn(2), t) == 0);
-    assert(findPage(pn(3), t) != 0);
-    assert(findPage(pn(4), t) != 0);
-    assert(findPage(pn(5), t) != 0);
+    for (uint32_t i = 1; i <= deletedCount; i++)
+        assert(findPage(pn(i), t) == 0);
+    for (uint32_t i = deletedCount + 1; i <= total; i++)
+        assert(findPage(pn(i), t) != 0);
 
     deleteTree(t);
     printf("PASS\n");
@@ -1624,7 +1653,7 @@ void test_btree_full_roundtrip(void) {
     table* t2 = calloc(1, sizeof(table));
     assert(loadTable("bt_fr", t2));
 
-    for (uint32_t i = 1; i <= 5; i++)
+    for (uint32_t i = 1; i <= M_GLOBAL + 1; i++)
         assert(findPage(pn(i), t2) != 0);
 
     address addr2 = findPage(pn(1), t2);

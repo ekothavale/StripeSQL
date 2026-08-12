@@ -323,16 +323,17 @@ static node* splitNode(node* n, address addr, address* newAddrOut, table* t) {
 	node* new = newNode(n->isLeaf, n->parent);
 	address newAddr = allocNode(t);
 	*newAddrOut = newAddr;
-	int middleKid = n->childCount / 2;
+	int middleKid = n->childCount / 2;       // number of children the new (right) node receives
+	int keepCount = n->childCount - middleKid; // number of children remaining (keepCount and middleKid differ when M is odd)
 
 	// save separator key before modifying keys (internal nodes only)
-	page_num separatorKey = n->keys[middleKid - 1];
+	page_num separatorKey = n->keys[keepCount - 1];
 
 	// copy children
 	for (int i = 0; i < middleKid; i++) {
-		address childAddr = n->children[i + middleKid];
+		address childAddr = n->children[i + keepCount];
 		new->children[i] = childAddr;
-		n->children[i + middleKid] = 0;
+		n->children[i + keepCount] = 0;
 		if (!n->isLeaf) {
 			node cn = {0};
 			if (readNode(childAddr, &cn, t)) {
@@ -345,15 +346,15 @@ static node* splitNode(node* n, address addr, address* newAddrOut, table* t) {
 	// copy keys: leaf gets middleKid keys; internal promotes middleKid-1 (separator goes to parent)
 	if (n->isLeaf) {
 		for (int i = 0; i < middleKid; i++) {
-			new->keys[i] = n->keys[i + middleKid];
-			n->keys[i + middleKid] = (page_num){0};
+			new->keys[i] = n->keys[i + keepCount];
+			n->keys[i + keepCount] = (page_num){0};
 		}
 	} else {
 		for (int i = 0; i < middleKid - 1; i++) {
-			new->keys[i] = n->keys[i + middleKid];
-			n->keys[i + middleKid] = (page_num){0};
+			new->keys[i] = n->keys[i + keepCount];
+			n->keys[i + keepCount] = (page_num){0};
 		}
-		n->keys[middleKid - 1] = (page_num){0}; // clear promoted separator from n
+		n->keys[keepCount - 1] = (page_num){0}; // clear promoted separator from n
 	}
 
 	new->childCount = middleKid;
@@ -590,7 +591,10 @@ static address mergeNode(node* n, address addr, table* t) {
 	// delete source
 	markDelete(sourceAddr, t);
 	// rebalance parent if necessary (rebalancing persists state to disk)
-	if (parent->childCount < HALF_M) {
+	if (isRoot(parent)) {
+		if (parent->childCount == 1) balanceTreeDelete(parent, n->parent, t);
+		else markNode(n->parent, parent, t);
+	} else if (parent->childCount < HALF_M) {
 		balanceTreeDelete(parent, n->parent, t);
 	} else {
 		markNode(n->parent, parent, t);
@@ -757,7 +761,7 @@ static address balanceTreeDelete(node* n, address addr, table* t) {
 		// check if next is a valid borrow target
 		if (nextAddr && isValidBorrow(n, &next)) {
 			borrowNext(n, addr, &next, nextAddr, t);
-			if (parent->childCount < HALF_M) balanceTreeDelete(parent, n->parent, t);
+			if (parent->childCount < HALF_M && !isRoot(parent)) balanceTreeDelete(parent, n->parent, t);
 			free(parent);
 			return addr;
 		}
@@ -768,7 +772,8 @@ static address balanceTreeDelete(node* n, address addr, table* t) {
 		// check if prev is a valid borrow target
 		if (prevAddr && isValidBorrow(n, &prev)) {
 			borrowPrev(n, addr, &prev, prevAddr, t);
-			if (parent->childCount < HALF_M) balanceTreeDelete(parent, n->parent, t);
+			// see the identical guard above in the borrowNext branch
+			if (parent->childCount < HALF_M && !isRoot(parent)) balanceTreeDelete(parent, n->parent, t);
 			free(parent);
 			return addr;
 		}

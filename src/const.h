@@ -24,7 +24,7 @@ Some combinations of constant values may break the DBMS
 #ifndef CONST_H
 #define CONST_H
 
-#define M_GLOBAL 4			// order (number of children a node can have) of the tree
+#define M_GLOBAL 45		// order (number of children a node can have) of the tree
 #define PAGE_SIZE 4096 		// size in bytes of each page
 
 // NEED TO PROGRAMMATICALLY CALCULATE THESE BASED ON PAGE SIZE
