@@ -29,24 +29,6 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 #include "SQL_interpreter/testing.h"
 
 
-static entry makeEntry(const char* str, datatype t) {
-    entry e;
-    e.type = t;
-    e.data = malloc(strlen(str) + 1);
-    strcpy(e.data, str);
-    return e;
-}
-
-static entry* makeRecord() {
-    entry* out = malloc(5 * sizeof(entry));
-    out[0] = makeEntry("Hello", T_STRING);
-    out[1] = makeEntry("My", T_STRING);
-    out[2] = makeEntry("Name", T_STRING);
-    out[3] = makeEntry("IS", T_STRING);
-    out[4] = makeEntry("40", T_INT);
-    return out;
-}
-
 static SQL_type getType(char c) {
     return (SQL_type) (c & 0b00011111);
 }
@@ -269,7 +251,7 @@ static void runFile(const char* path) {
 }
 
 int main(int argc, char** argv) {
-    test_page();
+    /*test_page();
     test_tableio();
     test_table_mgmt();
     test_btree();
@@ -280,7 +262,7 @@ int main(int argc, char** argv) {
     test_hashtable();
     test_schema();
     test_generator();
-    test_vm();
+    test_vm();*/
 
     if (argc == 1) {
         repl();

@@ -505,9 +505,8 @@ table* createTable(char* tablename) {
 	t->pageSize      = PAGE_SIZE;
 	t->nodeSize      = 49 + M_GLOBAL * (8 + PAGE_NUM_DISK_SIZE); // 49B fixed header + M children (8B) + M keys (PAGE_NUM_DISK_SIZE)
 	t->M             = M_GLOBAL;
-	// layout is [node stripe][pageNodeRatio page stripes] per unit — node
-	// stripe 1 starts immediately after the header, page stripe 1 right
-	// after that (see unitStart/currentPageStripeStart/currentNodeStripeStart)
+	// layout is [node stripe][pageNodeRatio page stripes][node stripe][pageNodeRatio page stripes]...
+	// stripe 1 starts immediately after the header, page stripe 1 right after that
 	t->nodeFree      = t->metalen;
 	t->pageFree      = (uint64_t)t->metalen
 	                 + (uint64_t)t->nodeStripeLen * t->nodeSize;
@@ -948,11 +947,8 @@ void commit(table* t) {
 }
 
 /*
-Discards a table's pending (uncommitted) changes instead of writing them.
-Empties the dirty-write tables without touching the file, so the on-disk state
-is left exactly as it was before the transaction started. Since nothing is
-written here (not even writeMeta), the caller must not keep using this table
-struct afterward — reload it fresh if further access is needed.
+discards a table's pending (uncommitted) changes instead of writing them.
+since nothing is written here, the caller must reload this table struct afterwards
 */
 void discard(table* t) {
 	for (int i = 0; i < t->pageDirty.capacity; i++) {
@@ -995,12 +991,6 @@ page | page | ... | page
 header at beginning of file
 a node stripe will always be first
 then pageNodeRatio page stripes will follow
-
-this group is a "unit". Page addressing and node
-addressing are each a pure function of their own stripe count and
-pageNodeRatio so that pages and nodes can be allocated at completely
-different rates without their addressing ever computing an overlapping
-address for either type.
 */
 
 /*
@@ -1072,7 +1062,7 @@ address allocNode(table* t) {
 	return out;
 }
 
-// GARBAGE COLLECTION
+// GARBAGE COLLECTION - incomplete
 
 /*
 moves a node from the source disk address to the dest disk address

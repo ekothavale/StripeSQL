@@ -58,9 +58,6 @@ typedef struct VM {
 } VM;
 
 // Public API — callable from outside this translation unit
-// (resetStack, runtimeError, openScanner, closeScanner, equal, lessThan,
-//  greaterThan, loadFirstValidPage, advanceScanner, valueToEntry, likeMatch,
-//  and run are file-scoped static helpers)
 void initVM(hashtable* schema);
 void freeVM();
 result_buffer interpret(const char* source);

@@ -30,12 +30,6 @@ which is implemented in another file.
 //     first for algorithmic time complexity
 //     second for smallest possible nodes
 
-/* TODO: 
- - Finish implementing b tree algorithms in this file
- - Build file IO API
- - Reimplement the b tree algorithms on disk
-*/ 
-
 /* Keys:
  - Each key is a 32bit unsigned int
  - Last n bits represent the slot number within a page
@@ -257,9 +251,7 @@ static void insertPageIntoChildren(node* n, address nodeAddr, slotted_page* p, a
 	n->childCount++;
 	n->maxKey = p->header.pageNum;
 	markNode(nodeAddr, n, t);
-	// n's own max just grew; if n is itself its parent's last child, that
-	// growth must propagate up through ancestor separator keys too, or a
-	// future top-down search can miss it entirely (see propagateMaxKeyUp)
+	// propagate n's new max up if necessary
 	propagateMaxKeyUp(nodeAddr, n->maxKey, t);
 	return;
 }
@@ -270,14 +262,9 @@ assumes node is not full
 */
 static void splitUpdateParent(node* parent, node* child, address childAddr, page_num newKey, table* t) {
 	if (isNodeFull(parent)) {
-		printf("Balancing parent from splitUpdateParent()\n");
 		address newSiblingAddr;
 		node* newSibling = balanceTreeAdd(parent, child->parent, &newSiblingAddr, t);
-		// balanceTreeAdd() just split `parent` into two nodes: `parent` itself
-		// (now the lower half) and `newSibling` (the upper half). child must
-		// go into whichever half actually covers its key range — blindly
-		// continuing to use `parent` below would silently misplace child
-		// under the wrong half whenever newKey belongs in the upper half.
+		// determine whether new sibling is the correct node to insert into
 		if (comparePageNums(newKey, parent->maxKey) > 0) {
 			child->parent = newSiblingAddr;
 			splitUpdateParent(newSibling, child, childAddr, newKey, t);
@@ -303,13 +290,6 @@ static void splitUpdateParent(node* parent, node* child, address childAddr, page
 	parent->keys[parent->childCount-1] = newKey; // no previous key to replace
 	parent->children[parent->childCount] = childAddr;
 	parent->childCount++;
-	// child just became parent's new last child, so parent's own max grew
-	// to match child's own true max — NOT newKey, which is only the
-	// separator between the previous last child and child (roughly the
-	// previous node's own shrunk max after splitting), and would silently
-	// undercount whenever child's true max exceeds that separator.
-	// Propagate the correct value up too, in case parent is itself its own
-	// parent's last child (see propagateMaxKeyUp).
 	parent->maxKey = child->maxKey;
 	markNode(child->parent, parent, t);
 	propagateMaxKeyUp(child->parent, child->maxKey, t);
@@ -382,11 +362,6 @@ static node* splitNode(node* n, address addr, address* newAddrOut, table* t) {
 	if (n->isLeaf) {
 		n->maxKey = n->keys[n->childCount - 1];
 	} else {
-		// keys[i] holds children[i]'s own max (see findPageAndLeaf's
-		// pageNum <= keys[i] -> descend children[i]), so keys[childCount-2]
-		// gives the SECOND-to-last child's max, not the new last child's
-		// (children[childCount-1]) — reading it here was always wrong,
-		// leaving n->maxKey one child too low after every internal split.
 		node lastChild = {0};
 		readNode(n->children[n->childCount - 1], &lastChild, t);
 		n->maxKey = lastChild.maxKey;
@@ -418,11 +393,6 @@ static node* balanceTreeAdd(node* n, address addr, address* newAddrOut, table* t
 		if (isNodeFull(&parent)) {
 			address dummy;
 			balanceTreeAdd(&parent, n->parent, &dummy, t);
-			// The grandparent's own split may have moved n into the new
-			// sibling half, changing n's true parent. n's in-memory
-			// .parent field was cached before that recursion ran, so it
-			// can now be stale — re-read n so splitNode below inserts n's
-			// split-off half into n's actual current parent, not a stale one.
 			readNode(addr, n, t);
 		}
 	}
@@ -454,22 +424,7 @@ static void addPage(node* n, address nodeAddr, slotted_page* p, address pageAddr
 // DELETION FUNCTIONS
 
 /*
-Propagates a node's growth (its new, larger maxKey — typically after absorbing
-a sibling via mergeNode) up through its ancestors' separator keys.
-
-An internal node's keys[] array only bounds children other than the last one
-(children[i] is bounded above by keys[i] for i < childCount-1; the last child
-has no explicit upper bound, matched via the "not found" fallback in the
-top-down search functions). So:
- - if nodeAddr is NOT its parent's last child, only the parent's separator
-   key immediately governing it needs updating — nothing above that changes.
- - if nodeAddr IS its parent's last child (including the degenerate
-   single-child case), the parent's own maxKey grew by the same amount, so
-   the same propagation must continue to the grandparent, and so on.
-Without this, an ancestor's separator key can stay stuck at an old, too-low
-value indefinitely — silently hiding everything under the grown node from
-any future top-down key search (though it stays fully reachable via the leaf
-linked list, since that's unaffected by any of this).
+Propagates a node's new, larger maxkey up through its ancestors' separator keys.
 */
 static void propagateMaxKeyUp(address nodeAddr, page_num newMaxKey, table* t) {
 	node n = {0};
@@ -624,16 +579,10 @@ static void borrowNext(node* n, address nAddr, node* next, address nextAddr, tab
 	address borrowedAddr = next->children[0];
 	n->children[n->childCount] = borrowedAddr;
 	n->keys[n->childCount++] = next->keys[0];
-	// n gained a new last child, so its own maxKey must grow to match —
-	// otherwise, if n is later chosen as a merge source, mergeNode reads this
-	// stale (too-low) maxKey via survivor->maxKey = source->maxKey and
-	// silently loses track of everything n has grown to contain since
 	n->maxKey = n->keys[n->childCount-1];
 	next->childCount--;
 	shiftAddressArrayL(next->children, 0, M_GLOBAL);
 	shiftPageNumArrayL(next->keys, 0, M_GLOBAL);
-	// the borrowed page doesn't track its own parent (found via tree traversal
-	// instead), so nothing further to update about it here
 	markNode(nAddr, n, t);
 	markNode(nextAddr, next, t);
 	// update parent
@@ -664,12 +613,9 @@ static void borrowPrev(node* n, address nAddr, node* prev, address prevAddr, tab
 	n->children[0] = borrowedAddr;
 	prev->keys[prev->childCount] = (page_num){0};
 	prev->children[prev->childCount] = 0;
-	// prev just lost its highest (last) child, so its own maxKey must shrink
-	// to match its new true last child
+	// prev just lost its highest child, so its own maxKey must shrink
 	prev->maxKey = prev->keys[prev->childCount-1];
 	n->childCount++;
-	// the borrowed page doesn't track its own parent (found via tree traversal
-	// instead), so nothing further to update about it here
 	markNode(nAddr, n, t);
 	markNode(prevAddr, prev, t);
 	// update parent
@@ -729,8 +675,7 @@ static void borrowPrevThroughParent(node* n, address nAddr, node* prev, address 
 			address borrowedAddr = prev->children[prev->childCount];
 			n->children[0] = borrowedAddr;
 			parent.keys[i-1] = prev->keys[prev->childCount-1];
-			// prev just lost its highest (last) child, so its own maxKey
-			// must shrink to match its new true last child
+			// prev just lost its highest child, so its own maxKey must shrink
 			prev->maxKey = prev->keys[prev->childCount-1];
 			prev->children[prev->childCount] = 0;
 			prev->keys[prev->childCount-1] = (page_num){0};
@@ -820,11 +765,6 @@ static bool deletePage(node* n, address nAddr, page_num pageNum, table* t)  {
 		return false;
 	}
 	if (n->childCount == HALF_M && !isRoot(n)) {
-		// balanceTreeDelete can return a different address than nAddr (e.g. if
-		// n gets merged into a "prev" sibling, the survivor lives at that
-		// sibling's address, not nAddr) — nAddr must track that or the
-		// deletion below gets applied to n's refreshed content but then
-		// written back to the wrong (stale) address via markNode(nAddr, ...).
 		nAddr = balanceTreeDelete(n, nAddr, t);
 		readNode(nAddr, n, t);
 	}

@@ -86,6 +86,7 @@ A SQL query moves through five stages before touching the disk:
 - `SELECT DISTINCT ...` — deduplicates result rows
 - `UPDATE table SET col = expr [WHERE ...]`
 - `DELETE FROM table [WHERE ...]`
+- Referencing a table with no registered schema (e.g. a typo'd name) reports a compile error instead of crashing the interpreter, across `SELECT`, `INSERT`, `UPDATE`, and `DELETE`
 
 **Transactions**
 - `BEGIN TRANSACTION` — starts a transaction; every table touched by a subsequent statement stays open, with its writes buffered but not flushed to disk
@@ -119,11 +120,12 @@ A SQL query moves through five stages before touching the disk:
 
 The following features are next on the todo list, roughly in priority order:
 
-1. **Column reordering in queries** — `INSERT INTO t (b, a) VALUES (2, 1)` and `SELECT b, a FROM t` with non-natural column ordering are not yet handled.
-2. **File-level garbage collection** — `condenseStripe` and `condenseAll` are stubbed in `tableIO.c`; implementing them will reclaim space from deleted records.
-3. **Propagate I/O errors** — `readNode` and `readPage` currently do not propagate failure to callers.
-4. **Merge schema and hash table** — the schema struct and the in-memory hash table currently maintain separate representations of column metadata; unifying them will simplify the generator and VM.
-5. **File structure analysis mode** - a new mode which creates a new database populated with the attributes of a given directory's files and subdirectories.
+1. **Write-Ahead Logging** - Atomicity and Isolation are already implemented by this system. WAL and crash recovery will add Consistency and Durability.
+2. **Crash recovery**
+3. **Column reordering in queries** — `INSERT INTO t (b, a) VALUES (2, 1)` and `SELECT b, a FROM t` with non-natural column ordering are not yet handled.
+4. **File-level garbage collection** — `condenseStripe` and `condenseAll` are stubbed in `tableIO.c`; implementing them will reclaim space from deleted records.
+5. **Propagate I/O errors** — `readNode` and `readPage` currently do not propagate failure to callers.
+6. **File structure analysis mode** - a new mode which creates a new database populated with the attributes of a given directory's files and subdirectories.
 
 ---
 
@@ -135,7 +137,7 @@ The following features are next on the todo list, roughly in priority order:
 | 2 | `readNode` and `readPage` silently swallow I/O errors instead of returning a failure code to the caller. |
 | 3 | Column reordering in `INSERT` and `SELECT` is not supported — column order in a query must match the order declared in `CREATE TABLE`. |
 | 4 | A fatal error partway through a transaction (e.g. a compile error, which calls `exit()`) does not auto-`DISCARD` — the transaction's open table handles are simply leaked without committing or writing back. |
-| 5 | There is no page overflow policy. Database records are dispersed across but if too many records are assigned to a page, insertion becomes impossible until the page is emptied. |
+| 5 | There is no page overflow policy — if enough records collide onto the same physical page, insertion becomes impossible until the page is emptied. Primary-key dispersion (both integer and text keys use a reversible bit/byte-reversal transform before bucketing) makes this rare in practice, and a failed insert now reports an error rather than silently dropping the row, but no page-split or overflow-chain mechanism exists yet. |
 
 ---
 
@@ -147,7 +149,7 @@ The following features are next on the todo list, roughly in priority order:
 make
 ```
 
-This compiles all source files with `clang` and produces the `main` binary in the project root. Requires `clang` and `make`.
+This compiles all source files with `clang` at `-O3` and produces the `main` binary in the project root. Requires `clang` and `make`.
 
 ### Run the REPL
 
@@ -242,15 +244,31 @@ Execution time is reported automatically after every file-mode run (wall-clock, 
  1.243 ms
 ```
 
-The table below shows representative timings on an Apple M-series chip for a single `users` table with `(id int PRIMARY KEY, name text)`.
+The `benchmarks/` directory contains four workloads: 10,000 sequential `INSERT`s with an integer primary key and with a text primary key, each run both bare and with the inserts wrapped in a single `BEGIN TRANSACTION` / `COMMIT`. The table below compares wall-clock time against SQLite 3.43.2 running the identical script through its own CLI — both engines on their out-of-the-box default settings (no custom pragmas; SQLite's default rollback-journal mode), averaged over 3 trials on an Apple M-series chip.
 
-| Operation | Rows | Time |
-|-----------|------|------|
-| Sequential INSERT | 100 | ~2 ms |
-| Full table scan SELECT | 100 | ~1 ms |
-| Primary key lookup SELECT | — | < 0.5 ms |
+| Benchmark | FileSQLite (avg) | SQLite (avg) | Ratio |
+|-----------|------------------:|--------------:|------:|
+| `10k.sql` (int PK, no transaction) | 3.782 s | 2.688 s | 1.4× |
+| `10k_txn.sql` (int PK, single transaction) | 0.231 s | 0.018 s | 12.8× |
+| `10k_str.sql` (text PK, no transaction) | 3.849 s | 2.693 s | 1.4× |
+| `10k_str_txn.sql` (text PK, single transaction) | 0.246 s | 0.023 s | 10.7× |
 
-These figures are rough baselines; performance will vary with page fill factor, tree depth, and disk speed. No formal benchmark harness exists yet.
+```mermaid
+xychart-beta
+    title "FileSQLite vs SQLite — avg seconds over 3 trials (lower is better)"
+    x-axis ["10k", "10k_txn", "10k_str", "10k_str_txn"]
+    y-axis "Seconds" 0 --> 4
+    bar "FileSQLite" [3.782, 0.231, 3.849, 0.246]
+    bar "SQLite" [2.688, 0.018, 2.693, 0.023]
+```
+
+Two things stand out:
+
+- **The non-transactional runs are dominated by per-statement commit overhead on both engines.** Each bare `INSERT` is its own implicit transaction, so 10,000 inserts means 10,000 fsync-equivalent commits — for both FileSQLite and SQLite. That cost swamps everything else, which is why the gap narrows to 1.4× here even though it's over 10× wider once that overhead is amortized away by wrapping the same inserts in one transaction.
+- **The transaction-wrapped runs are the more honest comparison of raw per-operation cost** — a 10-13× gap once commit is a single event rather than 10,000. The B+ tree searches within a node linearly rather than with a binary search, and node structs are allocated at the full configured order (`M_GLOBAL`, see `const.h`) regardless of actual fill — both real, identified costs relative to SQLite's tuned page cache and B-tree implementation.
+- Text and integer primary keys track each other closely on both engines, so FileSQLite's key-dispersion scheme (see Known Issues) isn't adding meaningful overhead of its own.
+
+These figures were measured with a plain `make` build (`-O3`, no sanitizers) and will vary with page fill factor, tree depth, `M_GLOBAL`, and disk speed.
 
 ---
 
@@ -258,4 +276,4 @@ These figures are rough baselines; performance will vary with page fill factor, 
 
 The interpreter architecture — bytecode chunk, stack-based VM, single-pass code generator — was inspired by Robert Nystrom's [*Crafting Interpreters*](https://craftinginterpreters.com/). The storage engine (B+ tree, slotted pages, dirty-stack write-back, etc.) was designed and implemented independently.
 
-Copyright (c) 2026 Ethan Kothavale. Distributed under the MIT License — see the license header in any source file for the full text.
+Copyright (c) 2026 Ethan Kothavale. Distributed under the MIT License — see [LICENSE.md](LICENSE.md), or the license header in any source file, for the full text.
