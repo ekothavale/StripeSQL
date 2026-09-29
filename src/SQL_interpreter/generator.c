@@ -451,6 +451,7 @@ static bool munchStmt(ast_node* node, chunk* c, hashtable* ht) {
 			  JUMP <loop_top>          loop back (backward)
 			[exit:]
 			  CLOSE_SCAN
+			  SET_RESULT               mark the result rows for printing
 			*/
 			// setup
 			char tname[MAX_IDENT_LEN];
@@ -533,7 +534,6 @@ static bool munchStmt(ast_node* node, chunk* c, hashtable* ht) {
 			// cleanup
 			patchJump(c, nextPatch);
 			writeChunk(c, OP_CLOSE_SCAN, 0);
-			writeStaticConst(c, UINT_VAL(s->hash));
 			writeChunk(c, OP_SET_RESULT, 0);
 			break;
 		}

@@ -29,25 +29,22 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 #include "SQL_interpreter/testing.h"
 
 
-static SQL_type getType(char c) {
-    return (SQL_type) (c & 0b00011111);
-}
-
 /*
-pretty prints the rows in the results of a query 
+pretty prints the rows in the results of a query
+each value is printed according to its own runtime type, which stays correct
+for projected, reordered, and computed columns
 */
 static void printResult(result_buffer result) {
     for (int r = 0; r < result.count; r++) {
         for (int c = 0; c < result.cols; c++) {
             if (c > 0) printf(" | ");
             value v = result.rows[r][c];
-            SQL_type type = getType(result.types[c]);
-            switch (type) {
-                case SQL_NULL:  printf("NULL");              break;
-                case SQL_BOOL:  printf("%s", v.as.boolean ? "true" : "false"); break;
-                case SQL_INT:   printf("%lld", v.as.integer); break;
-                case SQL_FLOAT: printf("%g",   v.as.floating); break;
-                case SQL_TEXT:  printf("%s",   v.as.text);    break;
+            switch (v.type) {
+                case VAL_NULL:  printf("NULL");              break;
+                case VAL_BOOL:  printf("%s", v.as.boolean ? "true" : "false"); break;
+                case VAL_INT:   printf("%lld", v.as.integer); break;
+                case VAL_FLOAT: printf("%g",   v.as.floating); break;
+                case VAL_TEXT:  printf("%s",   v.as.text);    break;
                 default:        printf("N/A");               break;
             }
         }

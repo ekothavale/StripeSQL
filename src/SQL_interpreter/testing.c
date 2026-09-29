@@ -1547,6 +1547,23 @@ void test_interpret_missing_table_returns_compile_error(void) {
     remove(schema_path());
 }
 
+void test_interpret_select_projection_types(void) {
+    // results are printed by each value's own type, so a projection whose column
+    // types differ from the schema's leading columns must still carry the right
+    // tags (a schema-order type array once made the printer read an int as text)
+    remove(schema_path());
+    assert(interpret("create table proj (id text primary key, v int)").ir == INTERPRET_OK);
+    assert(interpret("insert into proj values ('a', 7)").ir == INTERPRET_OK);
+
+    result_buffer r = interpret("select v, id from proj");
+    assert(r.ir == INTERPRET_OK && r.count == 1 && r.cols == 2);
+    assert(r.rows[0][0].type == VAL_INT  && r.rows[0][0].as.integer == 7);
+    assert(r.rows[0][1].type == VAL_TEXT && strcmp(r.rows[0][1].as.text, "a") == 0);
+
+    assert(interpret("drop table proj").ir == INTERPRET_OK);
+    remove(schema_path());
+}
+
 // --- master ---
 
 void test_vm(void) {
@@ -1556,6 +1573,7 @@ void test_vm(void) {
     test_vm_push_pop_null();
     test_vm_free_no_crash();
     test_interpret_missing_table_returns_compile_error();
+    test_interpret_select_projection_types();
     printf("All VM tests passed.\n");
 }
 

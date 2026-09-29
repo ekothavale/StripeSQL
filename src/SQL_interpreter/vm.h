@@ -36,8 +36,7 @@ typedef enum {
 } interpret_result;
 
 typedef struct result_buffer {
-	value** rows;
-	char* types; // the SQL type of each column in the result
+	value** rows; // each value carries its own runtime type
 	int count;
 	int capacity;
 	int cols;

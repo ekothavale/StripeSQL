@@ -113,6 +113,7 @@ void test_vm_push_pop_bool();
 void test_vm_push_pop_null();
 void test_vm_free_no_crash();
 void test_interpret_no_schema_returns_load_error();
+void test_interpret_select_projection_types();
 
 /* Generator tests */
 void test_generator();
