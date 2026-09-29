@@ -32,7 +32,7 @@ Session-scoped transaction state. Deliberately kept outside the VM struct:
 initVM()/freeVM() run once per statement (every interpret() call), but a
 transaction spans multiple statements/interpret() calls, so its state must
 survive across them. Tables touched during an active transaction stay open
-here (dirty writes accumulating in their normal write stacks, see tableIO.c)
+here (dirty writes accumulating in their dirty hashmaps, see tableIO.c)
 instead of being committed and closed at the end of each statement; COMMIT
 or DISCARD is what finally closes them out.
 */

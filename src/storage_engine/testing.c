@@ -272,8 +272,8 @@ void test_page(void) {
 // ##########################################################################################################################################
 // TABLEIO TESTS
 //
-// NOTE: test_page_roundtrip, test_node_roundtrip, test_page_write_lifo, and
-// test_node_write_lifo verify field values that pass through writePage/writeNode.
+// NOTE: test_page_roundtrip, test_node_roundtrip, test_page_write_drains_all, and
+// test_node_write_drains_all verify field values that pass through writePage/writeNode.
 
 // writeMeta is non-static but not in tableIO.h; forward-declare it here
 bool writeMeta(FILE* file, table* t);
@@ -303,7 +303,7 @@ static table make_test_table(void) {
     t.pageFree = (uint64_t)t.metalen + (uint64_t)t.nodeStripeLen * t.nodeSize;
     t.root = 0;
     t.M = M_GLOBAL;
-    // Inline dirty-table initialisation (setStacks is static in tableIO.c)
+    // Inline dirty-table initialisation (initDirtyHashmaps is static in tableIO.c)
     initAddrTable(&t.pageDirty);
     initAddrTable(&t.nodeDirty);
     initAddrTable(&t.delete);
@@ -459,7 +459,7 @@ void test_mark_page_dedup(void) {
 
 /*
 markPage stores a private heap copy of the page; mutating the original
-after marking must not change the copy held in the dirty stack.
+after marking must not change the copy held in the dirty hashmap.
 */
 void test_mark_page_snapshot(void) {
     printf("  test_mark_page_snapshot ... ");
@@ -685,10 +685,10 @@ void test_alloc_node_after_stripe(void) {
 // --- writeNextPage / readPage ---
 
 /*
-writeNextPage on an empty queue must be a no-op (no crash, count stays 0).
+writeNextPage on an empty dirty hashmap must be a no-op (no crash, count stays 0).
 */
-void test_page_write_empty_queue(void) {
-    printf("  test_page_write_empty_queue ... ");
+void test_page_write_empty_hashmap(void) {
+    printf("  test_page_write_empty_hashmap ... ");
     table t = make_test_table();
 
     assert(t.pageDirty.count == 0);
@@ -741,8 +741,8 @@ Mark 3 pages, then call writeNextPage 3 times. The dirty table has no
 inherent order, so which page drains on which call is unspecified — this
 verifies all 3 end up correctly written regardless of drain order.
 */
-void test_page_write_lifo(void) {
-    printf("  test_page_write_lifo ... ");
+void test_page_write_drains_all(void) {
+    printf("  test_page_write_drains_all ... ");
     table t = make_test_table();
 
     slotted_page* p1 = make_io_page(pn(1));
@@ -780,8 +780,8 @@ void test_page_write_lifo(void) {
 
 // --- writeNextNode / readNode ---
 
-void test_node_write_empty_queue(void) {
-    printf("  test_node_write_empty_queue ... ");
+void test_node_write_empty_hashmap(void) {
+    printf("  test_node_write_empty_hashmap ... ");
     table t = make_test_table();
 
     assert(t.nodeDirty.count == 0);
@@ -841,8 +841,8 @@ void test_node_roundtrip(void) {
 Mark 3 nodes, drain them all via writeNextNode, and verify each address
 holds its node regardless of drain order.
 */
-void test_node_write_lifo(void) {
-    printf("  test_node_write_lifo ... ");
+void test_node_write_drains_all(void) {
+    printf("  test_node_write_drains_all ... ");
     table t = make_test_table();
 
     node n1 = {0}; n1.childCount = 1; n1.maxKey = pn(10);
@@ -894,13 +894,13 @@ void test_tableio(void) {
     test_alloc_node_stripe();
     test_alloc_node_after_stripe();
     // writeNextPage / readPage
-    test_page_write_empty_queue();
+    test_page_write_empty_hashmap();
     test_page_roundtrip();
-    test_page_write_lifo();
+    test_page_write_drains_all();
     // writeNextNode / readNode
-    test_node_write_empty_queue();
+    test_node_write_empty_hashmap();
     test_node_roundtrip();
-    test_node_write_lifo();
+    test_node_write_drains_all();
     printf("=== All tableIO tests passed ===\n");
 }
 
@@ -1314,10 +1314,10 @@ void test_btree_record_delete(void) {
 // ── Group 3: commit ────────────────────────────────────────────────────────
 
 /*
-After marking dirty objects, commit() must drain all three stacks to zero.
+After marking dirty objects, commit() must drain all three dirty hashmaps to zero.
 */
-void test_btree_commit_drains_stacks(void) {
-    printf("  test_btree_commit_drains_stacks ... ");
+void test_btree_commit_drains_hashmaps(void) {
+    printf("  test_btree_commit_drains_hashmaps ... ");
     table* t = createTree("bt_cds", pn(1));
     assert(t != NULL);
 
@@ -1771,7 +1771,7 @@ void test_btree(void) {
     test_btree_record_update();
     test_btree_record_delete();
     // commit
-    test_btree_commit_drains_stacks();
+    test_btree_commit_drains_hashmaps();
     test_btree_commit_persist();
     test_btree_commit_delete_persist();
     test_btree_commit_skips_clean();

@@ -34,9 +34,6 @@ Some combinations of constant values may break the DBMS
 #define PAGE_NUM_ENTRIES 700 		// in reality this will be the size of the page minus the slot array and the header
 #define PAGE_ARR_CAP 4000  		// page slot array size
 
-#define DIRTY_STACK_GROWTH_RATE 1.5  // the rate at which the dynamic arrays that hold the stacks for dirty pages and dirty nodes grow
-#define DIRTY_STACK_INTIAL_SIZE 400  // the initial size of each stack
-
 #define MAX_REPL_INPUT_LEN 1024
 
 #endif

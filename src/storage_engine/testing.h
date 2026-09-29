@@ -32,7 +32,7 @@ void test_btree_find_nonexistent(void);
 void test_btree_record_add(void);
 void test_btree_record_update(void);
 void test_btree_record_delete(void);
-void test_btree_commit_drains_stacks(void);
+void test_btree_commit_drains_hashmaps(void);
 void test_btree_commit_persist(void);
 void test_btree_commit_delete_persist(void);
 void test_btree_commit_skips_clean(void);

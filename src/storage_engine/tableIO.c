@@ -366,13 +366,13 @@ bool writeMeta(FILE* file, table* t) {
 /*
 initializes a table's dirty-write hash tables
 */
-static void setStacks(table* t) {
+static void initDirtyHashmaps(table* t) {
 	initAddrTable(&t->pageDirty);
 	initAddrTable(&t->nodeDirty);
 	initAddrTable(&t->delete);
 }
 
-static void freeStacks(table* t) {
+static void freeDirtyHashmaps(table* t) {
 	freeAddrTable(&t->pageDirty);
 	freeAddrTable(&t->nodeDirty);
 	freeAddrTable(&t->delete);
@@ -468,7 +468,7 @@ frees a table struct, including the struct itself and all of its memory allocate
 frees allocated memory
 */
 void freeTable(table* t) {
-	freeStacks(t);
+	freeDirtyHashmaps(t);
 	free(t->name);
 	free(t);
 }
@@ -515,7 +515,7 @@ table* createTable(char* tablename) {
 	t->root          = 0;
 	t->name          = strdup(tablename);
 
-	setStacks(t);
+	initDirtyHashmaps(t);
 	writeMeta(f, t);
 	return t;
 }
@@ -552,7 +552,7 @@ bool loadTable(char* tablename, table* t) {
 	t->cursor = 0;
 	t->name   = strdup(tablename);
 	loadMeta(tfile, fname, t);
-	setStacks(t);
+	initDirtyHashmaps(t);
 	free(fname);
 	return true;
 }
@@ -1097,7 +1097,7 @@ address allocNode(table* t) {
 
 /*
 moves a node from the source disk address to the dest disk address
-writes directly to disk without using the write queue
+writes directly to disk, bypassing the dirty hashmaps
 trusts that both addresses given are correct
 */
 static void moveNode(address source, address dest, table* t) {
@@ -1110,7 +1110,7 @@ static void moveNode(address source, address dest, table* t) {
 
 /*
 moves a page from the source disk address to the dest disk address
-writes directly to disk without using the write queue
+writes directly to disk, bypassing the dirty hashmaps
 trusts that both addresses given are correct
 */
 static void movePage(address source, address dest, table* t) {
