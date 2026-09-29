@@ -1,4 +1,4 @@
-StripeSQL is a relational database management system written from scratch in C, using only the C standard library. It supports a SQL front end backed by a custom B+ tree storage engine with slotted-page file format.
+StripeSQL is a relational database management system written from scratch in C, with no dependencies beyond the C standard library and POSIX. It supports a SQL front end backed by a custom B+ tree storage engine with slotted-page file format.
 
 ---
 
@@ -68,7 +68,7 @@ A SQL query moves through five stages before touching the disk:
 
 **Slotted page** (`src/storage_engine/page.c`) — variable-length records are stored in slotted pages. Each slot holds an offset key, a pointer into the entry array, and a byte length.
 
-**Table I/O** (`src/storage_engine/tableIO.c`) — serialises pages and nodes to `.tbl` files in the `tables/` directory. Writes are buffered in dirty stacks and flushed to disk on `commit()`.
+**Table I/O** (`src/storage_engine/tableIO.c`) — serialises pages and nodes to `.tbl` files in the `tables/` directory. Writes are buffered in dirty stacks, then written and synced to disk (`fsync`) on `commit()`.
 
 ---
 
@@ -94,6 +94,7 @@ A SQL query moves through five stages before touching the disk:
 - `DISCARD` — drops all changes made since `BEGIN TRANSACTION` without writing anything to disk
 - A single transaction may span multiple tables
 - `BEGIN TRANSACTION` while already in a transaction, or `COMMIT`/`DISCARD` with none active, reports an error and is a no-op
+- Every commit — `COMMIT`, or the implicit commit at the end of each statement outside a transaction — is synced to disk with `fsync` before the statement returns (set `FULL_FSYNC` in `const.h` to use macOS's stronger `F_FULLFSYNC` instead). Read-only statements write and sync nothing. A failed write or sync is reported as a runtime error and is not retried.
 
 **Filtering and Expressions**
 - `WHERE` clause with `=`, `!=`, `<`, `<=`, `>`, `>=`
@@ -120,7 +121,7 @@ A SQL query moves through five stages before touching the disk:
 
 The following features are next on the todo list, roughly in priority order:
 
-1. **Write-Ahead Logging** - Atomicity and Isolation are already implemented by this system. WAL and crash recovery will add Consistency and Durability.
+1. **Write-Ahead Logging** - Committed changes are already synced to disk, but a crash or write failure partway through a commit can leave a table half-updated (see Known Issues). WAL and crash recovery will make commits atomic across crashes.
 2. **Crash recovery**
 3. **Column reordering in queries** — `INSERT INTO t (b, a) VALUES (2, 1)` and `SELECT b, a FROM t` with non-natural column ordering are not yet handled.
 4. **File-level garbage collection** — `condenseStripe` and `condenseAll` are stubbed in `tableIO.c`; implementing them will reclaim space from deleted records.
@@ -138,6 +139,7 @@ The following features are next on the todo list, roughly in priority order:
 | 3 | Column reordering in `INSERT` and `SELECT` is not supported — column order in a query must match the order declared in `CREATE TABLE`. |
 | 4 | A fatal error partway through a transaction (e.g. a compile error, which calls `exit()`) does not auto-`DISCARD` — the transaction's open table handles are simply leaked without committing or writing back. |
 | 5 | There is no page overflow policy — if enough records collide onto the same physical page, insertion becomes impossible until the page is emptied. Primary-key dispersion (both integer and text keys use a reversible bit/byte-reversal transform before bucketing) makes this rare in practice, and a failed insert now reports an error rather than silently dropping the row, but no page-split or overflow-chain mechanism exists yet. |
+| 6 | Commits are durable but not crash-atomic. A commit overwrites pages and nodes in place and then the table header, so a crash, power loss, or failed write partway through can leave the table file half-updated, and nothing on disk can undo it. The failure is reported, but the affected table may be corrupt until write-ahead logging is in place (see Roadmap). |
 
 ---
 
@@ -244,7 +246,7 @@ Execution time is reported automatically after every file-mode run (wall-clock, 
  1.243 ms
 ```
 
-All figures below were measured on an Apple M2 with an `-O3` build (the Makefile's flags, no sanitizers) and a warm OS page cache. Each is the median of 5 trials, taken after one discarded warm-up run. They will vary with page fill factor, tree depth, `M_GLOBAL`, and disk speed.
+All figures below were measured on an Apple M2 with an `-O3` build (the Makefile's flags, no sanitizers, default `FULL_FSYNC 0` so every commit is synced with plain `fsync`) and a warm OS page cache. Each is the median of 5 trials, taken after one discarded warm-up run. They will vary with page fill factor, tree depth, `M_GLOBAL`, and disk speed.
 
 ### Primary-key lookup vs. full scan
 
@@ -252,11 +254,11 @@ A table `(id int PRIMARY KEY, v int)` is loaded with N rows where `v = id`, so b
 
 | Rows | PK lookup | Full scan | Speedup |
 |-----:|----------:|----------:|--------:|
-| 1,000 | 0.30 ms | 33.7 ms | 114× |
-| 10,000 | 0.35 ms | 335 ms | 967× |
-| 100,000 | 0.40 ms | 3,658 ms | ~9,000× |
+| 1,000 | 0.27 ms | 33.1 ms | 123× |
+| 10,000 | 0.31 ms | 333 ms | 1,074× |
+| 100,000 | 0.38 ms | 3,658 ms | ~9,500× |
 
-- **Lookup latency is nearly flat.** It grows 36% across a 100× increase in rows, while scan time grows roughly linearly — the O(log n) vs. O(n) difference the index exists for.
+- **Lookup latency is nearly flat.** It grows 43% across a 100× increase in rows, while scan time grows roughly linearly — the O(log n) vs. O(n) difference the index exists for. Lookups are read-only, so they never sync.
 - **The scan side is inflated by storage footprint.** The table file takes about 5.4 KB per row (536 MB at 100,000 rows), so a full scan reads far more data than the rows themselves contain. A denser page layout would shrink scan times, and the speedup with them.
 
 ### Transaction batching
@@ -265,10 +267,10 @@ A table `(id int PRIMARY KEY, v int)` is loaded with N rows where `v = id`, so b
 
 | Primary key | Autocommit | Single transaction | Speedup | Inserts/sec (transaction) |
 |-------------|-----------:|-------------------:|--------:|--------------------------:|
-| `int` | 5.56 s | 0.247 s | 22.5× | ~40,500 |
-| `text` | 5.72 s | 0.262 s | 21.8× | ~38,100 |
+| `int` | 6.18 s | 0.265 s | 23.3× | ~37,800 |
+| `text` | 6.26 s | 0.278 s | 22.5× | ~35,900 |
 
-Neither mode calls `fsync`, so the speedup does not come from avoided disk syncs. It comes from paying the per-statement cost of opening, writing back, and closing the table file once instead of 10,000 times.
+Autocommit pays for 10,000 syncs where the transaction pays for one, but on macOS a plain `fsync` is cheap: syncing added only about 0.6 s to the autocommit runs. Most of the gap is still the per-statement cost of opening, writing back, and closing the table file 10,000 times. With `FULL_FSYNC` set, each sync costs about 3 ms on this machine, so syncs would dominate the autocommit runs instead.
 
 ### Comparison with SQLite
 
@@ -276,22 +278,22 @@ The `benchmarks/` directory contains four workloads. Each creates a table, inser
 
 | Benchmark | StripeSQL | SQLite | Ratio |
 |-----------|----------:|-------:|------:|
-| `10k.sql` (int PK, no transaction) | 6.35 s | 2.83 s | 2.2× |
-| `10k_txn.sql` (int PK, single transaction) | 0.940 s | 0.020 s | 47× |
-| `10k_str.sql` (text PK, no transaction) | 6.44 s | 2.92 s | 2.2× |
-| `10k_str_txn.sql` (text PK, single transaction) | 0.856 s | 0.020 s | 42× |
+| `10k.sql` (int PK, no transaction) | 6.62 s | 2.66 s | 2.5× |
+| `10k_txn.sql` (int PK, single transaction) | 0.853 s | 0.019 s | 45× |
+| `10k_str.sql` (text PK, no transaction) | 6.86 s | 2.75 s | 2.5× |
+| `10k_str_txn.sql` (text PK, single transaction) | 0.859 s | 0.022 s | 40× |
 
 ```mermaid
 xychart-beta
     title "StripeSQL vs SQLite — median seconds over 5 trials (lower is better)"
     x-axis ["10k", "10k_txn", "10k_str", "10k_str_txn"]
     y-axis "Seconds" 0 --> 7
-    bar "StripeSQL" [6.354, 0.940, 6.437, 0.856]
-    bar "SQLite" [2.829, 0.020, 2.919, 0.020]
+    bar "StripeSQL" [6.616, 0.853, 6.861, 0.859]
+    bar "SQLite" [2.663, 0.019, 2.746, 0.022]
 ```
 
-- **The autocommit comparison is not like-for-like.** Each bare `INSERT` is its own transaction on both engines, but SQLite syncs its journal and database file to disk on every commit, while StripeSQL never calls `fsync` and leaves flushing to the OS. SQLite does more durability work per commit and is still 2.2× faster. Write-ahead logging (see Roadmap) is what will close the durability gap.
-- **In the transaction runs, most of StripeSQL's time is the closing `DELETE FROM`.** It takes about 0.57 s of the ~0.9 s total, because every emptied page is removed from the B+ tree individually, with borrow/merge rebalancing along the way; SQLite erases a table's contents wholesale when `DELETE` has no `WHERE` clause. The inserts themselves take about 0.25 s (see Transaction batching). The B+ tree's linear search within nodes, and node structs allocated at the full configured order (`M_GLOBAL`, see `const.h`) regardless of fill, are other identified costs relative to SQLite's B-tree.
+- **Both engines sync every commit.** Each bare `INSERT` is its own transaction on both engines, and neither returns until the commit is synced: StripeSQL syncs the table file, SQLite (rollback journal, `synchronous=FULL`) syncs its journal and database file. Neither uses `F_FULLFSYNC` by default. The remaining difference in guarantees is atomicity: SQLite's journal lets it roll back a commit interrupted by a crash, which StripeSQL can't do until write-ahead logging lands (see Known Issues).
+- **In the transaction runs, most of StripeSQL's time is the closing `DELETE FROM`.** It takes about 0.57 s of the ~0.85 s total, because every emptied page is removed from the B+ tree individually, with borrow/merge rebalancing along the way; SQLite erases a table's contents wholesale when `DELETE` has no `WHERE` clause. The inserts themselves take about 0.27 s (see Transaction batching). The B+ tree's linear search within nodes, and node structs allocated at the full configured order (`M_GLOBAL`, see `const.h`) regardless of fill, are other identified costs relative to SQLite's B-tree.
 - Text and integer primary keys track each other closely on both engines, so StripeSQL's key-dispersion scheme (see Known Issues) isn't adding meaningful overhead of its own.
 
 ---
