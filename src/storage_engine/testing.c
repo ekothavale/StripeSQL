@@ -1398,6 +1398,52 @@ void test_btree_commit_delete_persist(void) {
     printf("PASS\n");
 }
 
+/*
+commit() on a table with nothing dirty (e.g. after a read-only statement) must
+write nothing: a header change made without dirtying any page or node must
+not reach disk.
+*/
+void test_btree_commit_skips_clean(void) {
+    printf("  test_btree_commit_skips_clean ... ");
+    table* t = createTree("bt_csc", pn(1));
+    assert(t != NULL);
+    address root = t->root;
+
+    t->root = root + 1;  // header-only change, nothing marked dirty
+    assert(commit(t));
+    close_table_keep_file(t);
+
+    table* t2 = calloc(1, sizeof(table));
+    assert(loadTable("bt_csc", t2));
+    assert(t2->root == root);
+
+    deleteTree(t2);
+    printf("PASS\n");
+}
+
+/*
+commit() must report failure when its writes cannot reach the file, here by
+swapping in a read-only stream so every write fails.
+*/
+void test_btree_commit_reports_write_failure(void) {
+    printf("  test_btree_commit_reports_write_failure ... ");
+    table* t = createTree("bt_crwf", pn(1));
+    assert(t != NULL);
+    findAndInsert(pn(2), t);  // dirties a new page and the root node
+
+    FILE* writable = t->source;
+    char* path = build_tbl_path("bt_crwf");
+    t->source = fopen(path, "rb");
+    free(path);
+    assert(t->source != NULL);
+    assert(!commit(t));
+
+    fclose(t->source);
+    t->source = writable;
+    deleteTree(t);
+    printf("PASS\n");
+}
+
 // ── Group 4: insert and split ──────────────────────────────────────────────
 
 /*
@@ -1728,6 +1774,8 @@ void test_btree(void) {
     test_btree_commit_drains_stacks();
     test_btree_commit_persist();
     test_btree_commit_delete_persist();
+    test_btree_commit_skips_clean();
+    test_btree_commit_reports_write_failure();
     // insert and split
     test_btree_insert_new_page();
     test_btree_insert_existing_page();

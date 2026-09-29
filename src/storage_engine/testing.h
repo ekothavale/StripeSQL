@@ -35,6 +35,8 @@ void test_btree_record_delete(void);
 void test_btree_commit_drains_stacks(void);
 void test_btree_commit_persist(void);
 void test_btree_commit_delete_persist(void);
+void test_btree_commit_skips_clean(void);
+void test_btree_commit_reports_write_failure(void);
 void test_btree_insert_new_page(void);
 void test_btree_insert_existing_page(void);
 void test_btree_split_structure(void);

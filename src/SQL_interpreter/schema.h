@@ -70,6 +70,6 @@ void deleteHT(uint32_t, hashtable* table);
 // Public API — callable from outside this translation unit
 void initSchema();
 hashtable* loadSchema();
-void saveSchema(hashtable* schema);
+bool saveSchema(hashtable* schema);
 
 #endif

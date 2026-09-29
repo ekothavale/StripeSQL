@@ -26,6 +26,7 @@ Some combinations of constant values may break the DBMS
 
 #define M_GLOBAL 45		// order (number of children a node can have) of the tree
 #define PAGE_SIZE 4096 		// size in bytes of each page
+#define FULL_FSYNC 0		// 1: sync commits with F_FULLFSYNC, which also flushes the drive's cache on macOS; 0: plain fsync (SQLite's default)
 
 // NEED TO PROGRAMMATICALLY CALCULATE THESE BASED ON PAGE SIZE
 // THE VALUES BELOW ARE PLACEHOLDERS

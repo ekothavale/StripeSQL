@@ -87,12 +87,13 @@ static node* newNode(bool isLeaf, address parent) {
 /*
 creates and initializes a new table file and fills it with a new b+ tree, with one empty node and one empty page
 @param pageNum - the page number of the starting page
-@return - table struct containing the necessary data to use the table
+@return - table struct containing the necessary data to use the table, or NULL if the table file could not be created or synced
 mallocs new memory (table)
 */
 table* createTree(char* tablename, page_num firstKey) {
 	// create structs
 	table* t = createTable(tablename);
+	if (!t) return NULL;
 	node* root = calloc(1, sizeof(node));
 	address rootAddr = allocNode(t);
 	slotted_page* page = makeSPage(firstKey, PAGE_NUM_SLOTS, PAGE_NUM_ENTRIES, PAGE_ARR_CAP);
@@ -108,9 +109,13 @@ table* createTree(char* tablename, page_num firstKey) {
 	t->root = rootAddr;
 
 	// write structs and flush metadata (root pointer) to disk
-	writeNewTree(page, pageAddr, root, rootAddr, t);
+	bool written = writeNewTree(page, pageAddr, root, rootAddr, t);
 	free(root);
 	free(page);
+	if (!written) {
+		deleteTable(t); // don't leave a half-written table file behind
+		return NULL;
+	}
 	return t;
 }
 

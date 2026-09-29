@@ -82,12 +82,13 @@ void loadNext(node* n, node* next, table* t);
 // writing
 void writeNextPage(table* t);
 void writeNextNode(table* t);
-void writeNewTree(slotted_page* p, address pageAddr, node* n, address nodeAddr, table* t);
+bool writeNewTree(slotted_page* p, address pageAddr, node* n, address nodeAddr, table* t);
+bool syncFile(FILE* file); // flush a stream and force it to stable storage
 // marking dirty objects
 void markPage(address address, slotted_page* p, table* t);
 void markNode(address address, node* n, table* t);
 void markDelete(address address, table* t); // can be used for any object type
-void commit(table* t);
+bool commit(table* t);
 void discard(table* t);
 // allocate new addresses
 void newStripe(table* t);

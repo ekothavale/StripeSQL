@@ -21,6 +21,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 
 #include "../memory.h"
 #include "../value.h"
+#include "../storage_engine/tableIO.h"
 
 // ##########################################################################################################################################
 // ##########################################################################################################################################
@@ -175,6 +176,7 @@ void initSchema() {
 	fwrite(&magic, sizeof(uint32_t), 1, tfile);
 	uint32_t zero = 0;
 	fwrite(&zero, sizeof(uint32_t), 1, tfile);
+	if (!syncFile(tfile)) printf("Error: failed to write schema file to disk\n");
 	fclose(tfile);
 }
 
@@ -287,17 +289,21 @@ hashtable* loadSchema() {
 
 /*
 assumes the hashtable contains accurate data
+@return false if the schema file could not be written and synced
 */
-void saveSchema(hashtable* schema) {
+bool saveSchema(hashtable* schema) {
 	const char* path = SCHEMA_PATH;
 
 	FILE* tfile = fopen(path, "wb");
 	if (!tfile) {
 		printf("Error: failed to open schema file for writing\n");
-		return;
+		return false;
 	}
 	uint32_t magic = SCHEMA_MAGIC;
 	fwrite(&magic, sizeof(uint32_t), 1, tfile);
 	writeEntries(schema, tfile);
+	bool synced = syncFile(tfile);
 	fclose(tfile);
+	if (!synced) printf("Error: failed to write schema file to disk\n");
+	return synced;
 }

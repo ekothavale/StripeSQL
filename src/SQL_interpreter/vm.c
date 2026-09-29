@@ -231,11 +231,16 @@ void openScanner(uint32_t tableNameHash, uint8_t pkIdx) {
 	vm.scanners[idx].pkIdx    = pkIdx;
 }
 
-void closeScanner(scanner* s) {
-	if (!s->open) return;
+/*
+closes a scanner, committing its table unless a transaction owns it
+returns false if that commit failed to reach disk
+*/
+bool closeScanner(scanner* s) {
+	if (!s->open) return true;
+	bool committed = true;
 	// tables owned by an active transaction stay open until COMMIT/DISCARD
 	if (!findTxnTable(s->tblHash)) {
-		commit(s->tbl);
+		committed = commit(s->tbl);
 		fclose(s->tbl->source);
 		freeTable(s->tbl);
 	}
@@ -248,6 +253,7 @@ void closeScanner(scanner* s) {
 	s->started = false;
 	s->atEnd   = false;
 	vm.numScanners--;
+	return committed;
 }
 
 /*
@@ -590,7 +596,7 @@ static interpret_result run() {
 				break;
 			}
 			case OP_CLOSE_SCAN: {
-				closeScanner(&vm.scanners[vm.numScanners-1]);
+				if (!closeScanner(&vm.scanners[vm.numScanners-1])) return INTERPRET_RUNTIME_ERROR;
 				break;
 			}
 			// advance scanner to next record. if at the end of the tree, jump to target
@@ -750,11 +756,10 @@ static interpret_result run() {
 				// otherwise create the table
 				page_num firstKey = { .type = getPkOrderingType(s) };
 				table* t = createTree(s->tablename, firstKey);
-				if (t) {
-					fclose(t->source);
-					freeTable(t);
-				}
-				saveSchema(vm.schema);
+				if (!t) return INTERPRET_RUNTIME_ERROR; // don't register a table whose file wasn't created
+				fclose(t->source);
+				freeTable(t);
+				if (!saveSchema(vm.schema)) return INTERPRET_RUNTIME_ERROR;
 				break;
 			}
 			case OP_DROP_TABLE: {
@@ -769,7 +774,7 @@ static interpret_result run() {
 					free(t);
 					printf("Error: table '%s' not found\n", name);
 				}
-				saveSchema(vm.schema);
+				if (!saveSchema(vm.schema)) return INTERPRET_RUNTIME_ERROR;
 				break;
 			}
 			case OP_BEGIN_TRANSACTION: {
@@ -786,14 +791,17 @@ static interpret_result run() {
 					printf("Error: no transaction in progress to commit\n");
 					break;
 				}
+				// commit every table even if one fails; failures are reported, not retried
+				bool committed = true;
 				for (int i = 0; i < transaction.count; i++) {
 					table* t = transaction.tables[i].tbl;
-					commit(t);
+					if (!commit(t)) committed = false;
 					fclose(t->source);
 					freeTable(t);
 				}
 				transaction.active = false;
 				transaction.count = 0;
+				if (!committed) return INTERPRET_RUNTIME_ERROR;
 				break;
 			}
 			case OP_DISCARD: {

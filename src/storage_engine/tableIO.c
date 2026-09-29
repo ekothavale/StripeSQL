@@ -42,6 +42,8 @@ TODO:
 #include "../memory.h"
 #include <stdbool.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #define ADDR_TABLE_MAX_LOAD_FACTOR 0.8
 
@@ -850,10 +852,29 @@ void writeNextNode(table* t) {
 writes a new tree consisting of one empty page and one empty node directly to a table file
 should be used only on a new file
 */
-void writeNewTree(slotted_page* p, address pageAddr, node* n, address nodeAddr, table* t) {
+bool writeNewTree(slotted_page* p, address pageAddr, node* n, address nodeAddr, table* t) {
 	writePage(p, pageAddr, t);
 	writeNode(n, nodeAddr, t);
 	writeMeta(t->source, t);
+	if (!syncFile(t->source)) {
+		printf("Error: failed to write table '%s' to disk\n", t->name);
+		return false;
+	}
+	return true;
+}
+
+/*
+flushes a stream's buffered writes and forces them to stable storage
+fails if the flush or sync fails, or if any write since the stream's error indicator was last cleared failed
+FULL_FSYNC (see const.h) selects F_FULLFSYNC on platforms that have it
+*/
+bool syncFile(FILE* file) {
+	if (fflush(file) != 0 || ferror(file)) return false;
+#if FULL_FSYNC && defined(F_FULLFSYNC)
+	return fcntl(fileno(file), F_FULLFSYNC) != -1;
+#else
+	return fsync(fileno(file)) == 0;
+#endif
 }
 
 /*MIGHT NEED THESE TO RETURN TRUE OR FALSE*/
@@ -907,9 +928,14 @@ void deleteObject(address address, table* t) {
 }
 
 /*
-empties a table's write tables and makes the changes to the file on disk
+empties a table's write tables and makes the changes to the file on disk, then syncs the file
+a table with nothing dirty (e.g. after a read-only statement) is left untouched and not synced
+@return false if any write or the sync failed; the file may then hold a partial commit
 */
-void commit(table* t) {
+bool commit(table* t) {
+	if (t->pageDirty.count == 0 && t->nodeDirty.count == 0 && t->delete.count == 0) return true;
+	clearerr(t->source); // scope syncFile()'s error check to this commit's writes
+
 	for (int i = 0; i < t->pageDirty.capacity; i++) {
 		addr_entry* e = &t->pageDirty.entries[i];
 		if (e->key == 0) continue;
@@ -944,6 +970,11 @@ void commit(table* t) {
 	t->delete.count = 0;
 
 	writeMeta(t->source, t);
+	if (!syncFile(t->source)) {
+		printf("Error: failed to write table '%s' to disk\n", t->name);
+		return false;
+	}
+	return true;
 }
 
 /*
