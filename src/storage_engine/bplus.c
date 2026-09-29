@@ -283,6 +283,7 @@ static void splitUpdateParent(node* parent, node* child, address childAddr, page
 			parent->children[i+2] = child;*/
 			parent->children[i+1] = childAddr;
 			parent->childCount++;
+			markNode(child->parent, parent, t);
 			return;
 		}
 	}

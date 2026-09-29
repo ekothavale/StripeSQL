@@ -40,6 +40,7 @@ void test_btree_insert_existing_page(void);
 void test_btree_split_structure(void);
 void test_btree_split_find_all(void);
 void test_btree_split_linked_list(void);
+void test_btree_split_non_last_child(void);
 void test_btree_delete_page(void);
 void test_btree_delete_triggers_borrow(void);
 void test_btree_delete_triggers_merge(void);

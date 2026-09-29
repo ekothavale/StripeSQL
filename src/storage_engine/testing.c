@@ -1503,6 +1503,28 @@ void test_btree_split_linked_list(void) {
     printf("PASS\n");
 }
 
+/*
+Splitting a node that is not its parent's last child must register the new
+sibling in the parent. Inserting in descending order routes every page after
+the first split into the leftmost leaf, so each later split takes the
+mid-parent path in splitUpdateParent; every page must remain findable.
+*/
+void test_btree_split_non_last_child(void) {
+    printf("  test_btree_split_non_last_child ... ");
+    uint32_t total = 3 * M_GLOBAL;
+    table* t = createTree("bt_snl", pn(total));
+    assert(t != NULL);
+
+    for (uint32_t i = total - 1; i >= 1; i--)
+        findAndInsert(pn(i), t);
+
+    for (uint32_t i = 1; i <= total; i++)
+        assert(findPage(pn(i), t) != 0);
+
+    deleteTree(t);
+    printf("PASS\n");
+}
+
 // ── Group 5: page deletion and tree rebalancing ────────────────────────────
 
 /*
@@ -1712,6 +1734,7 @@ void test_btree(void) {
     test_btree_split_structure();
     test_btree_split_find_all();
     test_btree_split_linked_list();
+    test_btree_split_non_last_child();
     // page deletion and rebalancing
     test_btree_delete_page();
     test_btree_delete_triggers_borrow();
