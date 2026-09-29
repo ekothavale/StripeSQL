@@ -244,31 +244,55 @@ Execution time is reported automatically after every file-mode run (wall-clock, 
  1.243 ms
 ```
 
-The `benchmarks/` directory contains four workloads: 10,000 sequential `INSERT`s with an integer primary key and with a text primary key, each run both bare and with the inserts wrapped in a single `BEGIN TRANSACTION` / `COMMIT`. The table below compares wall-clock time against SQLite 3.43.2 running the identical script through its own CLI — both engines on their out-of-the-box default settings (no custom pragmas; SQLite's default rollback-journal mode), averaged over 3 trials on an Apple M-series chip.
+All figures below were measured on an Apple M2 with an `-O3` build (the Makefile's flags, no sanitizers) and a warm OS page cache. Each is the median of 5 trials, taken after one discarded warm-up run. They will vary with page fill factor, tree depth, `M_GLOBAL`, and disk speed.
 
-| Benchmark | FileSQLite (avg) | SQLite (avg) | Ratio |
-|-----------|------------------:|--------------:|------:|
-| `10k.sql` (int PK, no transaction) | 3.782 s | 2.688 s | 1.4× |
-| `10k_txn.sql` (int PK, single transaction) | 0.231 s | 0.018 s | 12.8× |
-| `10k_str.sql` (text PK, no transaction) | 3.849 s | 2.693 s | 1.4× |
-| `10k_str_txn.sql` (text PK, single transaction) | 0.246 s | 0.023 s | 10.7× |
+### Primary-key lookup vs. full scan
+
+A table `(id int PRIMARY KEY, v int)` is loaded with N rows where `v = id`, so both columns hold identical values. Random keys are then looked up two ways: `WHERE id = k`, which compiles to `OP_KEY_SEARCH` (a B+ tree descent), and `WHERE v = k`, which has no index and falls back to a full table scan. Each lookup runs as its own statement, and the built-in timer's total is divided by the number of queries (1,000 index lookups per trial; fewer scans at larger N, since each one reads the whole table). Every query is checked to return exactly the expected row.
+
+| Rows | PK lookup | Full scan | Speedup |
+|-----:|----------:|----------:|--------:|
+| 1,000 | 0.30 ms | 33.7 ms | 114× |
+| 10,000 | 0.35 ms | 335 ms | 967× |
+| 100,000 | 0.40 ms | 3,658 ms | ~9,000× |
+
+- **Lookup latency is nearly flat.** It grows 36% across a 100× increase in rows, while scan time grows roughly linearly — the O(log n) vs. O(n) difference the index exists for.
+- **The scan side is inflated by storage footprint.** The table file takes about 5.4 KB per row (536 MB at 100,000 rows), so a full scan reads far more data than the rows themselves contain. A denser page layout would shrink scan times, and the speedup with them.
+
+### Transaction batching
+
+10,000 sequential `INSERT`s are run twice: once in autocommit mode, where every statement opens the table file, writes its changes back, and closes it; and once wrapped in a single `BEGIN TRANSACTION` / `COMMIT`, where dirty pages and nodes stay buffered until the commit. These scripts contain only the `CREATE TABLE` and the inserts, timed with the built-in timer.
+
+| Primary key | Autocommit | Single transaction | Speedup | Inserts/sec (transaction) |
+|-------------|-----------:|-------------------:|--------:|--------------------------:|
+| `int` | 5.56 s | 0.247 s | 22.5× | ~40,500 |
+| `text` | 5.72 s | 0.262 s | 21.8× | ~38,100 |
+
+Neither mode calls `fsync`, so the speedup does not come from avoided disk syncs. It comes from paying the per-statement cost of opening, writing back, and closing the table file once instead of 10,000 times.
+
+### Comparison with SQLite
+
+The `benchmarks/` directory contains four workloads. Each creates a table, inserts 10,000 sequential rows (integer or text primary key, bare or wrapped in one transaction), then runs `DELETE FROM` and `DROP TABLE`. Both engines are timed the same way: wall-clock time for the whole process, including startup, with a fresh database every trial. SQLite 3.45.3 runs the identical script through its CLI on default settings: rollback journal (`journal_mode=delete`), `synchronous=FULL`, no custom pragmas.
+
+| Benchmark | StripeSQL | SQLite | Ratio |
+|-----------|----------:|-------:|------:|
+| `10k.sql` (int PK, no transaction) | 6.35 s | 2.83 s | 2.2× |
+| `10k_txn.sql` (int PK, single transaction) | 0.940 s | 0.020 s | 47× |
+| `10k_str.sql` (text PK, no transaction) | 6.44 s | 2.92 s | 2.2× |
+| `10k_str_txn.sql` (text PK, single transaction) | 0.856 s | 0.020 s | 42× |
 
 ```mermaid
 xychart-beta
-    title "FileSQLite vs SQLite — avg seconds over 3 trials (lower is better)"
+    title "StripeSQL vs SQLite — median seconds over 5 trials (lower is better)"
     x-axis ["10k", "10k_txn", "10k_str", "10k_str_txn"]
-    y-axis "Seconds" 0 --> 4
-    bar "FileSQLite" [3.782, 0.231, 3.849, 0.246]
-    bar "SQLite" [2.688, 0.018, 2.693, 0.023]
+    y-axis "Seconds" 0 --> 7
+    bar "StripeSQL" [6.354, 0.940, 6.437, 0.856]
+    bar "SQLite" [2.829, 0.020, 2.919, 0.020]
 ```
 
-Two things stand out:
-
-- **The non-transactional runs are dominated by per-statement commit overhead on both engines.** Each bare `INSERT` is its own implicit transaction, so 10,000 inserts means 10,000 fsync-equivalent commits — for both FileSQLite and SQLite. That cost swamps everything else, which is why the gap narrows to 1.4× here even though it's over 10× wider once that overhead is amortized away by wrapping the same inserts in one transaction.
-- **The transaction-wrapped runs are the more honest comparison of raw per-operation cost** — a 10-13× gap once commit is a single event rather than 10,000. The B+ tree searches within a node linearly rather than with a binary search, and node structs are allocated at the full configured order (`M_GLOBAL`, see `const.h`) regardless of actual fill — both real, identified costs relative to SQLite's tuned page cache and B-tree implementation.
-- Text and integer primary keys track each other closely on both engines, so FileSQLite's key-dispersion scheme (see Known Issues) isn't adding meaningful overhead of its own.
-
-These figures were measured with a plain `make` build (`-O3`, no sanitizers) and will vary with page fill factor, tree depth, `M_GLOBAL`, and disk speed.
+- **The autocommit comparison is not like-for-like.** Each bare `INSERT` is its own transaction on both engines, but SQLite syncs its journal and database file to disk on every commit, while StripeSQL never calls `fsync` and leaves flushing to the OS. SQLite does more durability work per commit and is still 2.2× faster. Write-ahead logging (see Roadmap) is what will close the durability gap.
+- **In the transaction runs, most of StripeSQL's time is the closing `DELETE FROM`.** It takes about 0.57 s of the ~0.9 s total, because every emptied page is removed from the B+ tree individually, with borrow/merge rebalancing along the way; SQLite erases a table's contents wholesale when `DELETE` has no `WHERE` clause. The inserts themselves take about 0.25 s (see Transaction batching). The B+ tree's linear search within nodes, and node structs allocated at the full configured order (`M_GLOBAL`, see `const.h`) regardless of fill, are other identified costs relative to SQLite's B-tree.
+- Text and integer primary keys track each other closely on both engines, so StripeSQL's key-dispersion scheme (see Known Issues) isn't adding meaningful overhead of its own.
 
 ---
 
