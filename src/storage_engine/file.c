@@ -61,6 +61,29 @@ bool syncDirectory(const char* path) {
 
 // ##########################################################################################################################################
 // ##########################################################################################################################################
+// LOCKING
+
+/*
+opens (creating if needed) the file at path and takes an exclusive lock on it without waiting
+returns the open descriptor, which holds the lock until it's closed or the process exits, or -1 if
+another process already holds the lock or the file can't be opened
+the OS drops the lock when its process dies, even by crashing, so a crash never leaves a stale lock
+uses a POSIX record lock, which belongs to the process: closing any other descriptor for this same
+file would release it, so the lock file must not be opened anywhere else
+*/
+int lockFileExclusive(const char* path) {
+	int fd = open(path, O_RDWR | O_CREAT, 0644);
+	if (fd == -1) return -1;
+	struct flock lock = { .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0 };
+	if (fcntl(fd, F_SETLK, &lock) == -1) {
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+// ##########################################################################################################################################
+// ##########################################################################################################################################
 // BYTE ENCODING
 
 /*

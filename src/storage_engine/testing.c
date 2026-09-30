@@ -18,6 +18,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 
 #include "testing.h"
 #include "wal.h"
+#include "file.h"
 #include <unistd.h>
 #include <sys/wait.h>
 
@@ -1808,6 +1809,45 @@ void test_btree(void) {
     test_btree_delete_tree();
     test_btree_delete_tree_not_reloadable();
     printf("=== All B+ tree tests passed ===\n");
+}
+
+// ##########################################################################################################################################
+// ##########################################################################################################################################
+// FILE HELPER TESTS
+
+/* Whether a forked child process can take the lock on path. */
+static bool child_can_lock(const char* path) {
+    fflush(NULL);  // so the child doesn't re-flush output buffered before the fork
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) _exit(lockFileExclusive(path) == -1 ? 1 : 0);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+/*
+While one process holds the lock, another must be refused; once it's released,
+the other can take it. (Record locks belong to a process, so the second taker
+has to be a separate process.)
+*/
+void test_file_lock_excludes_other_processes(void) {
+    printf("  test_file_lock_excludes_other_processes ... ");
+    const char* path = TABLE_DIRECTORY "_lock_test.lock";
+    int fd = lockFileExclusive(path);
+    assert(fd != -1);
+    assert(!child_can_lock(path));
+    close(fd);
+    assert(child_can_lock(path));
+    remove(path);
+    printf("PASS\n");
+}
+
+/* Run all file helper tests. */
+void test_file(void) {
+    printf("=== File Helper Tests ===\n");
+    test_file_lock_excludes_other_processes();
+    printf("=== All file helper tests passed ===\n");
 }
 
 // ##########################################################################################################################################

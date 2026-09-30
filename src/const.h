@@ -38,5 +38,6 @@ Some combinations of constant values may break the DBMS
 
 #define TABLE_DIRECTORY "tables/" // directory in which table files (and the write-ahead log) are placed
 #define TABLE_EXTENSION ".tbl" // file extension for table files
+#define LOCK_PATH TABLE_DIRECTORY "stripe.lock" // held by the one process allowed to use the database
 
 #endif

@@ -50,6 +50,10 @@ void test_btree_full_roundtrip(void);
 void test_btree_delete_tree(void);
 void test_btree_delete_tree_not_reloadable(void);
 
+/* File helper tests */
+void test_file(void);
+void test_file_lock_excludes_other_processes(void);
+
 /* Write-ahead log tests */
 void test_wal(void);
 void test_wal_crc32c_check_value(void);

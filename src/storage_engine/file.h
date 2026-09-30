@@ -26,6 +26,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 bool syncFile(FILE* file); // flush a stream and force it to stable storage
 bool syncDirectory(const char* path); // make the creation/removal of entries in a directory durable
 
+// exclusion between processes
+int lockFileExclusive(const char* path); // returns a descriptor holding the lock, or -1 if it's taken
+
 // big-endian byte encoding (UNSAFE - assume there's enough space in the buffer)
 void writeULongBytewise(char* arr, uint64_t lui);
 void writeUIntBytewise(char* arr, uint32_t ui);
