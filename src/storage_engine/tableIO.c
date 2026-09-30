@@ -39,11 +39,15 @@ TODO:
 */
 
 #include "tableIO.h"
+#include "file.h"
+#include "wal.h"
 #include "../memory.h"
 #include <stdbool.h>
 #include <sys/stat.h>
+#include <errno.h>
 
 #define ADDR_TABLE_MAX_LOAD_FACTOR 0.8
+#define GARBAGE_MARKER 2 // a two in the first byte of an object means it's garbage
 
 // ##########################################################################################################################################
 // ##########################################################################################################################################
@@ -76,24 +80,6 @@ static bool jumpRel(long offset, table* t) {
 	}
 }
 
-
-/*
-UNSAFE FUNCTION - assumes there's enough space in the array for the long
-big endian
-*/
-static void writeULongBytewise(char* arr, uint64_t lui) {
-	for (int i = 7; i >= 0; i--) {
-		*(arr+i) = lui & 0xFF;
-		lui >>= 8;
-	}
-}
-
-static void writeUIntBytewise(char* arr, uint32_t ui) {
-	for (int i = 3; i >= 0; i--) {
-		*(arr+i) = ui & 0xFF;
-		ui >>= 8;
-	}
-}
 
 /*
 Serializes a page_num into exactly PAGE_NUM_DISK_SIZE bytes at buf.
@@ -333,8 +319,11 @@ static bool loadMeta(FILE* file, char* fname, table* table) {
 	return true;
 }
 
-bool writeMeta(FILE* file, table* t) {
-	uint32_t buf[] = {
+/*
+fills buf with the table's METALEN metadata words, in the order they're stored at the start of the file
+*/
+static void fillMeta(table* t, uint32_t* buf) {
+	uint32_t meta[METALEN] = {
 		MAGIC,
 		t->metalen,
 		t->pageStripes,
@@ -352,6 +341,12 @@ bool writeMeta(FILE* file, table* t) {
 		(uint32_t) (t->root & 0xFFFFFFFF),
 		t->M
 	};
+	memcpy(buf, meta, sizeof(meta));
+}
+
+bool writeMeta(FILE* file, table* t) {
+	uint32_t buf[METALEN];
+	fillMeta(t, buf);
 	jump(0, t);
 	fwrite(buf, 4, METALEN, file);
 	return true;
@@ -361,16 +356,23 @@ bool writeMeta(FILE* file, table* t) {
 // ##########################################################################################################################################
 // Dirty Hash Table Functions
 
+static void freeUndo(table* t);
+
 /*
-initializes a table's dirty-write hash tables
+initializes a table's dirty-write hash tables (and its statement-rollback state)
 */
-static void setStacks(table* t) {
+static void initDirtyHashmaps(table* t) {
 	initAddrTable(&t->pageDirty);
 	initAddrTable(&t->nodeDirty);
 	initAddrTable(&t->delete);
+	t->undo.active = false;
+	initAddrTable(&t->undo.pages);
+	initAddrTable(&t->undo.nodes);
+	initAddrTable(&t->undo.deletes);
 }
 
-static void freeStacks(table* t) {
+static void freeDirtyHashmaps(table* t) {
+	if (t->undo.active) freeUndo(t);
 	freeAddrTable(&t->pageDirty);
 	freeAddrTable(&t->nodeDirty);
 	freeAddrTable(&t->delete);
@@ -457,6 +459,39 @@ void insertAddrTable(address key, void* value, addr_table* at) {
 	if (isNew) at->count++;
 }
 
+/*
+removes key from the table if it's present, handing its value to valueOut (the caller now owns it)
+uses backward-shift deletion: later entries in the same probe run are moved back into the hole, so linear
+probing still finds every remaining key and an empty slot still ends a search, without tombstones
+@return false if key wasn't present
+*/
+bool removeAddrTable(address key, addr_table* at, void** valueOut) {
+	if (at->capacity == 0) return false;
+	addr_entry* found = findAddrEntry(key, at->entries, at->capacity);
+	if (found->key == 0) return false;
+	if (valueOut) *valueOut = found->value;
+	uint64_t capacity = (uint64_t)at->capacity;
+	uint64_t hole = (uint64_t)(found - at->entries);
+	for (uint64_t i = (hole + 1) % capacity; at->entries[i].key != 0; i = (i + 1) % capacity) {
+		uint64_t home = hashAddress(at->entries[i].key) % capacity;
+		// an entry can move back into the hole unless its home slot lies cyclically within (hole, i]
+		bool homeInRange = hole < i ? (home > hole && home <= i) : (home > hole || home <= i);
+		if (homeInRange) continue;
+		at->entries[hole] = at->entries[i];
+		hole = i;
+	}
+	at->entries[hole].key = 0;
+	at->entries[hole].value = NULL;
+	at->count--;
+	return true;
+}
+
+// whether key is present (findAddrTable can't tell, since a present key's value may be NULL)
+static bool containsAddrTable(address key, addr_table* at) {
+	if (at->capacity == 0) return false;
+	return findAddrEntry(key, at->entries, at->capacity)->key != 0;
+}
+
 // ##########################################################################################################################################
 // ##########################################################################################################################################
 // PUBLIC API FUNCTIONS
@@ -466,7 +501,7 @@ frees a table struct, including the struct itself and all of its memory allocate
 frees allocated memory
 */
 void freeTable(table* t) {
-	freeStacks(t);
+	freeDirtyHashmaps(t);
 	free(t->name);
 	free(t);
 }
@@ -476,25 +511,24 @@ Creates a new file for a database table and returns the matching table struct
 Used to create a new table
 mallocs new memory (table)
 */
-table* createTable(char* tablename) {
-	// Build path: "tables/<tablename>.tbl"
-	const char* dir = TABLE_DIRECTORY;
-	const char* ext = TABLE_EXTENSION;
-	size_t pathlen = strlen(dir) + strlen(tablename) + strlen(ext) + 1;
+/*
+builds the path "tables/<tablename>.tbl" (caller frees)
+*/
+static char* tablePath(const char* tablename) {
+	size_t pathlen = strlen(TABLE_DIRECTORY) + strlen(tablename) + strlen(TABLE_EXTENSION) + 1;
 	char* path = malloc(pathlen);
-	snprintf(path, pathlen, "%s%s%s", dir, tablename, ext);
+	snprintf(path, pathlen, "%s%s%s", TABLE_DIRECTORY, tablename, TABLE_EXTENSION);
+	return path;
+}
 
-	mkdir(dir, 0755); // no-op if directory already exists
-
-	FILE* f = fopen(path, "wb+");
-	free(path);
-	if (!f) {
-		printf("Error: failed to create table file for '%s'\n", tablename);
-		return NULL;
-	}
-
+/*
+initializes the struct for a new, empty table without touching the disk
+mallocs new memory (table)
+*/
+static table* initTable(char* tablename) {
 	table* t = malloc(sizeof(table));
-	t->source        = f;
+	t->source        = NULL;
+	t->isNew         = false;
 	t->cursor        = 0;
 	t->metalen       = METALEN * 4;
 	t->pageStripes   = 1;
@@ -513,8 +547,38 @@ table* createTable(char* tablename) {
 	t->root          = 0;
 	t->name          = strdup(tablename);
 
-	setStacks(t);
+	initDirtyHashmaps(t);
+	return t;
+}
+
+/*
+creates a table's file immediately and writes its header, bypassing the write-ahead log
+for low-level use and testing; the database creates tables with newTable() and a commit instead
+*/
+table* createTable(char* tablename) {
+	char* path = tablePath(tablename);
+	mkdir(TABLE_DIRECTORY, 0755); // no-op if directory already exists
+	FILE* f = fopen(path, "wb+");
+	free(path);
+	if (!f) {
+		printf("Error: failed to create table file for '%s'\n", tablename);
+		return NULL;
+	}
+	table* t = initTable(tablename);
+	t->source = f;
 	writeMeta(f, t);
+	return t;
+}
+
+/*
+creates a table in memory only; its file is created when the table is first committed (see
+commitTables()), after the commit point, so a crash beforehand leaves nothing behind
+until then, only objects in the dirty hashmaps can be read
+mallocs new memory (table)
+*/
+table* newTable(char* tablename) {
+	table* t = initTable(tablename);
+	t->isNew = true;
 	return t;
 }
 
@@ -547,10 +611,11 @@ bool loadTable(char* tablename, table* t) {
 		return false;
 	}
 	t->source = tfile;
+	t->isNew  = false;
 	t->cursor = 0;
 	t->name   = strdup(tablename);
 	loadMeta(tfile, fname, t);
-	setStacks(t);
+	initDirtyHashmaps(t);
 	free(fname);
 	return true;
 }
@@ -712,7 +777,7 @@ bool readNode(address addr, node* n, table* t) {
 }
 // write page
 /*
-writes the given page to the given address
+serializes the given page into a newly allocated buffer of exactly t->pageSize bytes (caller frees)
 page layout:
  | 0 | pageNum | usedData | numRecords | numEntries | arrCap |
  | maxEntries | maxSlots | slots | ... | records |
@@ -721,9 +786,7 @@ the code in page.c -> hasSpace() relies on the number of bytes used to represent
 if any changes are made to that encoding, hasSpace() must be updated as well
 please feel free to change the design of this system because I feel unclean using code like this
 */
-static void writePage(slotted_page* p, address address, table* t) {
-	// setup
-	jump(address, t);
+static char* serializePage(slotted_page* p, table* t) {
 	char* buffer = calloc(t->pageSize, 1);
 	// write header
 	// page header layout: 0(1B) | pageNum(19B) | usedData(4B) | numRecords(4B) |
@@ -762,7 +825,15 @@ static void writePage(slotted_page* p, address address, table* t) {
 		memcpy(entryStart - 5 - e.size, e.data, e.size); // potentially dangerous
 		entryOffset += addition;
 	}
-	// copy buffer to disk and clean up
+	return buffer;
+}
+
+/*
+writes the given page to the given address
+*/
+static void writePage(slotted_page* p, address address, table* t) {
+	jump(address, t);
+	char* buffer = serializePage(p, t);
 	fwrite(buffer, 1, t->pageSize, t->source);
 	free(buffer);
 }
@@ -791,11 +862,9 @@ void writeNextPage(table* t) {
 // write node
 
 /*
-writes the given node to the given address
+serializes the given node into a newly allocated buffer of exactly t->nodeSize bytes (caller frees)
 */
-static void writeNode(node* n, address address, table* t) {
-	// setup
-	jump(address, t);
+static char* serializeNode(node* n, table* t) {
 	char* buffer = calloc(t->nodeSize, 1);
 	// write metadata
 	// node layout: 0(1B) | parent(8B) | prev(8B) | next(8B) | childCount(4B) | maxKey(19B) | isLeaf(1B) |
@@ -820,7 +889,15 @@ static void writeNode(node* n, address address, table* t) {
 		writePageNumBytewise(buffer+offset, n->keys[i]);
 		offset += PAGE_NUM_DISK_SIZE;
 	}
-	// copy buffer to disk and clean up
+	return buffer;
+}
+
+/*
+writes the given node to the given address
+*/
+static void writeNode(node* n, address address, table* t) {
+	jump(address, t);
+	char* buffer = serializeNode(n, t);
 	fwrite(buffer, 1, t->nodeSize, t->source);
 	free(buffer);
 }
@@ -850,11 +927,6 @@ void writeNextNode(table* t) {
 writes a new tree consisting of one empty page and one empty node directly to a table file
 should be used only on a new file
 */
-void writeNewTree(slotted_page* p, address pageAddr, node* n, address nodeAddr, table* t) {
-	writePage(p, pageAddr, t);
-	writeNode(n, nodeAddr, t);
-	writeMeta(t->source, t);
-}
 
 /*MIGHT NEED THESE TO RETURN TRUE OR FALSE*/
 void loadParent(node* n, node* parent, table* t) {
@@ -869,8 +941,158 @@ void loadNext(node* n, node* next, table* t) {
 	readNode(n->next, next, t);
 }
 
+// ##########################################################################################################################################
+// ##########################################################################################################################################
+// STATEMENT ROLLBACK
+
+/*
+A statement's changes to a table go into its dirty hashmaps alongside those of earlier statements in the
+same transaction. So that a failed statement can be undone without losing the earlier ones, the first time
+a statement changes an object, the object's prior pending version (or the fact that it had none) is copied
+aside; rolling back puts those back and restores the header fields the statement began with. Nothing
+reaches the disk before a commit, so this is all in memory.
+*/
+
+typedef struct undo_entry {
+	bool present; // whether the object had a pending change before the statement changed it
+	void* prior;  // a copy of that pending version (pages and nodes only)
+}undo_entry;
+
+static undo_entry* newUndoEntry(bool present, void* prior) {
+	undo_entry* u = malloc(sizeof(undo_entry));
+	u->present = present;
+	u->prior = prior;
+	return u;
+}
+
+// called before the statement changes a page, node or delete marker for the first time
+static void rememberPage(address addr, table* t) {
+	if (!t->undo.active || findAddrTable(addr, &t->undo.pages)) return;
+	slotted_page* current = (slotted_page*)findAddrTable(addr, &t->pageDirty);
+	slotted_page* prior = NULL;
+	if (current) {
+		prior = malloc(sizeof(slotted_page));
+		copyPage(current, prior);
+	}
+	insertAddrTable(addr, newUndoEntry(current != NULL, prior), &t->undo.pages);
+}
+
+static void rememberNode(address addr, table* t) {
+	if (!t->undo.active || findAddrTable(addr, &t->undo.nodes)) return;
+	node* current = (node*)findAddrTable(addr, &t->nodeDirty);
+	node* prior = NULL;
+	if (current) {
+		prior = malloc(sizeof(node));
+		copyNode(current, prior);
+	}
+	insertAddrTable(addr, newUndoEntry(current != NULL, prior), &t->undo.nodes);
+}
+
+static void rememberDelete(address addr, table* t) {
+	if (!t->undo.active || findAddrTable(addr, &t->undo.deletes)) return;
+	insertAddrTable(addr, newUndoEntry(containsAddrTable(addr, &t->delete), NULL), &t->undo.deletes);
+}
+
+/*
+frees the prior versions a statement set aside and stops tracking it
+*/
+static void freeUndo(table* t) {
+	statement_undo* u = &t->undo;
+	for (int i = 0; i < u->pages.capacity; i++) {
+		if (u->pages.entries[i].key == 0) continue;
+		undo_entry* e = (undo_entry*)u->pages.entries[i].value;
+		if (e->prior) {
+			freeSPage((slotted_page*)e->prior);
+			free(e->prior);
+		}
+		free(e);
+	}
+	for (int i = 0; i < u->nodes.capacity; i++) {
+		if (u->nodes.entries[i].key == 0) continue;
+		undo_entry* e = (undo_entry*)u->nodes.entries[i].value;
+		free(e->prior);
+		free(e);
+	}
+	for (int i = 0; i < u->deletes.capacity; i++) {
+		if (u->deletes.entries[i].key == 0) continue;
+		free(u->deletes.entries[i].value);
+	}
+	freeAddrTable(&u->pages);
+	freeAddrTable(&u->nodes);
+	freeAddrTable(&u->deletes);
+	u->active = false;
+}
+
+/*
+starts tracking a statement's changes to t so that rollbackStatement() can undo them
+does nothing if the statement is already tracking t
+*/
+void beginStatement(table* t) {
+	statement_undo* u = &t->undo;
+	if (u->active) return;
+	u->active      = true;
+	u->pageFree    = t->pageFree;
+	u->nodeFree    = t->nodeFree;
+	u->root        = t->root;
+	u->pageStripes = t->pageStripes;
+	u->nodeStripes = t->nodeStripes;
+}
+
+/*
+the statement succeeded: keeps its changes and forgets the prior versions
+*/
+void endStatement(table* t) {
+	if (t->undo.active) freeUndo(t);
+}
+
+/*
+the statement failed: puts back every object's pending version from before the statement (dropping the ones
+it added) and restores the header fields, so earlier statements' changes stay pending as they were
+*/
+void rollbackStatement(table* t) {
+	statement_undo* u = &t->undo;
+	if (!u->active) return;
+	for (int i = 0; i < u->pages.capacity; i++) {
+		addr_entry* e = &u->pages.entries[i];
+		if (e->key == 0) continue;
+		undo_entry* prior = (undo_entry*)e->value;
+		void* current;
+		if (removeAddrTable(e->key, &t->pageDirty, &current)) {
+			freeSPage((slotted_page*)current);
+			free(current);
+		}
+		if (prior->present) insertAddrTable(e->key, prior->prior, &t->pageDirty);
+		prior->prior = NULL; // now owned by the dirty hashmap
+	}
+	for (int i = 0; i < u->nodes.capacity; i++) {
+		addr_entry* e = &u->nodes.entries[i];
+		if (e->key == 0) continue;
+		undo_entry* prior = (undo_entry*)e->value;
+		void* current;
+		if (removeAddrTable(e->key, &t->nodeDirty, &current)) free(current);
+		if (prior->present) insertAddrTable(e->key, prior->prior, &t->nodeDirty);
+		prior->prior = NULL;
+	}
+	for (int i = 0; i < u->deletes.capacity; i++) {
+		addr_entry* e = &u->deletes.entries[i];
+		if (e->key == 0) continue;
+		if (!((undo_entry*)e->value)->present) removeAddrTable(e->key, &t->delete, NULL);
+	}
+	t->pageFree    = u->pageFree;
+	t->nodeFree    = u->nodeFree;
+	t->root        = u->root;
+	t->pageStripes = u->pageStripes;
+	t->nodeStripes = u->nodeStripes;
+	freeUndo(t);
+}
+
+// ##########################################################################################################################################
+// ##########################################################################################################################################
+// MARKING DIRTY OBJECTS
+
 // mark page dirty
 void markPage(address address, slotted_page* p, table* t) {
+	rememberPage(address, t);
 	slotted_page* existing = (slotted_page*)findAddrTable(address, &t->pageDirty);
 	if (existing) {
 		copyPage(p, existing);
@@ -883,6 +1105,7 @@ void markPage(address address, slotted_page* p, table* t) {
 
 // mark node dirty
 void markNode(address address, node* n, table* t) {
+	rememberNode(address, t);
 	node* existing = (node*)findAddrTable(address, &t->nodeDirty);
 	if (existing) {
 		copyNode(n, existing);
@@ -895,21 +1118,84 @@ void markNode(address address, node* n, table* t) {
 
 // mark object for deletion
 void markDelete(address address, table* t) {
-	if (findAddrTable(address, &t->delete)) return; // skip if already marked
+	rememberDelete(address, t);
+	if (containsAddrTable(address, &t->delete)) return; // skip if already marked
 	insertAddrTable(address, NULL, &t->delete);
 }
 
 // delete object
 void deleteObject(address address, table* t) {
-	char code = 2; // a two in the first byte of an obejct means it's garbage
+	char code = GARBAGE_MARKER;
 	jump(address, t);
 	fwrite(&code, 1, 1, t->source);
 }
 
+static bool isDirty(table* t) {
+	return t->isNew || t->pageDirty.count > 0 || t->nodeDirty.count > 0 || t->delete.count > 0;
+}
+
 /*
-empties a table's write tables and makes the changes to the file on disk
+writes the table's file name within TABLE_DIRECTORY (how the write-ahead log refers to it) into out
+returns false if the name is too long to fit in a log entry
 */
-void commit(table* t) {
+static bool tableFileName(table* t, char* out) {
+	return snprintf(out, WAL_FILE_NAME_LEN, "%s%s", t->name, TABLE_EXTENSION) < WAL_FILE_NAME_LEN;
+}
+
+/*
+appends every change applyTable() will make to this table to the write-ahead log, in the same order,
+without touching the table file: creating the file if the table is new, then its dirty objects
+*/
+static bool logTable(table* t) {
+	char file[WAL_FILE_NAME_LEN];
+	if (!tableFileName(t, file)) return false;
+	if (t->isNew && !addLogEntry(file, WAL_FILE_CREATE, 0, NULL, 0)) return false;
+	for (int i = 0; i < t->pageDirty.capacity; i++) {
+		addr_entry* e = &t->pageDirty.entries[i];
+		if (e->key == 0) continue;
+		char* bytes = serializePage((slotted_page*)e->value, t);
+		bool logged = addLogEntry(file, WAL_PAGE, e->key, (uint8_t*)bytes, t->pageSize);
+		free(bytes);
+		if (!logged) return false;
+	}
+	for (int i = 0; i < t->nodeDirty.capacity; i++) {
+		addr_entry* e = &t->nodeDirty.entries[i];
+		if (e->key == 0) continue;
+		char* bytes = serializeNode((node*)e->value, t);
+		bool logged = addLogEntry(file, WAL_NODE, e->key, (uint8_t*)bytes, t->nodeSize);
+		free(bytes);
+		if (!logged) return false;
+	}
+	uint8_t garbage = GARBAGE_MARKER;
+	for (int i = 0; i < t->delete.capacity; i++) {
+		addr_entry* e = &t->delete.entries[i];
+		if (e->key == 0) continue;
+		if (!addLogEntry(file, WAL_DELETE, e->key, &garbage, 1)) return false;
+	}
+	uint32_t meta[METALEN];
+	fillMeta(t, meta);
+	return addLogEntry(file, WAL_META, 0, (uint8_t*)meta, sizeof(meta));
+}
+
+/*
+empties a table's write tables and makes the changes to the file on disk, then syncs the file
+a new table's file is created here, after the commit point
+@return false if any write or the sync failed; the file may then hold a partial commit
+*/
+static bool applyTable(table* t) {
+	if (t->isNew) {
+		char* path = tablePath(t->name);
+		mkdir(TABLE_DIRECTORY, 0755); // no-op if directory already exists
+		t->source = fopen(path, "wb+");
+		free(path);
+		if (!t->source) {
+			printf("Error: failed to create table file for '%s'\n", t->name);
+			return false;
+		}
+		t->isNew = false;
+	}
+	clearerr(t->source); // scope syncFile()'s error check to this commit's writes
+
 	for (int i = 0; i < t->pageDirty.capacity; i++) {
 		addr_entry* e = &t->pageDirty.entries[i];
 		if (e->key == 0) continue;
@@ -944,6 +1230,117 @@ void commit(table* t) {
 	t->delete.count = 0;
 
 	writeMeta(t->source, t);
+	if (!syncFile(t->source)) {
+		printf("Error: failed to write table '%s' to disk\n", t->name);
+		return false;
+	}
+	return true;
+}
+
+/*
+appends a whole-file change to the log: the file is emptied (or created) and its new contents follow in
+PAGE_SIZE pieces, or the file is removed
+*/
+static bool logFileChange(file_change* c) {
+	if (!c->bytes) return addLogEntry(c->name, WAL_FILE_REMOVE, 0, NULL, 0);
+	if (!addLogEntry(c->name, WAL_FILE_CREATE, 0, NULL, 0)) return false;
+	for (size_t off = 0; off < c->len; off += PAGE_SIZE) {
+		size_t n = c->len - off < PAGE_SIZE ? c->len - off : PAGE_SIZE;
+		if (!addLogEntry(c->name, WAL_FILE_DATA, off, (const uint8_t*)c->bytes + off, (uint16_t)n)) return false;
+	}
+	return true;
+}
+
+/*
+makes a whole-file change after the commit point, syncing a rewritten file
+*/
+static bool applyFileChange(file_change* c) {
+	char path[sizeof(TABLE_DIRECTORY) + WAL_FILE_NAME_LEN];
+	snprintf(path, sizeof(path), "%s%s", TABLE_DIRECTORY, c->name);
+	if (!c->bytes) return remove(path) == 0 || errno == ENOENT;
+	FILE* f = fopen(path, "wb");
+	if (!f) return false;
+	bool written = fwrite(c->bytes, 1, c->len, f) == c->len && syncFile(f);
+	fclose(f);
+	return written;
+}
+
+/*
+commits a transaction through the write-ahead log (see wal.c): changes to its tables, plus any whole-file
+changes (e.g. rewriting the schema, or removing a dropped table's file)
+ 1. every change is appended to the log: new tables' files, dirty pages, nodes, delete markers and
+    headers, then the whole-file changes
+ 2. the log is synced and marked committed  <- commit point
+ 3. the same changes are made to the files, which are synced, then their directory is synced if any
+    file was created or removed
+ 4. the log is reset
+a failure before the commit point aborts the transaction: its changes are dropped and false is returned
+a failure after it leaves a committed log and possibly half-written files, so the process exits and
+recovery finishes the commit on the next startup
+tables with nothing dirty (e.g. after a read-only statement) are skipped; if nothing changes at all,
+nothing is logged or synced
+*/
+bool commitTables(table** tables, int count, file_change* changes, int changeCount) {
+	bool anyChange = changeCount > 0;
+	bool changesFiles = changeCount > 0; // creates or removes a file, so the directory must be synced
+	for (int i = 0; i < count; i++) {
+		if (isDirty(tables[i])) anyChange = true;
+		if (tables[i]->isNew) changesFiles = true;
+	}
+	if (!anyChange) return true;
+
+	// if the log can't be started (e.g. it still holds another transaction), leave it untouched
+	if (!initManager()) {
+		printf("Error: failed to start logging the transaction; its changes were discarded\n");
+		for (int i = 0; i < count; i++) discard(tables[i]);
+		return false;
+	}
+	bool logged = true;
+	for (int i = 0; logged && i < count; i++) {
+		if (isDirty(tables[i])) logged = logTable(tables[i]);
+	}
+	for (int i = 0; logged && i < changeCount; i++) logged = logFileChange(&changes[i]);
+	if (logged) logged = markLogCommitted();
+	if (!logged) {
+		printf("Error: failed to write the transaction to the log; its changes were discarded\n");
+		for (int i = 0; i < count; i++) discard(tables[i]);
+		// a leftover partial transaction would corrupt the next one appended after it
+		if (!resetLog()) {
+			printf("Error: failed to reset the log; exiting so recovery can resolve it on startup\n");
+			exit(74);
+		}
+		return false;
+	}
+
+	for (int i = 0; i < count; i++) {
+		if (isDirty(tables[i]) && !applyTable(tables[i])) {
+			printf("Error: table '%s' is only partly written; exiting so recovery can finish the commit on startup\n", tables[i]->name);
+			exit(74);
+		}
+	}
+	for (int i = 0; i < changeCount; i++) {
+		if (!applyFileChange(&changes[i])) {
+			printf("Error: failed to write '%s' after commit; exiting so recovery can finish the commit on startup\n", changes[i].name);
+			exit(74);
+		}
+	}
+	if (changesFiles && !syncDirectory(TABLE_DIRECTORY)) {
+		printf("Error: failed to sync %s after commit; exiting so recovery can finish the commit on startup\n", TABLE_DIRECTORY);
+		exit(74);
+	}
+	if (!resetLog()) {
+		// a stale committed log would be replayed over later commits, so don't continue
+		printf("Error: failed to reset the log after a commit; exiting so recovery can clean it up on startup\n");
+		exit(74);
+	}
+	return true;
+}
+
+/*
+commits a single table (the implicit commit at the end of a statement outside a transaction)
+*/
+bool commit(table* t) {
+	return commitTables(&t, 1, NULL, 0);
 }
 
 /*
@@ -1066,7 +1463,7 @@ address allocNode(table* t) {
 
 /*
 moves a node from the source disk address to the dest disk address
-writes directly to disk without using the write queue
+writes directly to disk, bypassing the dirty hashmaps
 trusts that both addresses given are correct
 */
 static void moveNode(address source, address dest, table* t) {
@@ -1079,7 +1476,7 @@ static void moveNode(address source, address dest, table* t) {
 
 /*
 moves a page from the source disk address to the dest disk address
-writes directly to disk without using the write queue
+writes directly to disk, bypassing the dirty hashmaps
 trusts that both addresses given are correct
 */
 static void movePage(address source, address dest, table* t) {

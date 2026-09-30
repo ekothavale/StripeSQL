@@ -548,28 +548,21 @@ static const char* schema_path(void) {
 
 // --- loadSchema ---
 
-void test_load_schema_bootstraps_on_missing() {
-    // loadSchema() self-heals a missing schema file rather than failing: it's
-    // the only place in the codebase that calls initSchema(), and interpret()
-    // treats a NULL return as a hard load error, so a fresh checkout (tables/
-    // is gitignored) would be unable to run even a first CREATE TABLE if this
-    // returned NULL instead.
+void test_load_schema_missing_is_empty() {
+    // a missing schema file means no tables exist yet: loadSchema() returns an
+    // empty schema rather than failing (interpret() treats NULL as a hard load
+    // error, so a fresh checkout couldn't run even a first CREATE TABLE), and it
+    // doesn't create the file, which only a commit through the write-ahead log
+    // may do
     remove(schema_path());  // guarantee file is absent
     hashtable* ht = loadSchema();
-    assert(ht != NULL);          // missing file is bootstrapped, not an error
+    assert(ht != NULL);          // missing file is an empty schema, not an error
     assert(ht->count    == 0);
     assert(ht->capacity == 0);
     assert(ht->entries  == NULL);
     FILE* check = fopen(schema_path(), "rb");
-    assert(check != NULL);       // loadSchema() created the file on disk
-    fclose(check);
+    assert(check == NULL);       // loading never writes
     free(ht);
-
-    hashtable* ht2 = loadSchema();  // file now exists; second call loads it back
-    assert(ht2 != NULL);
-    assert(ht2->count == 0);
-    free(ht2);
-    remove(schema_path());
 }
 
 void test_load_schema_null_on_bad_magic() {
@@ -684,7 +677,7 @@ void test_save_load_schema_with_cols_and_types() {
 // --- master ---
 
 void test_schema() {
-    test_load_schema_bootstraps_on_missing();
+    test_load_schema_missing_is_empty();
     test_load_schema_null_on_bad_magic();
     test_save_schema_no_crash();
     test_save_schema_writes_magic();
@@ -1533,17 +1526,114 @@ void test_vm_free_no_crash(void) {
 // --- interpret ---
 
 void test_interpret_missing_table_returns_compile_error(void) {
-    // loadSchema() self-heals a missing schema file instead of returning NULL
-    // (see test_load_schema_bootstraps_on_missing), so querying a table that
+    // loadSchema() treats a missing schema file as empty instead of returning NULL
+    // (see test_load_schema_missing_is_empty), so querying a table that
     // simply isn't registered in that (now valid, empty) schema no longer
     // reaches INTERPRET_LOAD_ERROR — it's caught by generate()'s table-exists
     // check instead, which reports a normal compile error rather than letting
     // munchStmt dereference a NULL schema.
-    remove(schema_path());  // start from a fresh, self-healed schema
+    remove(schema_path());  // start from a fresh (empty) schema
     assert(interpret("select * from ghost").ir == INTERPRET_COMPILE_ERROR);
     assert(interpret("insert into ghost values (1)").ir == INTERPRET_COMPILE_ERROR);
     assert(interpret("update ghost set x = 1 where id = 1").ir == INTERPRET_COMPILE_ERROR);
     assert(interpret("delete from ghost where id = 1").ir == INTERPRET_COMPILE_ERROR);
+    remove(schema_path());
+}
+
+void test_interpret_select_projection_types(void) {
+    // results are printed by each value's own type, so a projection whose column
+    // types differ from the schema's leading columns must still carry the right
+    // tags (a schema-order type array once made the printer read an int as text)
+    remove(schema_path());
+    assert(interpret("create table proj (id text primary key, v int)").ir == INTERPRET_OK);
+    assert(interpret("insert into proj values ('a', 7)").ir == INTERPRET_OK);
+
+    result_buffer r = interpret("select v, id from proj");
+    assert(r.ir == INTERPRET_OK && r.count == 1 && r.cols == 2);
+    assert(r.rows[0][0].type == VAL_INT  && r.rows[0][0].as.integer == 7);
+    assert(r.rows[0][1].type == VAL_TEXT && strcmp(r.rows[0][1].as.text, "a") == 0);
+
+    assert(interpret("drop table proj").ir == INTERPRET_OK);
+    remove(schema_path());
+}
+
+/*
+checks that table sa holds rows 1..150 with v = id (except zeroRow, where v = 0)
+plus row 500, by a full scan and by a primary-key lookup of every row
+*/
+static void check_sa(int64_t zeroRow) {
+    result_buffer scan = interpret("select id, v from sa");
+    assert(scan.ir == INTERPRET_OK && scan.count == 151);
+    for (int i = 0; i < scan.count; i++) {
+        int64_t id = scan.rows[i][0].as.integer;
+        assert(scan.rows[i][1].as.integer == (id == zeroRow ? 0 : id));
+    }
+    char sql[64];
+    for (int64_t id = 1; id <= 150; id++) {
+        snprintf(sql, sizeof(sql), "select v from sa where id = %lld", id);
+        result_buffer one = interpret(sql);
+        assert(one.ir == INTERPRET_OK && one.count == 1);
+        assert(one.rows[0][0].as.integer == (id == zeroRow ? 0 : id));
+    }
+    result_buffer extra = interpret("select v from sa where id = 500");
+    assert(extra.ir == INTERPRET_OK && extra.count == 1 && extra.rows[0][0].as.integer == 500);
+}
+
+void test_interpret_failed_statement_rolls_back(void) {
+    // a statement that fails partway through must leave no trace. The row a full
+    // scan reaches last holds v = 0, so "1000 / v" fails only after every other
+    // row has been updated, or deleted (which restructures the tree); rolling
+    // back must undo all of it while keeping earlier statements' pending
+    // changes, both inside a transaction and outside one
+    remove(schema_path());
+    remove(TABLE_DIRECTORY "sa.tbl");
+    assert(interpret("create table sa (id int primary key, v int)").ir == INTERPRET_OK);
+    char sql[64];
+    assert(interpret("begin transaction").ir == INTERPRET_OK);
+    for (int i = 1; i <= 150; i++) {
+        snprintf(sql, sizeof(sql), "insert into sa values (%d, %d)", i, i);
+        assert(interpret(sql).ir == INTERPRET_OK);
+    }
+    assert(interpret("commit").ir == INTERPRET_OK);
+    result_buffer order = interpret("select id from sa");
+    int64_t zeroRow = order.rows[order.count - 1][0].as.integer;
+    snprintf(sql, sizeof(sql), "update sa set v = 0 where id = %lld", zeroRow);
+    assert(interpret(sql).ir == INTERPRET_OK);
+
+    assert(interpret("begin transaction").ir == INTERPRET_OK);
+    assert(interpret("insert into sa values (500, 500)").ir == INTERPRET_OK);  // pending; must survive
+    assert(interpret("update sa set v = 1000 / v").ir == INTERPRET_RUNTIME_ERROR);
+    assert(interpret("delete from sa where 1000 / v > 0").ir == INTERPRET_RUNTIME_ERROR);
+    check_sa(zeroRow);
+    assert(interpret("commit").ir == INTERPRET_OK);
+    check_sa(zeroRow);  // as reloaded from disk
+
+    assert(interpret("delete from sa where 1000 / v > 0").ir == INTERPRET_RUNTIME_ERROR);  // autocommit
+    check_sa(zeroRow);
+
+    assert(interpret("drop table sa").ir == INTERPRET_OK);
+    remove(schema_path());
+}
+
+void test_interpret_errors_halt_statements(void) {
+    // every error fails its statement as a runtime error, including ones that
+    // wouldn't have changed anything
+    remove(schema_path());
+    remove(TABLE_DIRECTORY "eh.tbl");
+    assert(interpret("create table eh (id int primary key)").ir == INTERPRET_OK);
+    assert(interpret("create table eh (id int primary key)").ir == INTERPRET_RUNTIME_ERROR);  // already exists
+    assert(interpret("drop table nope").ir == INTERPRET_RUNTIME_ERROR);                       // doesn't exist
+    assert(interpret("insert into eh values (1)").ir == INTERPRET_OK);
+    assert(interpret("insert into eh values (1)").ir == INTERPRET_RUNTIME_ERROR);             // duplicate key
+    assert(interpret("select id / 0 from eh").ir == INTERPRET_RUNTIME_ERROR);                 // division by zero
+    assert(interpret("commit").ir == INTERPRET_RUNTIME_ERROR);                                // no transaction
+    assert(interpret("discard").ir == INTERPRET_RUNTIME_ERROR);
+    assert(interpret("begin transaction").ir == INTERPRET_OK);
+    assert(interpret("begin transaction").ir == INTERPRET_RUNTIME_ERROR);                     // already in one
+    assert(interpret("create table eh2 (id int primary key)").ir == INTERPRET_RUNTIME_ERROR); // DDL in a transaction
+    assert(interpret("drop table eh").ir == INTERPRET_RUNTIME_ERROR);
+    assert(interpret("discard").ir == INTERPRET_OK);
+    assert(interpret("drop table eh").ir == INTERPRET_OK);
     remove(schema_path());
 }
 
@@ -1556,6 +1646,9 @@ void test_vm(void) {
     test_vm_push_pop_null();
     test_vm_free_no_crash();
     test_interpret_missing_table_returns_compile_error();
+    test_interpret_select_projection_types();
+    test_interpret_failed_statement_rolls_back();
+    test_interpret_errors_halt_statements();
     printf("All VM tests passed.\n");
 }
 

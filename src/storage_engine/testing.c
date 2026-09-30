@@ -17,6 +17,10 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 */
 
 #include "testing.h"
+#include "wal.h"
+#include "file.h"
+#include <unistd.h>
+#include <sys/wait.h>
 
 // ##########################################################################################################################################
 // ##########################################################################################################################################
@@ -272,8 +276,8 @@ void test_page(void) {
 // ##########################################################################################################################################
 // TABLEIO TESTS
 //
-// NOTE: test_page_roundtrip, test_node_roundtrip, test_page_write_lifo, and
-// test_node_write_lifo verify field values that pass through writePage/writeNode.
+// NOTE: test_page_roundtrip, test_node_roundtrip, test_page_write_drains_all, and
+// test_node_write_drains_all verify field values that pass through writePage/writeNode.
 
 // writeMeta is non-static but not in tableIO.h; forward-declare it here
 bool writeMeta(FILE* file, table* t);
@@ -303,7 +307,7 @@ static table make_test_table(void) {
     t.pageFree = (uint64_t)t.metalen + (uint64_t)t.nodeStripeLen * t.nodeSize;
     t.root = 0;
     t.M = M_GLOBAL;
-    // Inline dirty-table initialisation (setStacks is static in tableIO.c)
+    // Inline dirty-table initialisation (initDirtyHashmaps is static in tableIO.c)
     initAddrTable(&t.pageDirty);
     initAddrTable(&t.nodeDirty);
     initAddrTable(&t.delete);
@@ -459,7 +463,7 @@ void test_mark_page_dedup(void) {
 
 /*
 markPage stores a private heap copy of the page; mutating the original
-after marking must not change the copy held in the dirty stack.
+after marking must not change the copy held in the dirty hashmap.
 */
 void test_mark_page_snapshot(void) {
     printf("  test_mark_page_snapshot ... ");
@@ -685,10 +689,10 @@ void test_alloc_node_after_stripe(void) {
 // --- writeNextPage / readPage ---
 
 /*
-writeNextPage on an empty queue must be a no-op (no crash, count stays 0).
+writeNextPage on an empty dirty hashmap must be a no-op (no crash, count stays 0).
 */
-void test_page_write_empty_queue(void) {
-    printf("  test_page_write_empty_queue ... ");
+void test_page_write_empty_hashmap(void) {
+    printf("  test_page_write_empty_hashmap ... ");
     table t = make_test_table();
 
     assert(t.pageDirty.count == 0);
@@ -741,8 +745,8 @@ Mark 3 pages, then call writeNextPage 3 times. The dirty table has no
 inherent order, so which page drains on which call is unspecified — this
 verifies all 3 end up correctly written regardless of drain order.
 */
-void test_page_write_lifo(void) {
-    printf("  test_page_write_lifo ... ");
+void test_page_write_drains_all(void) {
+    printf("  test_page_write_drains_all ... ");
     table t = make_test_table();
 
     slotted_page* p1 = make_io_page(pn(1));
@@ -780,8 +784,8 @@ void test_page_write_lifo(void) {
 
 // --- writeNextNode / readNode ---
 
-void test_node_write_empty_queue(void) {
-    printf("  test_node_write_empty_queue ... ");
+void test_node_write_empty_hashmap(void) {
+    printf("  test_node_write_empty_hashmap ... ");
     table t = make_test_table();
 
     assert(t.nodeDirty.count == 0);
@@ -841,8 +845,8 @@ void test_node_roundtrip(void) {
 Mark 3 nodes, drain them all via writeNextNode, and verify each address
 holds its node regardless of drain order.
 */
-void test_node_write_lifo(void) {
-    printf("  test_node_write_lifo ... ");
+void test_node_write_drains_all(void) {
+    printf("  test_node_write_drains_all ... ");
     table t = make_test_table();
 
     node n1 = {0}; n1.childCount = 1; n1.maxKey = pn(10);
@@ -871,6 +875,33 @@ void test_node_write_lifo(void) {
 }
 
 /* Run all tableIO tests. */
+/*
+removeAddrTable must keep every remaining key findable (it shifts later entries of
+a probe run back into the hole instead of leaving a gap that would end searches
+early). 200 keys are inserted, then every third is removed.
+*/
+void test_addr_table_remove(void) {
+    printf("  test_addr_table_remove ... ");
+    addr_table at;
+    initAddrTable(&at);
+    int n = 200;
+    for (int i = 1; i <= n; i++) insertAddrTable((address)(i * 64), (void*)(uintptr_t)i, &at);
+    for (int i = 1; i <= n; i += 3) {
+        void* value = NULL;
+        assert(removeAddrTable((address)(i * 64), &at, &value));
+        assert((uintptr_t)value == (uintptr_t)i);
+    }
+    assert(!removeAddrTable(64, &at, NULL));  // already removed
+    for (int i = 1; i <= n; i++) {
+        void* value = findAddrTable((address)(i * 64), &at);
+        if ((i - 1) % 3 == 0) assert(value == NULL);
+        else assert((uintptr_t)value == (uintptr_t)i);
+    }
+    assert(at.count == n - (n + 2) / 3);
+    freeAddrTable(&at);
+    printf("PASS\n");
+}
+
 void test_tableio(void) {
     printf("=== TableIO Tests ===\n");
     // writeMeta / loadMeta
@@ -885,6 +916,8 @@ void test_tableio(void) {
     test_mark_node_dedup();
     test_mark_node_snapshot();
     test_mark_node_growth();
+    // dirty hashmap removal
+    test_addr_table_remove();
     // allocPage
     test_alloc_page();
     test_alloc_page_stripe();
@@ -894,13 +927,13 @@ void test_tableio(void) {
     test_alloc_node_stripe();
     test_alloc_node_after_stripe();
     // writeNextPage / readPage
-    test_page_write_empty_queue();
+    test_page_write_empty_hashmap();
     test_page_roundtrip();
-    test_page_write_lifo();
+    test_page_write_drains_all();
     // writeNextNode / readNode
-    test_node_write_empty_queue();
+    test_node_write_empty_hashmap();
     test_node_roundtrip();
-    test_node_write_lifo();
+    test_node_write_drains_all();
     printf("=== All tableIO tests passed ===\n");
 }
 
@@ -1314,10 +1347,10 @@ void test_btree_record_delete(void) {
 // ── Group 3: commit ────────────────────────────────────────────────────────
 
 /*
-After marking dirty objects, commit() must drain all three stacks to zero.
+After marking dirty objects, commit() must drain all three dirty hashmaps to zero.
 */
-void test_btree_commit_drains_stacks(void) {
-    printf("  test_btree_commit_drains_stacks ... ");
+void test_btree_commit_drains_hashmaps(void) {
+    printf("  test_btree_commit_drains_hashmaps ... ");
     table* t = createTree("bt_cds", pn(1));
     assert(t != NULL);
 
@@ -1395,6 +1428,64 @@ void test_btree_commit_delete_persist(void) {
     assert(!ok);
 
     deleteTree(t);
+    printf("PASS\n");
+}
+
+/*
+commit() on a table with nothing dirty (e.g. after a read-only statement) must
+write nothing: a header change made without dirtying any page or node must
+not reach disk.
+*/
+void test_btree_commit_skips_clean(void) {
+    printf("  test_btree_commit_skips_clean ... ");
+    table* t = createTree("bt_csc", pn(1));
+    assert(t != NULL);
+    address root = t->root;
+
+    t->root = root + 1;  // header-only change, nothing marked dirty
+    assert(commit(t));
+    close_table_keep_file(t);
+
+    table* t2 = calloc(1, sizeof(table));
+    assert(loadTable("bt_csc", t2));
+    assert(t2->root == root);
+
+    deleteTree(t2);
+    printf("PASS\n");
+}
+
+/*
+If writing a table fails after its transaction is committed in the log, the
+table may be half-written, so commit() must exit the process; the next
+recover() then finishes the commit from the log. The commit runs in a forked
+child whose table stream is swapped for a read-only one so its writes fail.
+*/
+void test_btree_commit_apply_failure_recovers(void) {
+    printf("  test_btree_commit_apply_failure_recovers ... ");
+    table* t = createTree("bt_cafr", pn(1));
+    assert(t != NULL);
+    findAndInsert(pn(2), t);  // dirties a new page and the root node
+
+    fflush(NULL);  // so the child doesn't re-flush output buffered before the fork
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        char* path = build_tbl_path("bt_cafr");
+        t->source = fopen(path, "rb");
+        commit(t);  // logs and commits, then fails writing the table and exits
+        _exit(0);   // unreachable if commit() behaves
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 74);
+
+    assert(recover());         // finishes the child's commit from the log
+    close_table_keep_file(t);  // drop the parent's copy of the (uncommitted) changes
+    table* t2 = calloc(1, sizeof(table));
+    assert(loadTable("bt_cafr", t2));
+    assert(findPage(pn(2), t2) != 0);
+
+    deleteTree(t2);
     printf("PASS\n");
 }
 
@@ -1498,6 +1589,28 @@ void test_btree_split_linked_list(void) {
     assert(right.prev  == leftAddr);
     assert(left.prev   == 0);
     assert(right.next  == 0);
+
+    deleteTree(t);
+    printf("PASS\n");
+}
+
+/*
+Splitting a node that is not its parent's last child must register the new
+sibling in the parent. Inserting in descending order routes every page after
+the first split into the leftmost leaf, so each later split takes the
+mid-parent path in splitUpdateParent; every page must remain findable.
+*/
+void test_btree_split_non_last_child(void) {
+    printf("  test_btree_split_non_last_child ... ");
+    uint32_t total = 3 * M_GLOBAL;
+    table* t = createTree("bt_snl", pn(total));
+    assert(t != NULL);
+
+    for (uint32_t i = total - 1; i >= 1; i--)
+        findAndInsert(pn(i), t);
+
+    for (uint32_t i = 1; i <= total; i++)
+        assert(findPage(pn(i), t) != 0);
 
     deleteTree(t);
     printf("PASS\n");
@@ -1703,15 +1816,18 @@ void test_btree(void) {
     test_btree_record_update();
     test_btree_record_delete();
     // commit
-    test_btree_commit_drains_stacks();
+    test_btree_commit_drains_hashmaps();
     test_btree_commit_persist();
     test_btree_commit_delete_persist();
+    test_btree_commit_skips_clean();
+    test_btree_commit_apply_failure_recovers();
     // insert and split
     test_btree_insert_new_page();
     test_btree_insert_existing_page();
     test_btree_split_structure();
     test_btree_split_find_all();
     test_btree_split_linked_list();
+    test_btree_split_non_last_child();
     // page deletion and rebalancing
     test_btree_delete_page();
     test_btree_delete_triggers_borrow();
@@ -1722,4 +1838,196 @@ void test_btree(void) {
     test_btree_delete_tree();
     test_btree_delete_tree_not_reloadable();
     printf("=== All B+ tree tests passed ===\n");
+}
+
+// ##########################################################################################################################################
+// ##########################################################################################################################################
+// FILE HELPER TESTS
+
+/* Whether a forked child process can take the lock on path. */
+static bool child_can_lock(const char* path) {
+    fflush(NULL);  // so the child doesn't re-flush output buffered before the fork
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) _exit(lockFileExclusive(path) == -1 ? 1 : 0);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+/*
+While one process holds the lock, another must be refused; once it's released,
+the other can take it. (Record locks belong to a process, so the second taker
+has to be a separate process.)
+*/
+void test_file_lock_excludes_other_processes(void) {
+    printf("  test_file_lock_excludes_other_processes ... ");
+    const char* path = TABLE_DIRECTORY "_lock_test.lock";
+    int fd = lockFileExclusive(path);
+    assert(fd != -1);
+    assert(!child_can_lock(path));
+    close(fd);
+    assert(child_can_lock(path));
+    remove(path);
+    printf("PASS\n");
+}
+
+/* Run all file helper tests. */
+void test_file(void) {
+    printf("=== File Helper Tests ===\n");
+    test_file_lock_excludes_other_processes();
+    printf("=== All file helper tests passed ===\n");
+}
+
+// ##########################################################################################################################################
+// ##########################################################################################################################################
+// WRITE-AHEAD LOG TESTS
+
+/* Size of the log file in bytes (0 if it doesn't exist). */
+static long log_size(void) {
+    FILE* f = fopen(WAL_LOG_PATH, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fclose(f);
+    return size;
+}
+
+/* Flip every bit of the log byte at offset. */
+static void corrupt_log_byte(long offset) {
+    FILE* f = fopen(WAL_LOG_PATH, "rb+");
+    assert(f != NULL);
+    fseek(f, offset, SEEK_SET);
+    int c = fgetc(f);
+    fseek(f, offset, SEEK_SET);
+    fputc(~c & 0xFF, f);
+    fclose(f);
+}
+
+/* Read len bytes at addr from tables/<name>.tbl into out (bytes past EOF stay untouched). */
+static void read_tbl_bytes(const char* name, address addr, char* out, size_t len) {
+    char* path = build_tbl_path(name);
+    FILE* f = fopen(path, "rb");
+    free(path);
+    assert(f != NULL);
+    fseek(f, (long)addr, SEEK_SET);
+    size_t n = fread(out, 1, len, f);
+    (void)n;
+    fclose(f);
+}
+
+/* Create a table and return an address in its unused space, for logging raw writes to. */
+static address make_wal_table(char* name) {
+    table* t = createTree(name, pn(1));
+    assert(t != NULL);
+    address addr = t->pageFree;
+    close_table_keep_file(t);
+    return addr;
+}
+
+static void drop_wal_table(char* name) {
+    table* t = calloc(1, sizeof(table));
+    assert(loadTable(name, t));
+    deleteTree(t);
+}
+
+static const char WAL_TEST_PAYLOAD[] = "REDOTEST";
+
+/* The checksum must match the published CRC-32C check value. */
+void test_wal_crc32c_check_value(void) {
+    printf("  test_wal_crc32c_check_value ... ");
+    assert(crc32c_compute(0, (const uint8_t*)"123456789", 9) == 0xE3069283);
+    printf("PASS\n");
+}
+
+/*
+A committed log that was never applied (as if the process crashed right after
+the commit point) must be replayed by recover(), which then empties the log.
+*/
+void test_wal_recover_redoes_committed_log(void) {
+    printf("  test_wal_recover_redoes_committed_log ... ");
+    address addr = make_wal_table("wal_redo");
+    assert(initManager());
+    assert(addLogEntry("wal_redo.tbl", WAL_PAGE, addr, (const uint8_t*)WAL_TEST_PAYLOAD, sizeof(WAL_TEST_PAYLOAD)));
+    assert(markLogCommitted());
+
+    assert(recover());
+    char got[sizeof(WAL_TEST_PAYLOAD)] = {0};
+    read_tbl_bytes("wal_redo", addr, got, sizeof(got));
+    assert(memcmp(got, WAL_TEST_PAYLOAD, sizeof(WAL_TEST_PAYLOAD)) == 0);
+    assert(log_size() == 0);
+
+    drop_wal_table("wal_redo");
+    printf("PASS\n");
+}
+
+/* A log with entries but no commit marker must be discarded without touching the table. */
+void test_wal_recover_discards_uncommitted_log(void) {
+    printf("  test_wal_recover_discards_uncommitted_log ... ");
+    address addr = make_wal_table("wal_disc");
+    assert(initManager());
+    assert(addLogEntry("wal_disc.tbl", WAL_PAGE, addr, (const uint8_t*)WAL_TEST_PAYLOAD, sizeof(WAL_TEST_PAYLOAD)));
+
+    assert(recover());  // closing the log flushes the entry first, so it is on disk without a marker
+    char got[sizeof(WAL_TEST_PAYLOAD)] = {0};
+    read_tbl_bytes("wal_disc", addr, got, sizeof(got));
+    assert(memcmp(got, WAL_TEST_PAYLOAD, sizeof(WAL_TEST_PAYLOAD)) != 0);
+    assert(log_size() == 0);
+
+    drop_wal_table("wal_disc");
+    printf("PASS\n");
+}
+
+/* A commit marker that fails its checksum (e.g. torn) means the transaction never committed. */
+void test_wal_recover_rejects_damaged_marker(void) {
+    printf("  test_wal_recover_rejects_damaged_marker ... ");
+    address addr = make_wal_table("wal_dmgm");
+    assert(initManager());
+    assert(addLogEntry("wal_dmgm.tbl", WAL_PAGE, addr, (const uint8_t*)WAL_TEST_PAYLOAD, sizeof(WAL_TEST_PAYLOAD)));
+    assert(markLogCommitted());
+    corrupt_log_byte(log_size() - 1);  // last byte of the marker's checksum
+
+    assert(recover());
+    char got[sizeof(WAL_TEST_PAYLOAD)] = {0};
+    read_tbl_bytes("wal_dmgm", addr, got, sizeof(got));
+    assert(memcmp(got, WAL_TEST_PAYLOAD, sizeof(WAL_TEST_PAYLOAD)) != 0);
+    assert(log_size() == 0);
+
+    drop_wal_table("wal_dmgm");
+    printf("PASS\n");
+}
+
+/*
+A committed log with a damaged entry can't be finished: recover() must report
+failure, write nothing, and leave the log in place for inspection.
+*/
+void test_wal_recover_reports_damaged_entry(void) {
+    printf("  test_wal_recover_reports_damaged_entry ... ");
+    address addr = make_wal_table("wal_dmge");
+    assert(initManager());
+    assert(addLogEntry("wal_dmge.tbl", WAL_PAGE, addr, (const uint8_t*)WAL_TEST_PAYLOAD, sizeof(WAL_TEST_PAYLOAD)));
+    assert(markLogCommitted());
+    long size = log_size();
+    corrupt_log_byte(100);  // inside the first entry's table name
+
+    assert(!recover());
+    char got[sizeof(WAL_TEST_PAYLOAD)] = {0};
+    read_tbl_bytes("wal_dmge", addr, got, sizeof(got));
+    assert(memcmp(got, WAL_TEST_PAYLOAD, sizeof(WAL_TEST_PAYLOAD)) != 0);
+    assert(log_size() == size);
+
+    assert(resetLog());  // clean up for the tests that follow
+    drop_wal_table("wal_dmge");
+    printf("PASS\n");
+}
+
+/* Run all write-ahead log tests. */
+void test_wal(void) {
+    printf("=== Write-Ahead Log Tests ===\n");
+    test_wal_crc32c_check_value();
+    test_wal_recover_redoes_committed_log();
+    test_wal_recover_discards_uncommitted_log();
+    test_wal_recover_rejects_damaged_marker();
+    test_wal_recover_reports_damaged_entry();
+    printf("=== All write-ahead log tests passed ===\n");
 }

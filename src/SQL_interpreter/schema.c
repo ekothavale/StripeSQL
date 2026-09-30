@@ -21,6 +21,8 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 
 #include "../memory.h"
 #include "../value.h"
+#include "../storage_engine/tableIO.h"
+#include <errno.h>
 
 // ##########################################################################################################################################
 // ##########################################################################################################################################
@@ -159,26 +161,6 @@ void deleteHT(uint32_t hash, hashtable* table) {
 // Schema functions
 
 /*
-creates a new, empty schema file at SCHEMA_DIR/schema.scma.
-writes the magic number and a zero entry count.
-overwrites any existing file at that path.
-*/
-void initSchema() {
-	const char* path = SCHEMA_PATH;
-
-	FILE* tfile = fopen(path, "wb");
-	if (!tfile) {
-		printf("Error: failed to create schema file\n");
-		return;
-	}
-	uint32_t magic = SCHEMA_MAGIC;
-	fwrite(&magic, sizeof(uint32_t), 1, tfile);
-	uint32_t zero = 0;
-	fwrite(&zero, sizeof(uint32_t), 1, tfile);
-	fclose(tfile);
-}
-
-/*
 reads the entries in the schema file and loads them into the given hash table
 on-disk format per entry: [hash: u32] [name len: u32] [name bytes] [col count: u32] ([col N type: u8] [col N len: u32] [col N bytes])*
 */
@@ -251,7 +233,7 @@ static void writeEntries(hashtable* ht, FILE* file) {
 
 /*
 load schema data from tables/schema.scma
-@return: hashtable pointer wiht schema data or NULL on failed read
+@return: hashtable pointer with schema data or NULL on failed read
 mallocs (1 hashtable)
 */
 hashtable* loadSchema() {
@@ -260,13 +242,13 @@ hashtable* loadSchema() {
 
 	FILE* tfile;
 	tfile = fopen(path, "rb");
-	// if tfile isn't found, try creating it
 	if (!tfile) {
-		initSchema();
-		tfile = fopen(path, "rb");
-	}
-	// if this still fails, report an error
-	if (!tfile) {
+		// no schema file yet means no tables yet; the first CREATE TABLE commits one through the log
+		if (errno == ENOENT) {
+			hashtable* ht = malloc(sizeof(hashtable));
+			initHashTable(ht);
+			return ht;
+		}
 		printf("Error: failed to open database schema\n");
 		return NULL;
 	}
@@ -286,18 +268,32 @@ hashtable* loadSchema() {
 }
 
 /*
-assumes the hashtable contains accurate data
+serializes the schema into the schema file's format: magic number, then the entries (see writeEntries())
+mallocs the returned buffer (caller frees) and sets len to its size; returns NULL on failure
 */
-void saveSchema(hashtable* schema) {
-	const char* path = SCHEMA_PATH;
-
-	FILE* tfile = fopen(path, "wb");
-	if (!tfile) {
-		printf("Error: failed to open schema file for writing\n");
-		return;
-	}
+char* serializeSchema(hashtable* schema, size_t* len) {
+	char* bytes = NULL;
+	FILE* mem = open_memstream(&bytes, len);
+	if (!mem) return NULL;
 	uint32_t magic = SCHEMA_MAGIC;
-	fwrite(&magic, sizeof(uint32_t), 1, tfile);
-	writeEntries(schema, tfile);
-	fclose(tfile);
+	fwrite(&magic, sizeof(uint32_t), 1, mem);
+	writeEntries(schema, mem);
+	fclose(mem);
+	return bytes;
+}
+
+/*
+replaces the schema file with the given schema, committed through the write-ahead log so a crash can't
+leave the file half-rewritten
+assumes the hashtable contains accurate data
+@return false if the commit failed
+*/
+bool saveSchema(hashtable* schema) {
+	size_t len;
+	char* bytes = serializeSchema(schema, &len);
+	if (!bytes) return false;
+	file_change change = { SCHEMA_FILE, bytes, len };
+	bool saved = commitTables(NULL, 0, &change, 1);
+	free(bytes);
+	return saved;
 }

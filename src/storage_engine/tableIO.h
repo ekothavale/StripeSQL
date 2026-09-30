@@ -26,8 +26,6 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 
 #define MAGIC 0xFACE3419
 #define METALEN 16 // number of 4-byte words needed to represent a table's metadata
-#define TABLE_DIRECTORY "tables/" // directory in which table files are placed
-#define TABLE_EXTENSION ".tbl" // file extension for table files
 
 typedef struct addr_entry {
 	address key;   // 0 = empty slot (address 0 is never a valid page/node address)
@@ -40,11 +38,25 @@ typedef struct addr_table {
 	addr_entry* entries;
 }addr_table;
 
+/*
+what the current statement needs to undo on a table if it fails (see beginStatement())
+*/
+typedef struct statement_undo {
+	bool active; // a statement is changing this table
+	addr_table pages; // address -> prior pending version of each page the statement changed (or none)
+	addr_table nodes; // address -> prior pending version of each node the statement changed (or none)
+	addr_table deletes; // address -> whether each address was already marked for deletion
+	address pageFree, nodeFree, root; // header fields as the statement began
+	int pageStripes, nodeStripes;
+}statement_undo;
+
 typedef struct table {
 	addr_table pageDirty; // address -> slotted_page* of dirty pages
 	addr_table nodeDirty; // address -> node* of dirty nodes
 	addr_table delete; // address -> NULL; presence marks an object for deletion
-	FILE* source; // physical file
+	statement_undo undo; // lets a failed statement's changes be rolled back
+	FILE* source; // physical file (NULL until a new table's first commit creates it)
+	bool isNew; // file doesn't exist yet: it's created when the table is first committed
 	char* name; // name of table (corresponding file path is tables/[name].tbl)
 	address cursor; // current file position (low-level; callers own their page/node state)
 	address pageFree; // address of next free page space
@@ -61,16 +73,29 @@ typedef struct table {
 	int M; // maximum number of children each node can have
 }table;
 
+/*
+a whole-file change committed atomically along with a transaction's tables (see commitTables())
+name is a file within TABLE_DIRECTORY; bytes != NULL replaces its contents with len bytes (creating it
+if needed), bytes == NULL removes it
+*/
+typedef struct file_change {
+	const char* name;
+	const char* bytes;
+	size_t len;
+}file_change;
+
 // generic address-keyed hash table (backs pageDirty / nodeDirty / delete)
 void initAddrTable(addr_table* at);
 void freeAddrTable(addr_table* at); // frees only the entries array; caller owns/frees the values
 void* findAddrTable(address key, addr_table* at);
 void insertAddrTable(address key, void* value, addr_table* at);
+bool removeAddrTable(address key, addr_table* at, void** valueOut); // valueOut may be NULL
 
 // manage table struct
 void freeTable(table* t);
 // manage database tables
-table* createTable(char* tablename);
+table* createTable(char* tablename); // creates the file immediately, bypassing the log
+table* newTable(char* tablename); // in memory only; the file is created by its first commit
 bool loadTable(char* tablename, table* t);
 bool deleteTable(table* t);
 // loading pages and nodes into caller-provided structs
@@ -82,13 +107,17 @@ void loadNext(node* n, node* next, table* t);
 // writing
 void writeNextPage(table* t);
 void writeNextNode(table* t);
-void writeNewTree(slotted_page* p, address pageAddr, node* n, address nodeAddr, table* t);
 // marking dirty objects
 void markPage(address address, slotted_page* p, table* t);
 void markNode(address address, node* n, table* t);
 void markDelete(address address, table* t); // can be used for any object type
-void commit(table* t);
+bool commit(table* t);
+bool commitTables(table** tables, int count, file_change* changes, int changeCount); // commit a whole transaction
 void discard(table* t);
+// statement rollback: undo a failed statement's changes while keeping earlier pending ones
+void beginStatement(table* t);
+void endStatement(table* t);
+void rollbackStatement(table* t);
 // allocate new addresses
 void newStripe(table* t);
 address allocNode(table* t);

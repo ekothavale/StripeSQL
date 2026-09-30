@@ -85,14 +85,15 @@ static node* newNode(bool isLeaf, address parent) {
 }
 
 /*
-creates and initializes a new table file and fills it with a new b+ tree, with one empty node and one empty page
-@param pageNum - the page number of the starting page
+builds a new table's b+ tree in memory, with one empty node and one empty page, both dirty
+nothing touches the disk until the table is committed, which also creates its file (see newTable())
+@param firstKey - the page number of the starting page
 @return - table struct containing the necessary data to use the table
 mallocs new memory (table)
 */
-table* createTree(char* tablename, page_num firstKey) {
+table* newTree(char* tablename, page_num firstKey) {
 	// create structs
-	table* t = createTable(tablename);
+	table* t = newTable(tablename);
 	node* root = calloc(1, sizeof(node));
 	address rootAddr = allocNode(t);
 	slotted_page* page = makeSPage(firstKey, PAGE_NUM_SLOTS, PAGE_NUM_ENTRIES, PAGE_ARR_CAP);
@@ -107,10 +108,27 @@ table* createTree(char* tablename, page_num firstKey) {
 
 	t->root = rootAddr;
 
-	// write structs and flush metadata (root pointer) to disk
-	writeNewTree(page, pageAddr, root, rootAddr, t);
+	// the dirty hashmaps keep their own copies
+	markNode(rootAddr, root, t);
+	markPage(pageAddr, page, t);
 	free(root);
+	freeSPage(page);
 	free(page);
+	return t;
+}
+
+/*
+creates a new table with an empty b+ tree and commits it, which creates its file
+@param firstKey - the page number of the starting page
+@return - table struct containing the necessary data to use the table, or NULL if the commit failed
+mallocs new memory (table)
+*/
+table* createTree(char* tablename, page_num firstKey) {
+	table* t = newTree(tablename, firstKey);
+	if (!commit(t)) {
+		freeTable(t);
+		return NULL;
+	}
 	return t;
 }
 
@@ -283,6 +301,7 @@ static void splitUpdateParent(node* parent, node* child, address childAddr, page
 			parent->children[i+2] = child;*/
 			parent->children[i+1] = childAddr;
 			parent->childCount++;
+			markNode(child->parent, parent, t);
 			return;
 		}
 	}

@@ -28,8 +28,10 @@ table names are stored as hashes and all column names are length prefixed
 #define SCHEMA_H
 
 #include "../common.h"
+#include "../const.h"
 
-#define SCHEMA_PATH "tables/schema.scma"
+#define SCHEMA_FILE "schema.scma" // within TABLE_DIRECTORY
+#define SCHEMA_PATH TABLE_DIRECTORY SCHEMA_FILE
 #define SCHEMA_MAGIC 0xFFBB8844
 
 #define MAX_LOAD_FACTOR 0.8 // load factor at which the hash table is resized
@@ -68,8 +70,8 @@ schema* readHT(uint32_t, hashtable* table);
 void deleteHT(uint32_t, hashtable* table);
 
 // Public API — callable from outside this translation unit
-void initSchema();
 hashtable* loadSchema();
-void saveSchema(hashtable* schema);
+char* serializeSchema(hashtable* schema, size_t* len);
+bool saveSchema(hashtable* schema);
 
 #endif

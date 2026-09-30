@@ -16,39 +16,25 @@ DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
 
-#ifndef BPLUS_H
-#define BPLUS_H
+#ifndef FILE_H
+#define FILE_H
 
+#include <stdint.h>
 #include "../common.h"
-#include "ordering.h"
-#include "page.h"
-#include "node.h"
-#include "tableIO.h"
 
-// UNTESTED
-#define MAX_KEY(n) \
-	((n)->keys[n->childCount-1])
+// durability
+bool syncFile(FILE* file); // flush a stream and force it to stable storage
+bool syncDirectory(const char* path); // make the creation/removal of entries in a directory durable
 
-// UNTESTED
-#define MIN_KEY(n) \
-	((n)->keys[0])
+// exclusion between processes
+int lockFileExclusive(const char* path); // returns a descriptor holding the lock, or -1 if it's taken
 
-#define HALF_M (M_GLOBAL / 2)
+// big-endian byte encoding (UNSAFE - assume there's enough space in the buffer)
+void writeULongBytewise(char* arr, uint64_t lui);
+void writeUIntBytewise(char* arr, uint32_t ui);
+void writeUShortBytewise(char* arr, uint16_t us);
+uint64_t readULongBytewise(const char* arr);
+uint32_t readUIntBytewise(const char* arr);
+uint16_t readUShortBytewise(const char* arr);
 
-table* newTree(char* tablename, page_num firstKey); // in memory only, until committed
-table* createTree(char* tablename, page_num firstKey); // newTree() plus a commit that creates its file
-void deleteTree(table* t);
-
-
-address findPage(page_num pageNum, table* t);
-address findPageAndLeaf(page_num pageNum, table* t, address* leafOut);
-address findAndInsert(page_num pageNum, table* t);
-bool findAndDelete(page_num pageNum, table* tree);
-
-bool insertRecord(sp_record* record, ordering_key key, table* t);
-bool updateRecord(sp_record* record, ordering_key key, table* t);
-bool deleteRecord(ordering_key key, table* t, slotted_page* page);
-bool searchRecord(ordering_key key, table* t);
-sp_record readRecord(ordering_key key, table* t, slotted_page* page);
-
-#endif // BPLUS_H
+#endif

@@ -17,6 +17,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 */
 
 #include "time.h"
+#include <sys/stat.h>
 
 #include "common.h"
 #include "debug.h"
@@ -25,29 +26,28 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 #include "SQL_interpreter/chunk.h"
 #include "SQL_interpreter/vm.h"
 #include "storage_engine/bplus.h"
+#include "storage_engine/wal.h"
+#include "storage_engine/file.h"
 #include "storage_engine/testing.h"
 #include "SQL_interpreter/testing.h"
 
 
-static SQL_type getType(char c) {
-    return (SQL_type) (c & 0b00011111);
-}
-
 /*
-pretty prints the rows in the results of a query 
+pretty prints the rows in the results of a query
+each value is printed according to its own runtime type, which stays correct
+for projected, reordered, and computed columns
 */
 static void printResult(result_buffer result) {
     for (int r = 0; r < result.count; r++) {
         for (int c = 0; c < result.cols; c++) {
             if (c > 0) printf(" | ");
             value v = result.rows[r][c];
-            SQL_type type = getType(result.types[c]);
-            switch (type) {
-                case SQL_NULL:  printf("NULL");              break;
-                case SQL_BOOL:  printf("%s", v.as.boolean ? "true" : "false"); break;
-                case SQL_INT:   printf("%lld", v.as.integer); break;
-                case SQL_FLOAT: printf("%g",   v.as.floating); break;
-                case SQL_TEXT:  printf("%s",   v.as.text);    break;
+            switch (v.type) {
+                case VAL_NULL:  printf("NULL");              break;
+                case VAL_BOOL:  printf("%s", v.as.boolean ? "true" : "false"); break;
+                case VAL_INT:   printf("%lld", v.as.integer); break;
+                case VAL_FLOAT: printf("%g",   v.as.floating); break;
+                case VAL_TEXT:  printf("%s",   v.as.text);    break;
                 default:        printf("N/A");               break;
             }
         }
@@ -255,6 +255,8 @@ int main(int argc, char** argv) {
     test_tableio();
     test_table_mgmt();
     test_btree();
+    test_file();
+    test_wal();
     test_chunk();
     test_value();
     test_lexer();
@@ -263,6 +265,21 @@ int main(int argc, char** argv) {
     test_schema();
     test_generator();
     test_vm();*/
+
+    // only one process may use the database at a time; the lock is held until this process exits,
+    // and the OS releases it even after a crash. It's taken before recovery so recovery can never
+    // run while another process is partway through a commit
+    mkdir(TABLE_DIRECTORY, 0755); // no-op if it already exists
+    if (lockFileExclusive(LOCK_PATH) == -1) {
+        printf("Error: couldn't lock %s; is another StripeSQL process using this database?\n", LOCK_PATH);
+        return 75;
+    }
+
+    // finish or discard any commit a crash interrupted before anything reads a table
+    if (!recover()) {
+        printf("Error: crash recovery failed; the log (%s) was left in place\n", WAL_LOG_PATH);
+        return 74;
+    }
 
     if (argc == 1) {
         repl();

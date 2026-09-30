@@ -26,6 +26,7 @@ Some combinations of constant values may break the DBMS
 
 #define M_GLOBAL 45		// order (number of children a node can have) of the tree
 #define PAGE_SIZE 4096 		// size in bytes of each page
+#define FULL_FSYNC 0		// 1: sync commits with F_FULLFSYNC, which also flushes the drive's cache on macOS; 0: plain fsync (SQLite's default)
 
 // NEED TO PROGRAMMATICALLY CALCULATE THESE BASED ON PAGE SIZE
 // THE VALUES BELOW ARE PLACEHOLDERS
@@ -33,9 +34,10 @@ Some combinations of constant values may break the DBMS
 #define PAGE_NUM_ENTRIES 700 		// in reality this will be the size of the page minus the slot array and the header
 #define PAGE_ARR_CAP 4000  		// page slot array size
 
-#define DIRTY_STACK_GROWTH_RATE 1.5  // the rate at which the dynamic arrays that hold the stacks for dirty pages and dirty nodes grow
-#define DIRTY_STACK_INTIAL_SIZE 400  // the initial size of each stack
-
 #define MAX_REPL_INPUT_LEN 1024
+
+#define TABLE_DIRECTORY "tables/" // directory in which table files (and the write-ahead log) are placed
+#define TABLE_EXTENSION ".tbl" // file extension for table files
+#define LOCK_PATH TABLE_DIRECTORY "stripe.lock" // held by the one process allowed to use the database
 
 #endif
