@@ -38,10 +38,23 @@ typedef struct addr_table {
 	addr_entry* entries;
 }addr_table;
 
+/*
+what the current statement needs to undo on a table if it fails (see beginStatement())
+*/
+typedef struct statement_undo {
+	bool active; // a statement is changing this table
+	addr_table pages; // address -> prior pending version of each page the statement changed (or none)
+	addr_table nodes; // address -> prior pending version of each node the statement changed (or none)
+	addr_table deletes; // address -> whether each address was already marked for deletion
+	address pageFree, nodeFree, root; // header fields as the statement began
+	int pageStripes, nodeStripes;
+}statement_undo;
+
 typedef struct table {
 	addr_table pageDirty; // address -> slotted_page* of dirty pages
 	addr_table nodeDirty; // address -> node* of dirty nodes
 	addr_table delete; // address -> NULL; presence marks an object for deletion
+	statement_undo undo; // lets a failed statement's changes be rolled back
 	FILE* source; // physical file (NULL until a new table's first commit creates it)
 	bool isNew; // file doesn't exist yet: it's created when the table is first committed
 	char* name; // name of table (corresponding file path is tables/[name].tbl)
@@ -76,6 +89,7 @@ void initAddrTable(addr_table* at);
 void freeAddrTable(addr_table* at); // frees only the entries array; caller owns/frees the values
 void* findAddrTable(address key, addr_table* at);
 void insertAddrTable(address key, void* value, addr_table* at);
+bool removeAddrTable(address key, addr_table* at, void** valueOut); // valueOut may be NULL
 
 // manage table struct
 void freeTable(table* t);
@@ -100,6 +114,10 @@ void markDelete(address address, table* t); // can be used for any object type
 bool commit(table* t);
 bool commitTables(table** tables, int count, file_change* changes, int changeCount); // commit a whole transaction
 void discard(table* t);
+// statement rollback: undo a failed statement's changes while keeping earlier pending ones
+void beginStatement(table* t);
+void endStatement(table* t);
+void rollbackStatement(table* t);
 // allocate new addresses
 void newStripe(table* t);
 address allocNode(table* t);

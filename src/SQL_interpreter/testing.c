@@ -1557,6 +1557,86 @@ void test_interpret_select_projection_types(void) {
     remove(schema_path());
 }
 
+/*
+checks that table sa holds rows 1..150 with v = id (except zeroRow, where v = 0)
+plus row 500, by a full scan and by a primary-key lookup of every row
+*/
+static void check_sa(int64_t zeroRow) {
+    result_buffer scan = interpret("select id, v from sa");
+    assert(scan.ir == INTERPRET_OK && scan.count == 151);
+    for (int i = 0; i < scan.count; i++) {
+        int64_t id = scan.rows[i][0].as.integer;
+        assert(scan.rows[i][1].as.integer == (id == zeroRow ? 0 : id));
+    }
+    char sql[64];
+    for (int64_t id = 1; id <= 150; id++) {
+        snprintf(sql, sizeof(sql), "select v from sa where id = %lld", id);
+        result_buffer one = interpret(sql);
+        assert(one.ir == INTERPRET_OK && one.count == 1);
+        assert(one.rows[0][0].as.integer == (id == zeroRow ? 0 : id));
+    }
+    result_buffer extra = interpret("select v from sa where id = 500");
+    assert(extra.ir == INTERPRET_OK && extra.count == 1 && extra.rows[0][0].as.integer == 500);
+}
+
+void test_interpret_failed_statement_rolls_back(void) {
+    // a statement that fails partway through must leave no trace. The row a full
+    // scan reaches last holds v = 0, so "1000 / v" fails only after every other
+    // row has been updated, or deleted (which restructures the tree); rolling
+    // back must undo all of it while keeping earlier statements' pending
+    // changes, both inside a transaction and outside one
+    remove(schema_path());
+    remove(TABLE_DIRECTORY "sa.tbl");
+    assert(interpret("create table sa (id int primary key, v int)").ir == INTERPRET_OK);
+    char sql[64];
+    assert(interpret("begin transaction").ir == INTERPRET_OK);
+    for (int i = 1; i <= 150; i++) {
+        snprintf(sql, sizeof(sql), "insert into sa values (%d, %d)", i, i);
+        assert(interpret(sql).ir == INTERPRET_OK);
+    }
+    assert(interpret("commit").ir == INTERPRET_OK);
+    result_buffer order = interpret("select id from sa");
+    int64_t zeroRow = order.rows[order.count - 1][0].as.integer;
+    snprintf(sql, sizeof(sql), "update sa set v = 0 where id = %lld", zeroRow);
+    assert(interpret(sql).ir == INTERPRET_OK);
+
+    assert(interpret("begin transaction").ir == INTERPRET_OK);
+    assert(interpret("insert into sa values (500, 500)").ir == INTERPRET_OK);  // pending; must survive
+    assert(interpret("update sa set v = 1000 / v").ir == INTERPRET_RUNTIME_ERROR);
+    assert(interpret("delete from sa where 1000 / v > 0").ir == INTERPRET_RUNTIME_ERROR);
+    check_sa(zeroRow);
+    assert(interpret("commit").ir == INTERPRET_OK);
+    check_sa(zeroRow);  // as reloaded from disk
+
+    assert(interpret("delete from sa where 1000 / v > 0").ir == INTERPRET_RUNTIME_ERROR);  // autocommit
+    check_sa(zeroRow);
+
+    assert(interpret("drop table sa").ir == INTERPRET_OK);
+    remove(schema_path());
+}
+
+void test_interpret_errors_halt_statements(void) {
+    // every error fails its statement as a runtime error, including ones that
+    // wouldn't have changed anything
+    remove(schema_path());
+    remove(TABLE_DIRECTORY "eh.tbl");
+    assert(interpret("create table eh (id int primary key)").ir == INTERPRET_OK);
+    assert(interpret("create table eh (id int primary key)").ir == INTERPRET_RUNTIME_ERROR);  // already exists
+    assert(interpret("drop table nope").ir == INTERPRET_RUNTIME_ERROR);                       // doesn't exist
+    assert(interpret("insert into eh values (1)").ir == INTERPRET_OK);
+    assert(interpret("insert into eh values (1)").ir == INTERPRET_RUNTIME_ERROR);             // duplicate key
+    assert(interpret("select id / 0 from eh").ir == INTERPRET_RUNTIME_ERROR);                 // division by zero
+    assert(interpret("commit").ir == INTERPRET_RUNTIME_ERROR);                                // no transaction
+    assert(interpret("discard").ir == INTERPRET_RUNTIME_ERROR);
+    assert(interpret("begin transaction").ir == INTERPRET_OK);
+    assert(interpret("begin transaction").ir == INTERPRET_RUNTIME_ERROR);                     // already in one
+    assert(interpret("create table eh2 (id int primary key)").ir == INTERPRET_RUNTIME_ERROR); // DDL in a transaction
+    assert(interpret("drop table eh").ir == INTERPRET_RUNTIME_ERROR);
+    assert(interpret("discard").ir == INTERPRET_OK);
+    assert(interpret("drop table eh").ir == INTERPRET_OK);
+    remove(schema_path());
+}
+
 // --- master ---
 
 void test_vm(void) {
@@ -1567,6 +1647,8 @@ void test_vm(void) {
     test_vm_free_no_crash();
     test_interpret_missing_table_returns_compile_error();
     test_interpret_select_projection_types();
+    test_interpret_failed_statement_rolls_back();
+    test_interpret_errors_halt_statements();
     printf("All VM tests passed.\n");
 }
 

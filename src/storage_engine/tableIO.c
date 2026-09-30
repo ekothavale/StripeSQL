@@ -356,16 +356,23 @@ bool writeMeta(FILE* file, table* t) {
 // ##########################################################################################################################################
 // Dirty Hash Table Functions
 
+static void freeUndo(table* t);
+
 /*
-initializes a table's dirty-write hash tables
+initializes a table's dirty-write hash tables (and its statement-rollback state)
 */
 static void initDirtyHashmaps(table* t) {
 	initAddrTable(&t->pageDirty);
 	initAddrTable(&t->nodeDirty);
 	initAddrTable(&t->delete);
+	t->undo.active = false;
+	initAddrTable(&t->undo.pages);
+	initAddrTable(&t->undo.nodes);
+	initAddrTable(&t->undo.deletes);
 }
 
 static void freeDirtyHashmaps(table* t) {
+	if (t->undo.active) freeUndo(t);
 	freeAddrTable(&t->pageDirty);
 	freeAddrTable(&t->nodeDirty);
 	freeAddrTable(&t->delete);
@@ -450,6 +457,39 @@ void insertAddrTable(address key, void* value, addr_table* at) {
 	found->key = key;
 	found->value = value;
 	if (isNew) at->count++;
+}
+
+/*
+removes key from the table if it's present, handing its value to valueOut (the caller now owns it)
+uses backward-shift deletion: later entries in the same probe run are moved back into the hole, so linear
+probing still finds every remaining key and an empty slot still ends a search, without tombstones
+@return false if key wasn't present
+*/
+bool removeAddrTable(address key, addr_table* at, void** valueOut) {
+	if (at->capacity == 0) return false;
+	addr_entry* found = findAddrEntry(key, at->entries, at->capacity);
+	if (found->key == 0) return false;
+	if (valueOut) *valueOut = found->value;
+	uint64_t capacity = (uint64_t)at->capacity;
+	uint64_t hole = (uint64_t)(found - at->entries);
+	for (uint64_t i = (hole + 1) % capacity; at->entries[i].key != 0; i = (i + 1) % capacity) {
+		uint64_t home = hashAddress(at->entries[i].key) % capacity;
+		// an entry can move back into the hole unless its home slot lies cyclically within (hole, i]
+		bool homeInRange = hole < i ? (home > hole && home <= i) : (home > hole || home <= i);
+		if (homeInRange) continue;
+		at->entries[hole] = at->entries[i];
+		hole = i;
+	}
+	at->entries[hole].key = 0;
+	at->entries[hole].value = NULL;
+	at->count--;
+	return true;
+}
+
+// whether key is present (findAddrTable can't tell, since a present key's value may be NULL)
+static bool containsAddrTable(address key, addr_table* at) {
+	if (at->capacity == 0) return false;
+	return findAddrEntry(key, at->entries, at->capacity)->key != 0;
 }
 
 // ##########################################################################################################################################
@@ -901,8 +941,158 @@ void loadNext(node* n, node* next, table* t) {
 	readNode(n->next, next, t);
 }
 
+// ##########################################################################################################################################
+// ##########################################################################################################################################
+// STATEMENT ROLLBACK
+
+/*
+A statement's changes to a table go into its dirty hashmaps alongside those of earlier statements in the
+same transaction. So that a failed statement can be undone without losing the earlier ones, the first time
+a statement changes an object, the object's prior pending version (or the fact that it had none) is copied
+aside; rolling back puts those back and restores the header fields the statement began with. Nothing
+reaches the disk before a commit, so this is all in memory.
+*/
+
+typedef struct undo_entry {
+	bool present; // whether the object had a pending change before the statement changed it
+	void* prior;  // a copy of that pending version (pages and nodes only)
+}undo_entry;
+
+static undo_entry* newUndoEntry(bool present, void* prior) {
+	undo_entry* u = malloc(sizeof(undo_entry));
+	u->present = present;
+	u->prior = prior;
+	return u;
+}
+
+// called before the statement changes a page, node or delete marker for the first time
+static void rememberPage(address addr, table* t) {
+	if (!t->undo.active || findAddrTable(addr, &t->undo.pages)) return;
+	slotted_page* current = (slotted_page*)findAddrTable(addr, &t->pageDirty);
+	slotted_page* prior = NULL;
+	if (current) {
+		prior = malloc(sizeof(slotted_page));
+		copyPage(current, prior);
+	}
+	insertAddrTable(addr, newUndoEntry(current != NULL, prior), &t->undo.pages);
+}
+
+static void rememberNode(address addr, table* t) {
+	if (!t->undo.active || findAddrTable(addr, &t->undo.nodes)) return;
+	node* current = (node*)findAddrTable(addr, &t->nodeDirty);
+	node* prior = NULL;
+	if (current) {
+		prior = malloc(sizeof(node));
+		copyNode(current, prior);
+	}
+	insertAddrTable(addr, newUndoEntry(current != NULL, prior), &t->undo.nodes);
+}
+
+static void rememberDelete(address addr, table* t) {
+	if (!t->undo.active || findAddrTable(addr, &t->undo.deletes)) return;
+	insertAddrTable(addr, newUndoEntry(containsAddrTable(addr, &t->delete), NULL), &t->undo.deletes);
+}
+
+/*
+frees the prior versions a statement set aside and stops tracking it
+*/
+static void freeUndo(table* t) {
+	statement_undo* u = &t->undo;
+	for (int i = 0; i < u->pages.capacity; i++) {
+		if (u->pages.entries[i].key == 0) continue;
+		undo_entry* e = (undo_entry*)u->pages.entries[i].value;
+		if (e->prior) {
+			freeSPage((slotted_page*)e->prior);
+			free(e->prior);
+		}
+		free(e);
+	}
+	for (int i = 0; i < u->nodes.capacity; i++) {
+		if (u->nodes.entries[i].key == 0) continue;
+		undo_entry* e = (undo_entry*)u->nodes.entries[i].value;
+		free(e->prior);
+		free(e);
+	}
+	for (int i = 0; i < u->deletes.capacity; i++) {
+		if (u->deletes.entries[i].key == 0) continue;
+		free(u->deletes.entries[i].value);
+	}
+	freeAddrTable(&u->pages);
+	freeAddrTable(&u->nodes);
+	freeAddrTable(&u->deletes);
+	u->active = false;
+}
+
+/*
+starts tracking a statement's changes to t so that rollbackStatement() can undo them
+does nothing if the statement is already tracking t
+*/
+void beginStatement(table* t) {
+	statement_undo* u = &t->undo;
+	if (u->active) return;
+	u->active      = true;
+	u->pageFree    = t->pageFree;
+	u->nodeFree    = t->nodeFree;
+	u->root        = t->root;
+	u->pageStripes = t->pageStripes;
+	u->nodeStripes = t->nodeStripes;
+}
+
+/*
+the statement succeeded: keeps its changes and forgets the prior versions
+*/
+void endStatement(table* t) {
+	if (t->undo.active) freeUndo(t);
+}
+
+/*
+the statement failed: puts back every object's pending version from before the statement (dropping the ones
+it added) and restores the header fields, so earlier statements' changes stay pending as they were
+*/
+void rollbackStatement(table* t) {
+	statement_undo* u = &t->undo;
+	if (!u->active) return;
+	for (int i = 0; i < u->pages.capacity; i++) {
+		addr_entry* e = &u->pages.entries[i];
+		if (e->key == 0) continue;
+		undo_entry* prior = (undo_entry*)e->value;
+		void* current;
+		if (removeAddrTable(e->key, &t->pageDirty, &current)) {
+			freeSPage((slotted_page*)current);
+			free(current);
+		}
+		if (prior->present) insertAddrTable(e->key, prior->prior, &t->pageDirty);
+		prior->prior = NULL; // now owned by the dirty hashmap
+	}
+	for (int i = 0; i < u->nodes.capacity; i++) {
+		addr_entry* e = &u->nodes.entries[i];
+		if (e->key == 0) continue;
+		undo_entry* prior = (undo_entry*)e->value;
+		void* current;
+		if (removeAddrTable(e->key, &t->nodeDirty, &current)) free(current);
+		if (prior->present) insertAddrTable(e->key, prior->prior, &t->nodeDirty);
+		prior->prior = NULL;
+	}
+	for (int i = 0; i < u->deletes.capacity; i++) {
+		addr_entry* e = &u->deletes.entries[i];
+		if (e->key == 0) continue;
+		if (!((undo_entry*)e->value)->present) removeAddrTable(e->key, &t->delete, NULL);
+	}
+	t->pageFree    = u->pageFree;
+	t->nodeFree    = u->nodeFree;
+	t->root        = u->root;
+	t->pageStripes = u->pageStripes;
+	t->nodeStripes = u->nodeStripes;
+	freeUndo(t);
+}
+
+// ##########################################################################################################################################
+// ##########################################################################################################################################
+// MARKING DIRTY OBJECTS
+
 // mark page dirty
 void markPage(address address, slotted_page* p, table* t) {
+	rememberPage(address, t);
 	slotted_page* existing = (slotted_page*)findAddrTable(address, &t->pageDirty);
 	if (existing) {
 		copyPage(p, existing);
@@ -915,6 +1105,7 @@ void markPage(address address, slotted_page* p, table* t) {
 
 // mark node dirty
 void markNode(address address, node* n, table* t) {
+	rememberNode(address, t);
 	node* existing = (node*)findAddrTable(address, &t->nodeDirty);
 	if (existing) {
 		copyNode(n, existing);
@@ -927,7 +1118,8 @@ void markNode(address address, node* n, table* t) {
 
 // mark object for deletion
 void markDelete(address address, table* t) {
-	if (findAddrTable(address, &t->delete)) return; // skip if already marked
+	rememberDelete(address, t);
+	if (containsAddrTable(address, &t->delete)) return; // skip if already marked
 	insertAddrTable(address, NULL, &t->delete);
 }
 

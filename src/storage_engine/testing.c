@@ -875,6 +875,33 @@ void test_node_write_drains_all(void) {
 }
 
 /* Run all tableIO tests. */
+/*
+removeAddrTable must keep every remaining key findable (it shifts later entries of
+a probe run back into the hole instead of leaving a gap that would end searches
+early). 200 keys are inserted, then every third is removed.
+*/
+void test_addr_table_remove(void) {
+    printf("  test_addr_table_remove ... ");
+    addr_table at;
+    initAddrTable(&at);
+    int n = 200;
+    for (int i = 1; i <= n; i++) insertAddrTable((address)(i * 64), (void*)(uintptr_t)i, &at);
+    for (int i = 1; i <= n; i += 3) {
+        void* value = NULL;
+        assert(removeAddrTable((address)(i * 64), &at, &value));
+        assert((uintptr_t)value == (uintptr_t)i);
+    }
+    assert(!removeAddrTable(64, &at, NULL));  // already removed
+    for (int i = 1; i <= n; i++) {
+        void* value = findAddrTable((address)(i * 64), &at);
+        if ((i - 1) % 3 == 0) assert(value == NULL);
+        else assert((uintptr_t)value == (uintptr_t)i);
+    }
+    assert(at.count == n - (n + 2) / 3);
+    freeAddrTable(&at);
+    printf("PASS\n");
+}
+
 void test_tableio(void) {
     printf("=== TableIO Tests ===\n");
     // writeMeta / loadMeta
@@ -889,6 +916,8 @@ void test_tableio(void) {
     test_mark_node_dedup();
     test_mark_node_snapshot();
     test_mark_node_growth();
+    // dirty hashmap removal
+    test_addr_table_remove();
     // allocPage
     test_alloc_page();
     test_alloc_page_stripe();

@@ -53,6 +53,7 @@ typedef struct VM {
 	result_buffer results;
 	scanner scanners[MAX_SCANNERS]; // concurrent database processes
 	int numScanners; 				// number of scanners currently open
+	bool failed; 					// set by any runtime error; halts the statement
 	value stack[STACK_MAX]; 		// where values are stored
 } VM;
 

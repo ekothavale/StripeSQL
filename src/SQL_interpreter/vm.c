@@ -61,18 +61,21 @@ static table* findTxnTable(uint32_t tableHash) {
 	return NULL;
 }
 
+static void statementError(const char* format, ...);
+
 /*
 registers a freshly opened table handle with the active transaction so later
 statements in the same transaction reuse it instead of reloading from disk
 */
-static void registerTxnTable(uint32_t tableHash, table* t) {
+static bool registerTxnTable(uint32_t tableHash, table* t) {
 	if (transaction.count >= MAX_TXN_TABLES) {
-		printf("Error: transaction has touched too many tables\n");
-		return;
+		statementError("Error: transaction has touched too many tables\n");
+		return false;
 	}
 	transaction.tables[transaction.count].tableHash = tableHash;
 	transaction.tables[transaction.count].tbl = t;
 	transaction.count++;
+	return true;
 }
 
 static void resetStack(){
@@ -90,6 +93,19 @@ static void runtimeError(const char* format, ...) {
   int line = vm.chunk->lines[instruction];
   fprintf(stderr, "[line %d] in script\n", line);
   resetStack();
+  vm.failed = true;
+}
+
+/*
+reports an error that halts the current statement: run() stops before its next instruction, and
+interpret() rolls back whatever the statement changed
+*/
+static void statementError(const char* format, ...) {
+	va_list args;
+	va_start(args, format);
+	vprintf(format, args);
+	va_end(args);
+	vm.failed = true;
 }
 
 void initVM(hashtable* schema) {
@@ -104,6 +120,7 @@ void initVM(hashtable* schema) {
 	vm.results.cols     = 0;
 	vm.schema           = schema;
 	vm.results.print    = false;
+	vm.failed           = false;
 }
 
 void freeVM() {
@@ -160,7 +177,7 @@ static ordering_type getPkOrderingType(schema* s) {
 			return sqlTypeToOrdering((SQL_type)(s->colTypes[i] & 0b00011111));
 		}
 	}
-	printf("Error: table '%s' has no primary key column\n", s->tablename);
+	statementError("Error: table '%s' has no primary key column\n", s->tablename);
 	return ORDERING_ULONG;
 }
 
@@ -204,18 +221,24 @@ opens a new scanner
 void openScanner(uint32_t tableNameHash, uint8_t pkIdx) {
 	const char* tablename = readHT(tableNameHash, vm.schema)->tablename;
 	if (vm.numScanners >= MAX_SCANNERS) {
-		printf("Error: no free scanner slots available\n");
+		statementError("Error: no free scanner slots available\n");
 		return;
 	}
 	table* t = findTxnTable(tableNameHash);
 	if (!t) {
 		t = malloc(sizeof(table));
-		if (!loadTable((char*)tablename, t)) {
+		if (!loadTable((char*)tablename, t)) { // loadTable() reports why
 			free(t);
+			vm.failed = true;
 			return;
 		}
-		if (transaction.active) registerTxnTable(tableNameHash, t);
+		if (transaction.active && !registerTxnTable(tableNameHash, t)) {
+			fclose(t->source);
+			freeTable(t);
+			return;
+		}
 	}
+	beginStatement(t); // so the table can be rolled back if this statement fails
 	int idx = vm.numScanners++;
 	vm.scanners[idx].tbl      = t;
 	vm.scanners[idx].tblHash  = tableNameHash;
@@ -238,6 +261,7 @@ returns false if that commit failed to reach disk
 bool closeScanner(scanner* s) {
 	if (!s->open) return true;
 	bool committed = true;
+	endStatement(s->tbl); // the statement is done with this table, so its changes are kept
 	// tables owned by an active transaction stay open until COMMIT/DISCARD
 	if (!findTxnTable(s->tblHash)) {
 		committed = commit(s->tbl);
@@ -269,14 +293,14 @@ bool advanceScanner(scanner* s) {
 		// walk down to leftmost leaf
 		address nAddr = t->root;
 		if (!readNode(nAddr, &s->leafNode, t)) {
-			printf("Error: scanner could not read root node at address %llu; tree may be corrupt\n", nAddr);
+			statementError("Error: scanner could not read root node at address %llu; tree may be corrupt\n", nAddr);
 			s->atEnd = true;
 			return false;
 		}
 		while (!s->leafNode.isLeaf) {
 			nAddr = s->leafNode.children[0];
 			if (!readNode(nAddr, &s->leafNode, t)) {
-				printf("Error: scanner could not read node at address %llu; tree may be corrupt\n", nAddr);
+				statementError("Error: scanner could not read node at address %llu; tree may be corrupt\n", nAddr);
 				s->atEnd = true;
 				return false;
 			}
@@ -473,6 +497,7 @@ static interpret_result run() {
 		} while (false)
 
 	for (;;) {
+		if (vm.failed) return INTERPRET_RUNTIME_ERROR; // an error halts the statement
 		#ifdef DEBUG_TRACE_EXECUTION
 			printf("        ");
 			for (value* slot = vm.stack; slot < vm.stackTop; slot++) {
@@ -509,7 +534,17 @@ static interpret_result run() {
 			case OP_ADD: BINARY_OP(+); break;
 			case OP_SUBTRACT: BINARY_OP(-); break;
 			case OP_MULTIPLY: BINARY_OP(*); break;
-			case OP_DIVIDE: BINARY_OP(/); break;
+			case OP_DIVIDE: {
+				// integer division by zero is undefined behavior in C, so it's an error rather than whatever the CPU does
+				value divisor = vm.stackTop[-1];
+				if ((divisor.type == VAL_INT && divisor.as.integer == 0) ||
+				    (divisor.type == VAL_FLOAT && divisor.as.floating == 0)) {
+					runtimeError("Division by zero");
+					break;
+				}
+				BINARY_OP(/);
+				break;
+			}
 			case OP_NEGATE: {
 				value v = pop();
 				if (v.type != VAL_INT && v.type != VAL_FLOAT) {
@@ -698,13 +733,15 @@ static interpret_result run() {
 				ordering_key ik = pkToOk(pk);
 				sp_record r = { .entries = entries, .len = count, .size = totalSize };
 				if (searchRecord(ik, t)) {
-					printf("Entry with primary key: ");
+					printf("Error: a row with primary key ");
 					printPK(pk);
 					printf(" already exists\n");
+					vm.failed = true;
 				} else if (!insertRecord(&r, ik, t)) {
-					printf("Failed to insert entry with primary key: ");
+					printf("Error: failed to insert the row with primary key ");
 					printPK(pk);
 					printf(" (page full)\n");
+					vm.failed = true;
 				}
 				free(entries);  // page owns the data pointers; release only the metadata array
 				break;
@@ -726,7 +763,10 @@ static interpret_result run() {
 				ordering_key ik = { .pageNum = s->page.header.pageNum, .offset = s->page.slots[s->slotIdx].ID };
 				freeSPage(&s->page);
 				s->page = (slotted_page){0};
-				deleteRecord(ik, t, &s->page);
+				if (!deleteRecord(ik, t, &s->page)) {
+					statementError("Error: failed to delete a row\n");
+					break;
+				}
 				if (s->page.header.numRecords == 0) {
 					s->childIdx = (s->childIdx > 0) ? s->childIdx - 1 : (uint32_t)(-1);
 					// deleteRecord()'s rebalancing (borrow/merge) can modify nodes
@@ -745,20 +785,20 @@ static interpret_result run() {
 				uint32_t hash = vm.chunk->constants.values[schemaIdx].as.u32;
 				// CREATE TABLE commits on its own, so a transaction couldn't DISCARD it
 				if (transaction.active) {
-					printf("Error: CREATE TABLE can't run inside a transaction\n");
-					return INTERPRET_RUNTIME_ERROR;
+					statementError("Error: CREATE TABLE can't run inside a transaction\n");
+					break;
 				}
 				schema* s = readHT(hash, vm.schema);
 				if (!s) {
-					printf("Error: schema not found for CREATE TABLE\n");
+					statementError("Error: schema not found for CREATE TABLE\n");
 					break;
 				}
-				// if the table already exists, do nothing
 				if (tableAlreadyExists(s->tablename)) {
-					printf("Tried to create table %s but it already exists\n", s->tablename);
+					statementError("Error: table %s already exists\n", s->tablename);
 					break;
 				}
 				page_num firstKey = { .type = getPkOrderingType(s) };
+				if (vm.failed) break;
 				// the new table's file and its schema entry are committed together, so a crash can't
 				// leave one without the other
 				table* t = newTree(s->tablename, firstKey);
@@ -784,11 +824,11 @@ static interpret_result run() {
 				uint32_t hash = hashString(name, (int)strlen(name));
 				// DROP TABLE commits on its own, so a transaction couldn't DISCARD it
 				if (transaction.active) {
-					printf("Error: DROP TABLE can't run inside a transaction\n");
-					return INTERPRET_RUNTIME_ERROR;
+					statementError("Error: DROP TABLE can't run inside a transaction\n");
+					break;
 				}
 				if (!readHT(hash, vm.schema) && !tableAlreadyExists(name)) {
-					printf("Error: table '%s' not found\n", name);
+					statementError("Error: table '%s' not found\n", name);
 					break;
 				}
 				// the schema entry and the table's file are removed together
@@ -811,7 +851,7 @@ static interpret_result run() {
 			}
 			case OP_BEGIN_TRANSACTION: {
 				if (transaction.active) {
-					printf("Error: a transaction is already in progress\n");
+					statementError("Error: a transaction is already in progress\n");
 					break;
 				}
 				transaction.active = true;
@@ -820,7 +860,7 @@ static interpret_result run() {
 			}
 			case OP_COMMIT: {
 				if (!transaction.active) {
-					printf("Error: no transaction in progress to commit\n");
+					statementError("Error: no transaction in progress to commit\n");
 					break;
 				}
 				// every table in the transaction commits under one commit marker in the log, so
@@ -839,7 +879,7 @@ static interpret_result run() {
 			}
 			case OP_DISCARD: {
 				if (!transaction.active) {
-					printf("Error: no transaction in progress to discard\n");
+					statementError("Error: no transaction in progress to discard\n");
 					break;
 				}
 				for (int i = 0; i < transaction.count; i++) {
@@ -864,6 +904,29 @@ static interpret_result run() {
 	#undef READ_BYTE
 	#undef READ_CONSTANT
 	#undef BINARY_OP
+}
+
+/*
+undoes a statement that failed partway through: each table it was changing gets back the pending changes
+it had before the statement, so a transaction carries on as if the statement never ran. A table outside a
+transaction also drops them (none of the statement was committed) and is closed
+*/
+static void abortStatement(void) {
+	for (int i = vm.numScanners - 1; i >= 0; i--) {
+		scanner* s = &vm.scanners[i];
+		if (!s->open) continue;
+		rollbackStatement(s->tbl);
+		if (!findTxnTable(s->tblHash)) {
+			discard(s->tbl);
+			fclose(s->tbl->source);
+			freeTable(s->tbl);
+		}
+		freeSPage(&s->page);
+		s->page = (slotted_page){0};
+		s->tbl  = NULL;
+		s->open = false;
+	}
+	vm.numScanners = 0;
 }
 
 result_buffer interpret(const char* source) {
@@ -900,6 +963,7 @@ result_buffer interpret(const char* source) {
 	vm.ip = vm.chunk->code;
 
 	vm.results.ir = run();
+	if (vm.results.ir == INTERPRET_RUNTIME_ERROR) abortStatement();
 
 	freeHashTable(schema);
 	free(schema);

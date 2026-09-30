@@ -50,6 +50,8 @@ void test_btree_full_roundtrip(void);
 void test_btree_delete_tree(void);
 void test_btree_delete_tree_not_reloadable(void);
 
+void test_addr_table_remove(void);
+
 /* File helper tests */
 void test_file(void);
 void test_file_lock_excludes_other_processes(void);
