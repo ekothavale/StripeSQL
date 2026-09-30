@@ -16,6 +16,12 @@ main: $(OBJS)
 clean:
 	rm -f $(OBJS) main
 
+# crash-recovery test for the write-ahead log (macOS only; see crashtest/crashtest.py)
+crashtest: main
+	python3 crashtest/crashtest.py
+
+.PHONY: clean crashtest
+
 # --- core ---
 
 main.o: $(SRC)/main.c $(SRC)/common.h $(SRC)/debug.h \
