@@ -44,6 +44,7 @@ TODO:
 #include "../memory.h"
 #include <stdbool.h>
 #include <sys/stat.h>
+#include <errno.h>
 
 #define ADDR_TABLE_MAX_LOAD_FACTOR 0.8
 #define GARBAGE_MARKER 2 // a two in the first byte of an object means it's garbage
@@ -470,25 +471,24 @@ Creates a new file for a database table and returns the matching table struct
 Used to create a new table
 mallocs new memory (table)
 */
-table* createTable(char* tablename) {
-	// Build path: "tables/<tablename>.tbl"
-	const char* dir = TABLE_DIRECTORY;
-	const char* ext = TABLE_EXTENSION;
-	size_t pathlen = strlen(dir) + strlen(tablename) + strlen(ext) + 1;
+/*
+builds the path "tables/<tablename>.tbl" (caller frees)
+*/
+static char* tablePath(const char* tablename) {
+	size_t pathlen = strlen(TABLE_DIRECTORY) + strlen(tablename) + strlen(TABLE_EXTENSION) + 1;
 	char* path = malloc(pathlen);
-	snprintf(path, pathlen, "%s%s%s", dir, tablename, ext);
+	snprintf(path, pathlen, "%s%s%s", TABLE_DIRECTORY, tablename, TABLE_EXTENSION);
+	return path;
+}
 
-	mkdir(dir, 0755); // no-op if directory already exists
-
-	FILE* f = fopen(path, "wb+");
-	free(path);
-	if (!f) {
-		printf("Error: failed to create table file for '%s'\n", tablename);
-		return NULL;
-	}
-
+/*
+initializes the struct for a new, empty table without touching the disk
+mallocs new memory (table)
+*/
+static table* initTable(char* tablename) {
 	table* t = malloc(sizeof(table));
-	t->source        = f;
+	t->source        = NULL;
+	t->isNew         = false;
 	t->cursor        = 0;
 	t->metalen       = METALEN * 4;
 	t->pageStripes   = 1;
@@ -508,7 +508,37 @@ table* createTable(char* tablename) {
 	t->name          = strdup(tablename);
 
 	initDirtyHashmaps(t);
+	return t;
+}
+
+/*
+creates a table's file immediately and writes its header, bypassing the write-ahead log
+for low-level use and testing; the database creates tables with newTable() and a commit instead
+*/
+table* createTable(char* tablename) {
+	char* path = tablePath(tablename);
+	mkdir(TABLE_DIRECTORY, 0755); // no-op if directory already exists
+	FILE* f = fopen(path, "wb+");
+	free(path);
+	if (!f) {
+		printf("Error: failed to create table file for '%s'\n", tablename);
+		return NULL;
+	}
+	table* t = initTable(tablename);
+	t->source = f;
 	writeMeta(f, t);
+	return t;
+}
+
+/*
+creates a table in memory only; its file is created when the table is first committed (see
+commitTables()), after the commit point, so a crash beforehand leaves nothing behind
+until then, only objects in the dirty hashmaps can be read
+mallocs new memory (table)
+*/
+table* newTable(char* tablename) {
+	table* t = initTable(tablename);
+	t->isNew = true;
 	return t;
 }
 
@@ -541,6 +571,7 @@ bool loadTable(char* tablename, table* t) {
 		return false;
 	}
 	t->source = tfile;
+	t->isNew  = false;
 	t->cursor = 0;
 	t->name   = strdup(tablename);
 	loadMeta(tfile, fname, t);
@@ -856,16 +887,6 @@ void writeNextNode(table* t) {
 writes a new tree consisting of one empty page and one empty node directly to a table file
 should be used only on a new file
 */
-bool writeNewTree(slotted_page* p, address pageAddr, node* n, address nodeAddr, table* t) {
-	writePage(p, pageAddr, t);
-	writeNode(n, nodeAddr, t);
-	writeMeta(t->source, t);
-	if (!syncFile(t->source)) {
-		printf("Error: failed to write table '%s' to disk\n", t->name);
-		return false;
-	}
-	return true;
-}
 
 /*MIGHT NEED THESE TO RETURN TRUE OR FALSE*/
 void loadParent(node* n, node* parent, table* t) {
@@ -918,19 +939,30 @@ void deleteObject(address address, table* t) {
 }
 
 static bool isDirty(table* t) {
-	return t->pageDirty.count > 0 || t->nodeDirty.count > 0 || t->delete.count > 0;
+	return t->isNew || t->pageDirty.count > 0 || t->nodeDirty.count > 0 || t->delete.count > 0;
 }
 
 /*
-appends every write applyTable() will make to this table to the write-ahead log, in the same order,
-without touching the table file
+writes the table's file name within TABLE_DIRECTORY (how the write-ahead log refers to it) into out
+returns false if the name is too long to fit in a log entry
+*/
+static bool tableFileName(table* t, char* out) {
+	return snprintf(out, WAL_FILE_NAME_LEN, "%s%s", t->name, TABLE_EXTENSION) < WAL_FILE_NAME_LEN;
+}
+
+/*
+appends every change applyTable() will make to this table to the write-ahead log, in the same order,
+without touching the table file: creating the file if the table is new, then its dirty objects
 */
 static bool logTable(table* t) {
+	char file[WAL_FILE_NAME_LEN];
+	if (!tableFileName(t, file)) return false;
+	if (t->isNew && !addLogEntry(file, WAL_FILE_CREATE, 0, NULL, 0)) return false;
 	for (int i = 0; i < t->pageDirty.capacity; i++) {
 		addr_entry* e = &t->pageDirty.entries[i];
 		if (e->key == 0) continue;
 		char* bytes = serializePage((slotted_page*)e->value, t);
-		bool logged = addLogEntry(t->name, WAL_PAGE, e->key, (uint8_t*)bytes, t->pageSize);
+		bool logged = addLogEntry(file, WAL_PAGE, e->key, (uint8_t*)bytes, t->pageSize);
 		free(bytes);
 		if (!logged) return false;
 	}
@@ -938,7 +970,7 @@ static bool logTable(table* t) {
 		addr_entry* e = &t->nodeDirty.entries[i];
 		if (e->key == 0) continue;
 		char* bytes = serializeNode((node*)e->value, t);
-		bool logged = addLogEntry(t->name, WAL_NODE, e->key, (uint8_t*)bytes, t->nodeSize);
+		bool logged = addLogEntry(file, WAL_NODE, e->key, (uint8_t*)bytes, t->nodeSize);
 		free(bytes);
 		if (!logged) return false;
 	}
@@ -946,18 +978,30 @@ static bool logTable(table* t) {
 	for (int i = 0; i < t->delete.capacity; i++) {
 		addr_entry* e = &t->delete.entries[i];
 		if (e->key == 0) continue;
-		if (!addLogEntry(t->name, WAL_DELETE, e->key, &garbage, 1)) return false;
+		if (!addLogEntry(file, WAL_DELETE, e->key, &garbage, 1)) return false;
 	}
 	uint32_t meta[METALEN];
 	fillMeta(t, meta);
-	return addLogEntry(t->name, WAL_META, 0, (uint8_t*)meta, sizeof(meta));
+	return addLogEntry(file, WAL_META, 0, (uint8_t*)meta, sizeof(meta));
 }
 
 /*
 empties a table's write tables and makes the changes to the file on disk, then syncs the file
+a new table's file is created here, after the commit point
 @return false if any write or the sync failed; the file may then hold a partial commit
 */
 static bool applyTable(table* t) {
+	if (t->isNew) {
+		char* path = tablePath(t->name);
+		mkdir(TABLE_DIRECTORY, 0755); // no-op if directory already exists
+		t->source = fopen(path, "wb+");
+		free(path);
+		if (!t->source) {
+			printf("Error: failed to create table file for '%s'\n", t->name);
+			return false;
+		}
+		t->isNew = false;
+	}
 	clearerr(t->source); // scope syncFile()'s error check to this commit's writes
 
 	for (int i = 0; i < t->pageDirty.capacity; i++) {
@@ -1002,22 +1046,56 @@ static bool applyTable(table* t) {
 }
 
 /*
-commits a transaction's tables through the write-ahead log (see wal.c):
- 1. every dirty page, node, delete marker and header of every table is appended to the log
+appends a whole-file change to the log: the file is emptied (or created) and its new contents follow in
+PAGE_SIZE pieces, or the file is removed
+*/
+static bool logFileChange(file_change* c) {
+	if (!c->bytes) return addLogEntry(c->name, WAL_FILE_REMOVE, 0, NULL, 0);
+	if (!addLogEntry(c->name, WAL_FILE_CREATE, 0, NULL, 0)) return false;
+	for (size_t off = 0; off < c->len; off += PAGE_SIZE) {
+		size_t n = c->len - off < PAGE_SIZE ? c->len - off : PAGE_SIZE;
+		if (!addLogEntry(c->name, WAL_FILE_DATA, off, (const uint8_t*)c->bytes + off, (uint16_t)n)) return false;
+	}
+	return true;
+}
+
+/*
+makes a whole-file change after the commit point, syncing a rewritten file
+*/
+static bool applyFileChange(file_change* c) {
+	char path[sizeof(TABLE_DIRECTORY) + WAL_FILE_NAME_LEN];
+	snprintf(path, sizeof(path), "%s%s", TABLE_DIRECTORY, c->name);
+	if (!c->bytes) return remove(path) == 0 || errno == ENOENT;
+	FILE* f = fopen(path, "wb");
+	if (!f) return false;
+	bool written = fwrite(c->bytes, 1, c->len, f) == c->len && syncFile(f);
+	fclose(f);
+	return written;
+}
+
+/*
+commits a transaction through the write-ahead log (see wal.c): changes to its tables, plus any whole-file
+changes (e.g. rewriting the schema, or removing a dropped table's file)
+ 1. every change is appended to the log: new tables' files, dirty pages, nodes, delete markers and
+    headers, then the whole-file changes
  2. the log is synced and marked committed  <- commit point
- 3. the same writes are made to each table file, which is then synced
+ 3. the same changes are made to the files, which are synced, then their directory is synced if any
+    file was created or removed
  4. the log is reset
 a failure before the commit point aborts the transaction: its changes are dropped and false is returned
-a failure after it leaves a committed log and possibly half-written tables, so the process exits and
+a failure after it leaves a committed log and possibly half-written files, so the process exits and
 recovery finishes the commit on the next startup
-tables with nothing dirty (e.g. after a read-only statement) are skipped; if none are dirty, nothing is logged or synced
+tables with nothing dirty (e.g. after a read-only statement) are skipped; if nothing changes at all,
+nothing is logged or synced
 */
-bool commitTables(table** tables, int count) {
-	bool anyDirty = false;
+bool commitTables(table** tables, int count, file_change* changes, int changeCount) {
+	bool anyChange = changeCount > 0;
+	bool changesFiles = changeCount > 0; // creates or removes a file, so the directory must be synced
 	for (int i = 0; i < count; i++) {
-		if (isDirty(tables[i])) anyDirty = true;
+		if (isDirty(tables[i])) anyChange = true;
+		if (tables[i]->isNew) changesFiles = true;
 	}
-	if (!anyDirty) return true;
+	if (!anyChange) return true;
 
 	// if the log can't be started (e.g. it still holds another transaction), leave it untouched
 	if (!initManager()) {
@@ -1029,6 +1107,7 @@ bool commitTables(table** tables, int count) {
 	for (int i = 0; logged && i < count; i++) {
 		if (isDirty(tables[i])) logged = logTable(tables[i]);
 	}
+	for (int i = 0; logged && i < changeCount; i++) logged = logFileChange(&changes[i]);
 	if (logged) logged = markLogCommitted();
 	if (!logged) {
 		printf("Error: failed to write the transaction to the log; its changes were discarded\n");
@@ -1047,6 +1126,16 @@ bool commitTables(table** tables, int count) {
 			exit(74);
 		}
 	}
+	for (int i = 0; i < changeCount; i++) {
+		if (!applyFileChange(&changes[i])) {
+			printf("Error: failed to write '%s' after commit; exiting so recovery can finish the commit on startup\n", changes[i].name);
+			exit(74);
+		}
+	}
+	if (changesFiles && !syncDirectory(TABLE_DIRECTORY)) {
+		printf("Error: failed to sync %s after commit; exiting so recovery can finish the commit on startup\n", TABLE_DIRECTORY);
+		exit(74);
+	}
 	if (!resetLog()) {
 		// a stale committed log would be replayed over later commits, so don't continue
 		printf("Error: failed to reset the log after a commit; exiting so recovery can clean it up on startup\n");
@@ -1059,7 +1148,7 @@ bool commitTables(table** tables, int count) {
 commits a single table (the implicit commit at the end of a statement outside a transaction)
 */
 bool commit(table* t) {
-	return commitTables(&t, 1);
+	return commitTables(&t, 1, NULL, 0);
 }
 
 /*

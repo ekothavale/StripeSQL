@@ -28,40 +28,45 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 #define WAL_MAGIC_MASK 0xFFFFFF00 // selects the magic out of an entry's combined magic | type field
 #define WAL_COMMIT_TAG 0x434F4D54 // "COMT": first word of the commit marker
 #define WAL_LOG_PATH TABLE_DIRECTORY "stripe.log"
-#define WAL_TABLE_NAME_LEN 256 // room for any identifier (MAX_IDENT_LEN in generator.c)
+#define WAL_FILE_NAME_LEN 260 // room for any table name (MAX_IDENT_LEN - 1 chars in generator.c) plus ".tbl" and a NUL
 #define TRANS_ID_SEED 0x09410293
 #define TRANS_ID_MULTIPLIER 1007683
 #define TRANS_ID_INCREMENT 54321
 #define TRANS_ID_MOD 0x7FFFFFFF
 
 /*
-kind of object an entry's payload holds, stored in the low byte of the entry's magic
-recovery writes every kind the same way (payload bytes at addr); the type is for inspecting the log
+kind of operation an entry records, stored in the low byte of the entry's magic
+the first five are writes: recovery writes each the same way (payload bytes at addr), and the type is
+there for inspecting the log; the last two change which files exist
+every operation is idempotent, so replaying a committed log any number of times gives the same files
 */
 typedef enum {
-	WAL_PAGE   = 1,
-	WAL_NODE   = 2,
-	WAL_META   = 3, // table header, always at address 0
-	WAL_DELETE = 4, // 1-byte garbage marker (see deleteObject() in tableIO.c)
+	WAL_PAGE        = 1,
+	WAL_NODE        = 2,
+	WAL_META        = 3, // table header, always at address 0
+	WAL_DELETE      = 4, // 1-byte garbage marker (see deleteObject() in tableIO.c)
+	WAL_FILE_DATA   = 5, // part of a file being rewritten in full, e.g. the schema
+	WAL_FILE_CREATE = 6, // create the file, or empty it if it exists (no payload)
+	WAL_FILE_REMOVE = 7, // remove the file if it exists (no payload)
 } wal_object_type;
 
 /*
-one logged write: payloadLen bytes to be written at addr in tables/<tableName>.tbl
+one logged operation on the file tables/<fileName>; for writes, payloadLen bytes to be written at addr
 on disk every entry takes exactly WAL_ENTRY_DISK_SIZE bytes, big-endian:
- magic | type (4B) | transID (4B) | tableName (256B, NUL-padded) | addr (8B) | payloadLen (2B) |
+ magic | type (4B) | transID (4B) | fileName (260B, NUL-padded) | addr (8B) | payloadLen (2B) |
  payload (PAGE_SIZE B, zero-padded) | checksum (4B, CRC-32C of every byte before it)
 */
 typedef struct wal_entry {
 	uint32_t magic;
 	uint32_t transID;
-	char tableName[WAL_TABLE_NAME_LEN];
+	char fileName[WAL_FILE_NAME_LEN];
 	address addr;
 	uint16_t payloadLen;
 	uint8_t payload[PAGE_SIZE];
 	uint32_t checksum;
 }wal_entry;
 
-#define WAL_ENTRY_DISK_SIZE (4 + 4 + WAL_TABLE_NAME_LEN + 8 + 2 + PAGE_SIZE + 4)
+#define WAL_ENTRY_DISK_SIZE (4 + 4 + WAL_FILE_NAME_LEN + 8 + 2 + PAGE_SIZE + 4)
 
 /*
 the commit marker appended after a transaction's entries; once it is synced, the transaction is committed
@@ -79,7 +84,7 @@ typedef struct wal_manager {
 
 // Public API
 bool initManager(void); // call at the start of every logged transaction
-bool addLogEntry(const char* tableName, wal_object_type type, address addr, const uint8_t* bytes, uint16_t len);
+bool addLogEntry(const char* fileName, wal_object_type type, address addr, const uint8_t* bytes, uint16_t len);
 bool markLogCommitted(void);
 bool resetLog(void);
 bool recover(void);

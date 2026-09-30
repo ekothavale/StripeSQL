@@ -548,28 +548,21 @@ static const char* schema_path(void) {
 
 // --- loadSchema ---
 
-void test_load_schema_bootstraps_on_missing() {
-    // loadSchema() self-heals a missing schema file rather than failing: it's
-    // the only place in the codebase that calls initSchema(), and interpret()
-    // treats a NULL return as a hard load error, so a fresh checkout (tables/
-    // is gitignored) would be unable to run even a first CREATE TABLE if this
-    // returned NULL instead.
+void test_load_schema_missing_is_empty() {
+    // a missing schema file means no tables exist yet: loadSchema() returns an
+    // empty schema rather than failing (interpret() treats NULL as a hard load
+    // error, so a fresh checkout couldn't run even a first CREATE TABLE), and it
+    // doesn't create the file, which only a commit through the write-ahead log
+    // may do
     remove(schema_path());  // guarantee file is absent
     hashtable* ht = loadSchema();
-    assert(ht != NULL);          // missing file is bootstrapped, not an error
+    assert(ht != NULL);          // missing file is an empty schema, not an error
     assert(ht->count    == 0);
     assert(ht->capacity == 0);
     assert(ht->entries  == NULL);
     FILE* check = fopen(schema_path(), "rb");
-    assert(check != NULL);       // loadSchema() created the file on disk
-    fclose(check);
+    assert(check == NULL);       // loading never writes
     free(ht);
-
-    hashtable* ht2 = loadSchema();  // file now exists; second call loads it back
-    assert(ht2 != NULL);
-    assert(ht2->count == 0);
-    free(ht2);
-    remove(schema_path());
 }
 
 void test_load_schema_null_on_bad_magic() {
@@ -684,7 +677,7 @@ void test_save_load_schema_with_cols_and_types() {
 // --- master ---
 
 void test_schema() {
-    test_load_schema_bootstraps_on_missing();
+    test_load_schema_missing_is_empty();
     test_load_schema_null_on_bad_magic();
     test_save_schema_no_crash();
     test_save_schema_writes_magic();
@@ -1533,13 +1526,13 @@ void test_vm_free_no_crash(void) {
 // --- interpret ---
 
 void test_interpret_missing_table_returns_compile_error(void) {
-    // loadSchema() self-heals a missing schema file instead of returning NULL
-    // (see test_load_schema_bootstraps_on_missing), so querying a table that
+    // loadSchema() treats a missing schema file as empty instead of returning NULL
+    // (see test_load_schema_missing_is_empty), so querying a table that
     // simply isn't registered in that (now valid, empty) schema no longer
     // reaches INTERPRET_LOAD_ERROR — it's caught by generate()'s table-exists
     // check instead, which reports a normal compile error rather than letting
     // munchStmt dereference a NULL schema.
-    remove(schema_path());  // start from a fresh, self-healed schema
+    remove(schema_path());  // start from a fresh (empty) schema
     assert(interpret("select * from ghost").ir == INTERPRET_COMPILE_ERROR);
     assert(interpret("insert into ghost values (1)").ir == INTERPRET_COMPILE_ERROR);
     assert(interpret("update ghost set x = 1 where id = 1").ir == INTERPRET_COMPILE_ERROR);

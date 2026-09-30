@@ -35,7 +35,8 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 
 #define HALF_M (M_GLOBAL / 2)
 
-table* createTree(char* tablename, page_num firstKey);
+table* newTree(char* tablename, page_num firstKey); // in memory only, until committed
+table* createTree(char* tablename, page_num firstKey); // newTree() plus a commit that creates its file
 void deleteTree(table* t);
 
 

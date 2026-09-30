@@ -8,7 +8,8 @@ For each scenario the harness:
   2. runs the commit once to record the post-commit contents and count its file writes and syncs,
   3. for every one of those N events: restores the baseline, runs the commit with the process
      killed just before event N, then starts StripeSQL normally (which runs recovery) and checks that
-       - every table holds exactly its pre-commit or its post-commit contents, never a mix,
+       - every table holds exactly its pre-commit or its post-commit contents, never a mix, and a
+         table that doesn't exist has neither a schema entry nor a file (CREATE and DROP TABLE),
        - a primary-key lookup of every id agrees with a full scan,
        - the log is empty afterwards.
 
@@ -51,8 +52,13 @@ def rows(out):
 
 
 def contents(table):
-    """a table's rows from a full scan, after checking that primary-key lookups agree with the scan"""
+    """a table's rows from a full scan, after checking that primary-key lookups agree with the scan;
+    None if the table doesn't exist"""
     scan = run(f"SELECT id, v FROM {table};\n")
+    if scan.returncode == 65 and "does not exist" in scan.stdout:
+        if os.path.exists(os.path.join("tables", f"{table}.tbl")):
+            raise Inconsistent(f"{table} has a file but no schema entry")
+        return None
     if scan.returncode != 0:
         raise Inconsistent(f"scanning {table} failed: {scan.stdout.strip()[-200:]}")
     found = sorted(rows(scan.stdout))
@@ -128,6 +134,8 @@ SCENARIOS = [
      "UPDATE t SET v = -1 WHERE id = 7;\nDELETE FROM t WHERE id = 20;\nINSERT INTO u VALUES (2, 2);\nCOMMIT;\n"),
     ("autocommit INSERT", "INSERT INTO t VALUES (300, 300);\n"),
     ("autocommit DELETE", "DELETE FROM t WHERE id = 42;\n"),
+    ("CREATE TABLE", "CREATE TABLE w (id int PRIMARY KEY, v int);\n"),
+    ("DROP TABLE", "DROP TABLE u;\n"),
 ]
 
 
@@ -142,7 +150,7 @@ def main():
         SPY = os.path.join(workdir, "syncspy.dylib")
         subprocess.run(["clang", "-dynamiclib", "-O2", SPY_SRC, "-o", SPY], check=True)
         os.chdir(workdir)
-        passed = all([sweep(label, SETUP, sql, ["t", "u"]) for label, sql in SCENARIOS])
+        passed = all([sweep(label, SETUP, sql, ["t", "u", "w"]) for label, sql in SCENARIOS])
     finally:
         os.chdir(REPO)
         shutil.rmtree(workdir, ignore_errors=True)

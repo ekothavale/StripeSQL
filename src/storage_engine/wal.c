@@ -20,17 +20,20 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 Implements a redo write ahead log
 
 Commit protocol (driven by commitTables() in tableIO.c):
- 1. initManager(), then addLogEntry() for every dirty page, node, delete marker and table header
+ 1. initManager(), then addLogEntry() for every file the transaction changes: each dirty page, node,
+    delete marker and table header, plus files it creates (a new table), rewrites (the schema) or removes
  2. markLogCommitted(): sync the entries, append the commit marker, sync again  <- commit point
- 3. make the same writes to the table files and sync them
+ 3. make the same changes to the files, sync them, and sync their directory
  4. resetLog(): truncate the log and sync it
-Each entry holds the exact bytes of one write, so redoing a committed log is idempotent: recovery can
-rewrite every entry without knowing which writes reached disk before the crash.
-Nothing is logged before commit because uncommitted changes never leave the dirty hashmaps, so there is
-never anything on disk to undo.
+Each entry holds the exact bytes of one write, or a create/remove that is safe to repeat, so redoing a
+committed log is idempotent: recovery can replay every entry without knowing which reached disk before
+the crash. The log names files within TABLE_DIRECTORY and knows nothing about what's in them.
+Nothing is logged before commit because uncommitted changes never leave memory (the dirty hashmaps, or a
+new table or schema that hasn't been written yet), so there is never anything on disk to undo.
 */
 
 #include <stddef.h>
+#include <errno.h>
 #include "wal.h"
 #include "file.h"
 
@@ -148,14 +151,14 @@ bool initManager(void) {
 /*
 fills the manager's entry with one write
 */
-static bool buildEntry(const char* tableName, wal_object_type type, address addr, const uint8_t* bytes, uint16_t len) {
-	if (len > PAGE_SIZE || strlen(tableName) >= WAL_TABLE_NAME_LEN) return false;
+static bool buildEntry(const char* fileName, wal_object_type type, address addr, const uint8_t* bytes, uint16_t len) {
+	if (len > PAGE_SIZE || strlen(fileName) >= WAL_FILE_NAME_LEN) return false;
 	manager.entry.magic = WAL_MAGIC | type;
-	memset(manager.entry.tableName, 0, WAL_TABLE_NAME_LEN);
-	strcpy(manager.entry.tableName, tableName);
+	memset(manager.entry.fileName, 0, WAL_FILE_NAME_LEN);
+	strcpy(manager.entry.fileName, fileName);
 	manager.entry.addr = addr;
 	manager.entry.payloadLen = len;
-	memcpy(manager.entry.payload, bytes, len);
+	if (len > 0) memcpy(manager.entry.payload, bytes, len);
 	return true;
 }
 
@@ -168,7 +171,7 @@ static void serializeEntry(wal_entry* e, char* buf) {
 	char* p = buf;
 	writeUIntBytewise(p, e->magic);              p += 4;
 	writeUIntBytewise(p, e->transID);            p += 4;
-	memcpy(p, e->tableName, WAL_TABLE_NAME_LEN); p += WAL_TABLE_NAME_LEN;
+	memcpy(p, e->fileName, WAL_FILE_NAME_LEN);   p += WAL_FILE_NAME_LEN;
 	writeULongBytewise(p, e->addr);              p += 8;
 	writeUShortBytewise(p, e->payloadLen);       p += 2;
 	memcpy(p, e->payload, e->payloadLen);        // the rest of the payload stays zeroed
@@ -184,15 +187,15 @@ static bool parseEntry(const char* buf, wal_entry* e) {
 	const char* p = buf;
 	e->magic = readUIntBytewise(p);              p += 4;
 	e->transID = readUIntBytewise(p);            p += 4;
-	memcpy(e->tableName, p, WAL_TABLE_NAME_LEN); p += WAL_TABLE_NAME_LEN;
+	memcpy(e->fileName, p, WAL_FILE_NAME_LEN);   p += WAL_FILE_NAME_LEN;
 	e->addr = readULongBytewise(p);              p += 8;
 	e->payloadLen = readUShortBytewise(p);       p += 2;
 	memcpy(e->payload, p, PAGE_SIZE);
 	e->checksum = readUIntBytewise(buf + ENTRY_CHECKSUM_OFFSET);
 
 	uint32_t type = e->magic & ~WAL_MAGIC_MASK;
-	if ((e->magic & WAL_MAGIC_MASK) != WAL_MAGIC || type < WAL_PAGE || type > WAL_DELETE) return false;
-	if (e->payloadLen > PAGE_SIZE || e->tableName[WAL_TABLE_NAME_LEN - 1] != '\0') return false;
+	if ((e->magic & WAL_MAGIC_MASK) != WAL_MAGIC || type < WAL_PAGE || type > WAL_FILE_REMOVE) return false;
+	if (e->payloadLen > PAGE_SIZE || e->fileName[WAL_FILE_NAME_LEN - 1] != '\0') return false;
 	return e->checksum == crc32c_compute(0, (const uint8_t*)buf, ENTRY_CHECKSUM_OFFSET);
 }
 
@@ -200,8 +203,8 @@ static bool parseEntry(const char* buf, wal_entry* e) {
 append a log entry to the managers log file
 the entry isn't durable until markLogCommitted() syncs the log
 */
-bool addLogEntry(const char* tableName, wal_object_type type, address addr, const uint8_t* bytes, uint16_t len) {
-	if (!manager.log || !buildEntry(tableName, type, addr, bytes, len)) return false;
+bool addLogEntry(const char* fileName, wal_object_type type, address addr, const uint8_t* bytes, uint16_t len) {
+	if (!manager.log || !buildEntry(fileName, type, addr, bytes, len)) return false;
 	serializeEntry(&manager.entry, entryBuf);
 	if (fwrite(entryBuf, 1, WAL_ENTRY_DISK_SIZE, manager.log) != WAL_ENTRY_DISK_SIZE) return false;
 	manager.numEntries++;
@@ -236,20 +239,35 @@ static bool readEntry(uint32_t index, wal_entry* e) {
 }
 
 /*
-writes one entry's bytes into its table file and syncs it
-recovery can't use the B+ tree code (the table may be half-written), so this is a raw write
-naive: opens, syncs and closes the table file for every entry
+performs one entry's operation on its file, syncing whatever it writes
+recovery can't use the B+ tree code (a table may be half-written), so writes are raw
+naive: opens, syncs and closes the file for every entry
+a write to a missing file fails: every file a committed log writes to either existed or is created
+earlier in the same log, so a missing one means the database is damaged
 */
 static bool applyEntry(const wal_entry* e) {
-	char path[sizeof(TABLE_DIRECTORY) + WAL_TABLE_NAME_LEN + sizeof(TABLE_EXTENSION)];
-	snprintf(path, sizeof(path), "%s%s%s", TABLE_DIRECTORY, e->tableName, TABLE_EXTENSION);
-	FILE* f = fopen(path, "rb+");
-	if (!f) return false;
-	bool written = fseek(f, (long)e->addr, SEEK_SET) == 0
-	            && fwrite(e->payload, 1, e->payloadLen, f) == e->payloadLen
-	            && syncFile(f);
-	fclose(f);
-	return written;
+	char path[sizeof(TABLE_DIRECTORY) + WAL_FILE_NAME_LEN];
+	snprintf(path, sizeof(path), "%s%s", TABLE_DIRECTORY, e->fileName);
+	switch (e->magic & ~WAL_MAGIC_MASK) {
+		case WAL_FILE_CREATE: {
+			FILE* f = fopen(path, "wb");
+			if (!f) return false;
+			bool created = syncFile(f);
+			fclose(f);
+			return created;
+		}
+		case WAL_FILE_REMOVE:
+			return remove(path) == 0 || errno == ENOENT;
+		default: {
+			FILE* f = fopen(path, "rb+");
+			if (!f) return false;
+			bool written = fseek(f, (long)e->addr, SEEK_SET) == 0
+			            && fwrite(e->payload, 1, e->payloadLen, f) == e->payloadLen
+			            && syncFile(f);
+			fclose(f);
+			return written;
+		}
+	}
 }
 
 /*
@@ -264,14 +282,18 @@ static bool executeCommit(uint32_t numEntries, uint32_t transID) {
 			return false;
 		}
 	}
+	bool changedFiles = false; // whether any file was created or removed
 	for (uint32_t i = 0; i < numEntries; i++) {
 		readEntry(i, &manager.entry);
 		if (!applyEntry(&manager.entry)) {
-			printf("Error: failed to write log entry %u to table '%s'\n", i, manager.entry.tableName);
+			printf("Error: failed to apply log entry %u to '%s'\n", i, manager.entry.fileName);
 			return false;
 		}
+		uint32_t type = manager.entry.magic & ~WAL_MAGIC_MASK;
+		if (type == WAL_FILE_CREATE || type == WAL_FILE_REMOVE) changedFiles = true;
 	}
-	return true;
+	// creating or removing a file only survives a crash once its directory is synced
+	return !changedFiles || syncDirectory(TABLE_DIRECTORY);
 }
 
 /*

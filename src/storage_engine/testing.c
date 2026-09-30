@@ -1919,7 +1919,7 @@ void test_wal_recover_redoes_committed_log(void) {
     printf("  test_wal_recover_redoes_committed_log ... ");
     address addr = make_wal_table("wal_redo");
     assert(initManager());
-    assert(addLogEntry("wal_redo", WAL_PAGE, addr, (const uint8_t*)WAL_TEST_PAYLOAD, sizeof(WAL_TEST_PAYLOAD)));
+    assert(addLogEntry("wal_redo.tbl", WAL_PAGE, addr, (const uint8_t*)WAL_TEST_PAYLOAD, sizeof(WAL_TEST_PAYLOAD)));
     assert(markLogCommitted());
 
     assert(recover());
@@ -1937,7 +1937,7 @@ void test_wal_recover_discards_uncommitted_log(void) {
     printf("  test_wal_recover_discards_uncommitted_log ... ");
     address addr = make_wal_table("wal_disc");
     assert(initManager());
-    assert(addLogEntry("wal_disc", WAL_PAGE, addr, (const uint8_t*)WAL_TEST_PAYLOAD, sizeof(WAL_TEST_PAYLOAD)));
+    assert(addLogEntry("wal_disc.tbl", WAL_PAGE, addr, (const uint8_t*)WAL_TEST_PAYLOAD, sizeof(WAL_TEST_PAYLOAD)));
 
     assert(recover());  // closing the log flushes the entry first, so it is on disk without a marker
     char got[sizeof(WAL_TEST_PAYLOAD)] = {0};
@@ -1954,7 +1954,7 @@ void test_wal_recover_rejects_damaged_marker(void) {
     printf("  test_wal_recover_rejects_damaged_marker ... ");
     address addr = make_wal_table("wal_dmgm");
     assert(initManager());
-    assert(addLogEntry("wal_dmgm", WAL_PAGE, addr, (const uint8_t*)WAL_TEST_PAYLOAD, sizeof(WAL_TEST_PAYLOAD)));
+    assert(addLogEntry("wal_dmgm.tbl", WAL_PAGE, addr, (const uint8_t*)WAL_TEST_PAYLOAD, sizeof(WAL_TEST_PAYLOAD)));
     assert(markLogCommitted());
     corrupt_log_byte(log_size() - 1);  // last byte of the marker's checksum
 
@@ -1976,7 +1976,7 @@ void test_wal_recover_reports_damaged_entry(void) {
     printf("  test_wal_recover_reports_damaged_entry ... ");
     address addr = make_wal_table("wal_dmge");
     assert(initManager());
-    assert(addLogEntry("wal_dmge", WAL_PAGE, addr, (const uint8_t*)WAL_TEST_PAYLOAD, sizeof(WAL_TEST_PAYLOAD)));
+    assert(addLogEntry("wal_dmge.tbl", WAL_PAGE, addr, (const uint8_t*)WAL_TEST_PAYLOAD, sizeof(WAL_TEST_PAYLOAD)));
     assert(markLogCommitted());
     long size = log_size();
     corrupt_log_byte(100);  // inside the first entry's table name

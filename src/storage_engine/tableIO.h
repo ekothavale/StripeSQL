@@ -42,7 +42,8 @@ typedef struct table {
 	addr_table pageDirty; // address -> slotted_page* of dirty pages
 	addr_table nodeDirty; // address -> node* of dirty nodes
 	addr_table delete; // address -> NULL; presence marks an object for deletion
-	FILE* source; // physical file
+	FILE* source; // physical file (NULL until a new table's first commit creates it)
+	bool isNew; // file doesn't exist yet: it's created when the table is first committed
 	char* name; // name of table (corresponding file path is tables/[name].tbl)
 	address cursor; // current file position (low-level; callers own their page/node state)
 	address pageFree; // address of next free page space
@@ -59,6 +60,17 @@ typedef struct table {
 	int M; // maximum number of children each node can have
 }table;
 
+/*
+a whole-file change committed atomically along with a transaction's tables (see commitTables())
+name is a file within TABLE_DIRECTORY; bytes != NULL replaces its contents with len bytes (creating it
+if needed), bytes == NULL removes it
+*/
+typedef struct file_change {
+	const char* name;
+	const char* bytes;
+	size_t len;
+}file_change;
+
 // generic address-keyed hash table (backs pageDirty / nodeDirty / delete)
 void initAddrTable(addr_table* at);
 void freeAddrTable(addr_table* at); // frees only the entries array; caller owns/frees the values
@@ -68,7 +80,8 @@ void insertAddrTable(address key, void* value, addr_table* at);
 // manage table struct
 void freeTable(table* t);
 // manage database tables
-table* createTable(char* tablename);
+table* createTable(char* tablename); // creates the file immediately, bypassing the log
+table* newTable(char* tablename); // in memory only; the file is created by its first commit
 bool loadTable(char* tablename, table* t);
 bool deleteTable(table* t);
 // loading pages and nodes into caller-provided structs
@@ -80,13 +93,12 @@ void loadNext(node* n, node* next, table* t);
 // writing
 void writeNextPage(table* t);
 void writeNextNode(table* t);
-bool writeNewTree(slotted_page* p, address pageAddr, node* n, address nodeAddr, table* t);
 // marking dirty objects
 void markPage(address address, slotted_page* p, table* t);
 void markNode(address address, node* n, table* t);
 void markDelete(address address, table* t); // can be used for any object type
 bool commit(table* t);
-bool commitTables(table** tables, int count); // commit several tables as one transaction
+bool commitTables(table** tables, int count, file_change* changes, int changeCount); // commit a whole transaction
 void discard(table* t);
 // allocate new addresses
 void newStripe(table* t);

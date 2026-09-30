@@ -743,6 +743,11 @@ static interpret_result run() {
 				// schema entry is pre-populated in vm.schema by the compiler before execution
 				uint8_t schemaIdx = READ_BYTE();
 				uint32_t hash = vm.chunk->constants.values[schemaIdx].as.u32;
+				// CREATE TABLE commits on its own, so a transaction couldn't DISCARD it
+				if (transaction.active) {
+					printf("Error: CREATE TABLE can't run inside a transaction\n");
+					return INTERPRET_RUNTIME_ERROR;
+				}
 				schema* s = readHT(hash, vm.schema);
 				if (!s) {
 					printf("Error: schema not found for CREATE TABLE\n");
@@ -753,28 +758,55 @@ static interpret_result run() {
 					printf("Tried to create table %s but it already exists\n", s->tablename);
 					break;
 				}
-				// otherwise create the table
 				page_num firstKey = { .type = getPkOrderingType(s) };
-				table* t = createTree(s->tablename, firstKey);
-				if (!t) return INTERPRET_RUNTIME_ERROR; // don't register a table whose file wasn't created
-				fclose(t->source);
+				// the new table's file and its schema entry are committed together, so a crash can't
+				// leave one without the other
+				table* t = newTree(s->tablename, firstKey);
+				size_t len;
+				char* bytes = serializeSchema(vm.schema, &len);
+				bool committed = false;
+				if (bytes) {
+					file_change schemaChange = { SCHEMA_FILE, bytes, len };
+					committed = commitTables(&t, 1, &schemaChange, 1);
+					free(bytes);
+				} else {
+					printf("Error: failed to serialize the schema\n");
+					discard(t);
+				}
+				if (t->source) fclose(t->source);
 				freeTable(t);
-				if (!saveSchema(vm.schema)) return INTERPRET_RUNTIME_ERROR;
+				if (!committed) return INTERPRET_RUNTIME_ERROR;
 				break;
 			}
 			case OP_DROP_TABLE: {
 				uint8_t nameIdx = READ_BYTE();
 				const char* name = vm.chunk->constants.values[nameIdx].as.text;
 				uint32_t hash = hashString(name, (int)strlen(name));
-				deleteHT(hash, vm.schema);
-				table* t = malloc(sizeof(table));
-				if (loadTable((char*)name, t)) {
-					deleteTable(t);  // closes file, removes .tbl, frees t
-				} else {
-					free(t);
-					printf("Error: table '%s' not found\n", name);
+				// DROP TABLE commits on its own, so a transaction couldn't DISCARD it
+				if (transaction.active) {
+					printf("Error: DROP TABLE can't run inside a transaction\n");
+					return INTERPRET_RUNTIME_ERROR;
 				}
-				if (!saveSchema(vm.schema)) return INTERPRET_RUNTIME_ERROR;
+				if (!readHT(hash, vm.schema) && !tableAlreadyExists(name)) {
+					printf("Error: table '%s' not found\n", name);
+					break;
+				}
+				// the schema entry and the table's file are removed together
+				deleteHT(hash, vm.schema);
+				size_t len;
+				char* bytes = serializeSchema(vm.schema, &len);
+				if (!bytes) {
+					printf("Error: failed to serialize the schema\n");
+					return INTERPRET_RUNTIME_ERROR;
+				}
+				size_t fileLen = strlen(name) + strlen(TABLE_EXTENSION) + 1;
+				char* file = malloc(fileLen);
+				snprintf(file, fileLen, "%s%s", name, TABLE_EXTENSION);
+				file_change changes[] = { { SCHEMA_FILE, bytes, len }, { file, NULL, 0 } };
+				bool committed = commitTables(NULL, 0, changes, 2);
+				free(bytes);
+				free(file);
+				if (!committed) return INTERPRET_RUNTIME_ERROR;
 				break;
 			}
 			case OP_BEGIN_TRANSACTION: {
@@ -795,7 +827,7 @@ static interpret_result run() {
 				// either all of their changes survive a crash or none do
 				table* tables[MAX_TXN_TABLES];
 				for (int i = 0; i < transaction.count; i++) tables[i] = transaction.tables[i].tbl;
-				bool committed = commitTables(tables, transaction.count);
+				bool committed = commitTables(tables, transaction.count, NULL, 0);
 				for (int i = 0; i < transaction.count; i++) {
 					fclose(tables[i]->source);
 					freeTable(tables[i]);

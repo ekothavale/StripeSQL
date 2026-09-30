@@ -52,7 +52,7 @@ memory.o: $(SRC)/memory.c $(SRC)/memory.h
 parser.o: $(SQL)/parser.c $(SQL)/parser.h $(SQL)/lexer.h $(SQL)/chunk.h $(SRC)/common.h
 	clang $(CFLAGS) -c $(SQL)/parser.c -o parser.o
 
-schema.o: $(SQL)/schema.c $(SQL)/schema.h $(SRC)/common.h $(STOR)/file.h
+schema.o: $(SQL)/schema.c $(SQL)/schema.h $(SRC)/common.h $(SRC)/const.h $(STOR)/tableIO.h
 	clang $(CFLAGS) -c $(SQL)/schema.c -o schema.o
 
 value.o: $(SRC)/value.c $(SRC)/value.h $(SRC)/memory.h
