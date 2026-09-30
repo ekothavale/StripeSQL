@@ -251,20 +251,7 @@ static void runFile(const char* path) {
 }
 
 int main(int argc, char** argv) {
-    /*test_page();
-    test_tableio();
-    test_table_mgmt();
-    test_btree();
-    test_file();
-    test_wal();
-    test_chunk();
-    test_value();
-    test_lexer();
-    test_parser();
-    test_hashtable();
-    test_schema();
-    test_generator();
-    test_vm();*/
+    // the unit tests have their own entry point: src/run_tests.c, run with `make test`
 
     // only one process may use the database at a time; the lock is held until this process exits,
     // and the OS releases it even after a crash. It's taken before recovery so recovery can never

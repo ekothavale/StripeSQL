@@ -164,7 +164,7 @@ The following features are next on the todo list, roughly in priority order:
 make
 ```
 
-This compiles all source files with `clang` at `-O3` and produces the `main` binary in the project root. Requires `clang` and `make`.
+This compiles all source files with `clang` at `-O3` and produces the `main` binary in the project root. Requires `clang` and `make`. Run the tests with `make test` (see Testing and Coverage).
 
 ### Run the REPL
 
@@ -343,7 +343,71 @@ xychart-beta
 
 ---
 
-## VIII. Attributions and Outro
+## VIII. Testing and Coverage
+
+### Running the tests
+
+```sh
+make test            # unit tests (a few seconds)
+make crashtest       # crash-recovery test (macOS only, a few minutes)
+make coverage        # coverage report for the unit tests
+make coverage-full   # coverage report for both test suites (macOS only, about 15 minutes)
+```
+
+`make test` builds `src/run_tests.c` together with every source file except `main.c` and runs it in a temporary directory, since the tests create and delete tables and the schema file. A failed assertion aborts the run with a non-zero exit status. The `Error:` messages printed along the way come from tests that check error handling.
+
+| Suite | Source | Covers |
+|-------|--------|--------|
+| Storage engine | `src/storage_engine/testing.c` | Slotted pages; table files, headers, and dirty hashmaps; creating, loading, and deleting tables; B+ tree search, splits, deletion, borrowing, and merging; the process lock; the write-ahead log and crash recovery, including a forked process whose commit fails after the commit point |
+| SQL interpreter | `src/SQL_interpreter/testing.c` | Bytecode chunks, values, the lexer, the parser, the schema hashtable and file, the bytecode generator, the VM, and whole statements run through `interpret()`: result types, statement rollback, and errors halting statements |
+| Crash recovery | `crashtest/` | The built binary end to end, killed just before every file write and `fsync` of a commit (see *Crash-recovery test* under Usage) |
+
+### Coverage
+
+Measured with clang's source-based coverage (`-fprofile-instr-generate -fcoverage-mapping`, summarized by `llvm-cov`). Test code (`testing.c`, `run_tests.c`) is excluded.
+
+| Tests | Lines | Functions | Branches |
+|-------|------:|----------:|---------:|
+| Unit tests (`make coverage`) | 72.4% | 86.7% | 61.7% |
+| Crash-recovery test alone | 56.2% | 74.9% | 45.5% |
+| Both (`make coverage-full`) | **73.2%** | **87.3%** | **62.8%** |
+
+The unit-test row covers every file except `main.c`, which the unit tests don't link; the other two rows include it. `debug.c`, the bytecode disassembler and execution tracer used only in debug builds, never runs. Without it, both suites together cover 77% of lines and 92% of functions.
+
+<details>
+<summary>Per-file coverage (both suites)</summary>
+
+| File | Lines | Functions | Branches |
+|------|------:|----------:|---------:|
+| `SQL_interpreter/chunk.c` | 100.0% | 100.0% | 100.0% |
+| `SQL_interpreter/generator.c` | 73.4% | 100.0% | 65.6% |
+| `SQL_interpreter/lexer.c` | 84.8% | 100.0% | 79.6% |
+| `SQL_interpreter/parser.c` | 77.4% | 97.7% | 71.3% |
+| `SQL_interpreter/schema.c` | 92.8% | 100.0% | 83.3% |
+| `SQL_interpreter/vm.c` | 70.8% | 88.5% | 54.4% |
+| `storage_engine/bplus.c` | 67.1% | 81.6% | 54.2% |
+| `storage_engine/file.c` | 94.3% | 100.0% | 75.0% |
+| `storage_engine/ordering.c` | 64.1% | 88.9% | 55.2% |
+| `storage_engine/page.c` | 86.4% | 100.0% | 76.8% |
+| `storage_engine/tableIO.c` | 86.6% | 90.0% | 74.2% |
+| `storage_engine/wal.c` | 97.1% | 100.0% | 69.6% |
+| `main.c` | 50.2% | 85.7% | 44.9% |
+| `memory.c` | 75.0% | 100.0% | 75.0% |
+| `value.c` | 76.9% | 66.7% | 100.0% |
+| `debug.c` | 0.0% | 0.0% | 0.0% |
+
+</details>
+
+The main gaps:
+- **Filtering on non-key columns.** The VM's `=`, `<`, and `LIKE` comparisons (`equal`, `lessThan`, `likeMatch`) never run; the tests filter only through primary-key lookups and one `>` comparison.
+- **The REPL** (`repl()` in `main.c`).
+- **Some B+ tree delete rebalancing:** `borrowPrev`, `borrowNextThroughParent`, and `borrowPrevThroughParent`.
+- **Floating-point primary keys** (`doubleToBits` in `ordering.c`).
+- **Code with no callers**, which no test can reach: `readRecord` and `updateRecord` in `bplus.c`, `loadPrev`/`loadNext`, the `consume*` helpers, and the garbage-collection stubs `moveNode`/`movePage` in `tableIO.c`, plus `getSQLType`/`encodeSQLType` in `value.c`.
+
+---
+
+## IX. Attributions and Outro
 
 The interpreter architecture — bytecode chunk, stack-based VM, single-pass code generator — was inspired by Robert Nystrom's [*Crafting Interpreters*](https://craftinginterpreters.com/). The storage engine (B+ tree, slotted pages, dirty-hashmap write-back, etc.) was designed and implemented independently.
 

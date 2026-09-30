@@ -17,12 +17,13 @@ The kill is done by syncspy.c, injected with DYLD_INSERT_LIBRARIES. It models a 
 power loss: writes that already reached the OS survive the crash.
 
 Usage, from the repository root:  make && python3 crashtest/crashtest.py
+Set STRIPESQL_BIN to test a different binary (make coverage-full uses an instrumented one).
 Everything runs in a temporary directory; the repository's tables/ directory is never touched.
 """
 import os, re, shutil, subprocess, sys, tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = os.path.join(REPO, "main")
+BIN = os.environ.get("STRIPESQL_BIN", os.path.join(REPO, "main"))  # overridable, e.g. by `make coverage-full`
 SPY_SRC = os.path.join(REPO, "crashtest", "syncspy.c")
 QUERY_TIMEOUT = 10  # seconds; a damaged tree can make a scan loop forever
 IDS = list(range(1, 400))  # every primary key the scenarios can produce

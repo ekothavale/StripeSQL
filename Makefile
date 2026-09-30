@@ -20,7 +20,44 @@ clean:
 crashtest: main
 	python3 crashtest/crashtest.py
 
-.PHONY: clean crashtest
+# --- tests and coverage ---
+# the unit tests (src/run_tests.c) create and delete tables and the schema file, so every target
+# below builds and runs in a throwaway directory and never touches tables/
+
+MAIN_SRCS = $(filter-out $(SRC)/run_tests.c, $(wildcard $(SRC)/*.c)) $(wildcard $(SQL)/*.c) $(wildcard $(STOR)/*.c)
+TEST_SRCS = $(filter-out $(SRC)/main.c, $(wildcard $(SRC)/*.c)) $(wildcard $(SQL)/*.c) $(wildcard $(STOR)/*.c)
+COVFLAGS  = -I$(SRC) -I$(SQL) -I$(STOR) -O0 -g -fprofile-instr-generate -fcoverage-mapping
+COV_IGNORE = 'testing\.c|run_tests\.c'
+LLVM_PROFDATA ?= xcrun llvm-profdata
+LLVM_COV ?= xcrun llvm-cov
+
+test:
+	@dir=$$(mktemp -d); mkdir $$dir/tables; \
+	clang $(CFLAGS) -g $(TEST_SRCS) -o $$dir/run_tests && (cd $$dir && ./run_tests); \
+	status=$$?; rm -rf $$dir; exit $$status
+
+# line, function and branch coverage of the unit tests (test code excluded)
+coverage:
+	@dir=$$(mktemp -d); mkdir $$dir/tables; \
+	clang $(COVFLAGS) $(TEST_SRCS) -o $$dir/run_tests && \
+	(cd $$dir && LLVM_PROFILE_FILE=$$dir/unit.profraw ./run_tests > /dev/null) && \
+	$(LLVM_PROFDATA) merge -sparse $$dir/unit.profraw -o $$dir/all.profdata && \
+	$(LLVM_COV) report $$dir/run_tests -instr-profile=$$dir/all.profdata -ignore-filename-regex=$(COV_IGNORE); \
+	status=$$?; rm -rf $$dir; exit $$status
+
+# the unit tests plus the crash-recovery test, run against an instrumented binary (macOS only, ~15 min)
+# processes the crash test kills can leave unreadable profiles, so merging skips them (--failure-mode=all)
+coverage-full:
+	@dir=$$(mktemp -d); mkdir $$dir/tables $$dir/profiles; \
+	clang $(COVFLAGS) $(TEST_SRCS) -o $$dir/run_tests && \
+	clang $(COVFLAGS) $(MAIN_SRCS) -o $$dir/main && \
+	(cd $$dir && LLVM_PROFILE_FILE=$$dir/profiles/unit.profraw ./run_tests > /dev/null) && \
+	LLVM_PROFILE_FILE=$$dir/profiles/crash-%p.profraw STRIPESQL_BIN=$$dir/main python3 crashtest/crashtest.py && \
+	$(LLVM_PROFDATA) merge -sparse --failure-mode=all $$dir/profiles/*.profraw -o $$dir/all.profdata 2>/dev/null && \
+	$(LLVM_COV) report $$dir/main -object $$dir/run_tests -instr-profile=$$dir/all.profdata -ignore-filename-regex=$(COV_IGNORE); \
+	status=$$?; rm -rf $$dir; exit $$status
+
+.PHONY: clean crashtest test coverage coverage-full
 
 # --- core ---
 
