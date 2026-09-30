@@ -21,7 +21,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 
 #include "../memory.h"
 #include "../value.h"
-#include "../storage_engine/tableIO.h"
+#include "../storage_engine/file.h"
 
 // ##########################################################################################################################################
 // ##########################################################################################################################################
@@ -253,7 +253,7 @@ static void writeEntries(hashtable* ht, FILE* file) {
 
 /*
 load schema data from tables/schema.scma
-@return: hashtable pointer wiht schema data or NULL on failed read
+@return: hashtable pointer with schema data or NULL on failed read
 mallocs (1 hashtable)
 */
 hashtable* loadSchema() {

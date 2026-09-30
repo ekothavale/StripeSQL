@@ -5,7 +5,7 @@ CFLAGS = -I$(SRC) -I$(SQL) -I$(STOR) -O3
 
 OBJS = main.o debug.o \
        chunk.o generator.o lexer.o memory.o parser.o schema.o value.o vm.o \
-       bplus.o ordering.o page.o tableIO.o stor_testing.o sql_testing.o
+       bplus.o file.o ordering.o page.o tableIO.o wal.o stor_testing.o sql_testing.o
 
 ASAN = -fsanitize=address
 
@@ -20,7 +20,7 @@ clean:
 
 main.o: $(SRC)/main.c $(SRC)/common.h $(SRC)/debug.h \
         $(SQL)/lexer.h $(SQL)/chunk.h $(SQL)/vm.h \
-        $(STOR)/bplus.h $(STOR)/testing.h
+        $(STOR)/bplus.h $(STOR)/wal.h $(STOR)/testing.h
 	clang $(CFLAGS) -c $(SRC)/main.c -o main.o
 
 debug.o: $(SRC)/debug.c $(SRC)/debug.h $(SRC)/common.h \
@@ -46,7 +46,7 @@ memory.o: $(SRC)/memory.c $(SRC)/memory.h
 parser.o: $(SQL)/parser.c $(SQL)/parser.h $(SQL)/lexer.h $(SQL)/chunk.h $(SRC)/common.h
 	clang $(CFLAGS) -c $(SQL)/parser.c -o parser.o
 
-schema.o: $(SQL)/schema.c $(SQL)/schema.h $(SRC)/common.h $(STOR)/tableIO.h
+schema.o: $(SQL)/schema.c $(SQL)/schema.h $(SRC)/common.h $(STOR)/file.h
 	clang $(CFLAGS) -c $(SQL)/schema.c -o schema.o
 
 value.o: $(SRC)/value.c $(SRC)/value.h $(SRC)/memory.h
@@ -61,16 +61,22 @@ vm.o: $(SQL)/vm.c $(SQL)/vm.h $(SQL)/parser.h $(SQL)/chunk.h \
 bplus.o: $(STOR)/bplus.c $(STOR)/bplus.h
 	clang $(CFLAGS) -c $(STOR)/bplus.c -o bplus.o
 
+file.o: $(STOR)/file.c $(STOR)/file.h $(SRC)/common.h $(SRC)/const.h
+	clang $(CFLAGS) -c $(STOR)/file.c -o file.o
+
 ordering.o: $(STOR)/ordering.c $(STOR)/ordering.h $(SRC)/value.h
 	clang $(CFLAGS) -c $(STOR)/ordering.c -o ordering.o
 
 page.o: $(STOR)/page.c $(STOR)/page.h $(SRC)/common.h
 	clang $(CFLAGS) -c $(STOR)/page.c -o page.o
 
-tableIO.o: $(STOR)/tableIO.c $(STOR)/tableIO.h
+tableIO.o: $(STOR)/tableIO.c $(STOR)/tableIO.h $(STOR)/file.h $(STOR)/wal.h
 	clang $(CFLAGS) -c $(STOR)/tableIO.c -o tableIO.o
 
-stor_testing.o: $(STOR)/testing.c $(STOR)/testing.h $(STOR)/bplus.h $(STOR)/page.h
+wal.o: $(STOR)/wal.c $(STOR)/wal.h $(STOR)/file.h $(SRC)/common.h $(SRC)/const.h
+	clang $(CFLAGS) -c $(STOR)/wal.c -o wal.o
+
+stor_testing.o: $(STOR)/testing.c $(STOR)/testing.h $(STOR)/bplus.h $(STOR)/page.h $(STOR)/wal.h
 	clang $(CFLAGS) -c $(STOR)/testing.c -o stor_testing.o
 
 sql_testing.o: $(SQL)/testing.c $(SQL)/testing.h $(SQL)/chunk.h $(SQL)/schema.h $(SRC)/value.h $(SQL)/lexer.h $(SQL)/parser.h $(SQL)/generator.h $(SQL)/vm.h $(SRC)/common.h

@@ -791,13 +791,14 @@ static interpret_result run() {
 					printf("Error: no transaction in progress to commit\n");
 					break;
 				}
-				// commit every table even if one fails; failures are reported, not retried
-				bool committed = true;
+				// every table in the transaction commits under one commit marker in the log, so
+				// either all of their changes survive a crash or none do
+				table* tables[MAX_TXN_TABLES];
+				for (int i = 0; i < transaction.count; i++) tables[i] = transaction.tables[i].tbl;
+				bool committed = commitTables(tables, transaction.count);
 				for (int i = 0; i < transaction.count; i++) {
-					table* t = transaction.tables[i].tbl;
-					if (!commit(t)) committed = false;
-					fclose(t->source);
-					freeTable(t);
+					fclose(tables[i]->source);
+					freeTable(tables[i]);
 				}
 				transaction.active = false;
 				transaction.count = 0;

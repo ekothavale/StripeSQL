@@ -25,6 +25,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 #include "SQL_interpreter/chunk.h"
 #include "SQL_interpreter/vm.h"
 #include "storage_engine/bplus.h"
+#include "storage_engine/wal.h"
 #include "storage_engine/testing.h"
 #include "SQL_interpreter/testing.h"
 
@@ -252,6 +253,7 @@ int main(int argc, char** argv) {
     test_tableio();
     test_table_mgmt();
     test_btree();
+    test_wal();
     test_chunk();
     test_value();
     test_lexer();
@@ -260,6 +262,12 @@ int main(int argc, char** argv) {
     test_schema();
     test_generator();
     test_vm();*/
+
+    // finish or discard any commit a crash interrupted before anything reads a table
+    if (!recover()) {
+        printf("Error: crash recovery failed; the log (%s) was left in place\n", WAL_LOG_PATH);
+        return 74;
+    }
 
     if (argc == 1) {
         repl();

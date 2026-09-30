@@ -26,8 +26,6 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 
 #define MAGIC 0xFACE3419
 #define METALEN 16 // number of 4-byte words needed to represent a table's metadata
-#define TABLE_DIRECTORY "tables/" // directory in which table files are placed
-#define TABLE_EXTENSION ".tbl" // file extension for table files
 
 typedef struct addr_entry {
 	address key;   // 0 = empty slot (address 0 is never a valid page/node address)
@@ -83,12 +81,12 @@ void loadNext(node* n, node* next, table* t);
 void writeNextPage(table* t);
 void writeNextNode(table* t);
 bool writeNewTree(slotted_page* p, address pageAddr, node* n, address nodeAddr, table* t);
-bool syncFile(FILE* file); // flush a stream and force it to stable storage
 // marking dirty objects
 void markPage(address address, slotted_page* p, table* t);
 void markNode(address address, node* n, table* t);
 void markDelete(address address, table* t); // can be used for any object type
 bool commit(table* t);
+bool commitTables(table** tables, int count); // commit several tables as one transaction
 void discard(table* t);
 // allocate new addresses
 void newStripe(table* t);

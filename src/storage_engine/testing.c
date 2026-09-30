@@ -17,6 +17,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 */
 
 #include "testing.h"
+#include "wal.h"
+#include <unistd.h>
+#include <sys/wait.h>
 
 // ##########################################################################################################################################
 // ##########################################################################################################################################
@@ -1422,25 +1425,37 @@ void test_btree_commit_skips_clean(void) {
 }
 
 /*
-commit() must report failure when its writes cannot reach the file, here by
-swapping in a read-only stream so every write fails.
+If writing a table fails after its transaction is committed in the log, the
+table may be half-written, so commit() must exit the process; the next
+recover() then finishes the commit from the log. The commit runs in a forked
+child whose table stream is swapped for a read-only one so its writes fail.
 */
-void test_btree_commit_reports_write_failure(void) {
-    printf("  test_btree_commit_reports_write_failure ... ");
-    table* t = createTree("bt_crwf", pn(1));
+void test_btree_commit_apply_failure_recovers(void) {
+    printf("  test_btree_commit_apply_failure_recovers ... ");
+    table* t = createTree("bt_cafr", pn(1));
     assert(t != NULL);
     findAndInsert(pn(2), t);  // dirties a new page and the root node
 
-    FILE* writable = t->source;
-    char* path = build_tbl_path("bt_crwf");
-    t->source = fopen(path, "rb");
-    free(path);
-    assert(t->source != NULL);
-    assert(!commit(t));
+    fflush(NULL);  // so the child doesn't re-flush output buffered before the fork
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        char* path = build_tbl_path("bt_cafr");
+        t->source = fopen(path, "rb");
+        commit(t);  // logs and commits, then fails writing the table and exits
+        _exit(0);   // unreachable if commit() behaves
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 74);
 
-    fclose(t->source);
-    t->source = writable;
-    deleteTree(t);
+    assert(recover());         // finishes the child's commit from the log
+    close_table_keep_file(t);  // drop the parent's copy of the (uncommitted) changes
+    table* t2 = calloc(1, sizeof(table));
+    assert(loadTable("bt_cafr", t2));
+    assert(findPage(pn(2), t2) != 0);
+
+    deleteTree(t2);
     printf("PASS\n");
 }
 
@@ -1775,7 +1790,7 @@ void test_btree(void) {
     test_btree_commit_persist();
     test_btree_commit_delete_persist();
     test_btree_commit_skips_clean();
-    test_btree_commit_reports_write_failure();
+    test_btree_commit_apply_failure_recovers();
     // insert and split
     test_btree_insert_new_page();
     test_btree_insert_existing_page();
@@ -1793,4 +1808,157 @@ void test_btree(void) {
     test_btree_delete_tree();
     test_btree_delete_tree_not_reloadable();
     printf("=== All B+ tree tests passed ===\n");
+}
+
+// ##########################################################################################################################################
+// ##########################################################################################################################################
+// WRITE-AHEAD LOG TESTS
+
+/* Size of the log file in bytes (0 if it doesn't exist). */
+static long log_size(void) {
+    FILE* f = fopen(WAL_LOG_PATH, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fclose(f);
+    return size;
+}
+
+/* Flip every bit of the log byte at offset. */
+static void corrupt_log_byte(long offset) {
+    FILE* f = fopen(WAL_LOG_PATH, "rb+");
+    assert(f != NULL);
+    fseek(f, offset, SEEK_SET);
+    int c = fgetc(f);
+    fseek(f, offset, SEEK_SET);
+    fputc(~c & 0xFF, f);
+    fclose(f);
+}
+
+/* Read len bytes at addr from tables/<name>.tbl into out (bytes past EOF stay untouched). */
+static void read_tbl_bytes(const char* name, address addr, char* out, size_t len) {
+    char* path = build_tbl_path(name);
+    FILE* f = fopen(path, "rb");
+    free(path);
+    assert(f != NULL);
+    fseek(f, (long)addr, SEEK_SET);
+    size_t n = fread(out, 1, len, f);
+    (void)n;
+    fclose(f);
+}
+
+/* Create a table and return an address in its unused space, for logging raw writes to. */
+static address make_wal_table(char* name) {
+    table* t = createTree(name, pn(1));
+    assert(t != NULL);
+    address addr = t->pageFree;
+    close_table_keep_file(t);
+    return addr;
+}
+
+static void drop_wal_table(char* name) {
+    table* t = calloc(1, sizeof(table));
+    assert(loadTable(name, t));
+    deleteTree(t);
+}
+
+static const char WAL_TEST_PAYLOAD[] = "REDOTEST";
+
+/* The checksum must match the published CRC-32C check value. */
+void test_wal_crc32c_check_value(void) {
+    printf("  test_wal_crc32c_check_value ... ");
+    assert(crc32c_compute(0, (const uint8_t*)"123456789", 9) == 0xE3069283);
+    printf("PASS\n");
+}
+
+/*
+A committed log that was never applied (as if the process crashed right after
+the commit point) must be replayed by recover(), which then empties the log.
+*/
+void test_wal_recover_redoes_committed_log(void) {
+    printf("  test_wal_recover_redoes_committed_log ... ");
+    address addr = make_wal_table("wal_redo");
+    assert(initManager());
+    assert(addLogEntry("wal_redo", WAL_PAGE, addr, (const uint8_t*)WAL_TEST_PAYLOAD, sizeof(WAL_TEST_PAYLOAD)));
+    assert(markLogCommitted());
+
+    assert(recover());
+    char got[sizeof(WAL_TEST_PAYLOAD)] = {0};
+    read_tbl_bytes("wal_redo", addr, got, sizeof(got));
+    assert(memcmp(got, WAL_TEST_PAYLOAD, sizeof(WAL_TEST_PAYLOAD)) == 0);
+    assert(log_size() == 0);
+
+    drop_wal_table("wal_redo");
+    printf("PASS\n");
+}
+
+/* A log with entries but no commit marker must be discarded without touching the table. */
+void test_wal_recover_discards_uncommitted_log(void) {
+    printf("  test_wal_recover_discards_uncommitted_log ... ");
+    address addr = make_wal_table("wal_disc");
+    assert(initManager());
+    assert(addLogEntry("wal_disc", WAL_PAGE, addr, (const uint8_t*)WAL_TEST_PAYLOAD, sizeof(WAL_TEST_PAYLOAD)));
+
+    assert(recover());  // closing the log flushes the entry first, so it is on disk without a marker
+    char got[sizeof(WAL_TEST_PAYLOAD)] = {0};
+    read_tbl_bytes("wal_disc", addr, got, sizeof(got));
+    assert(memcmp(got, WAL_TEST_PAYLOAD, sizeof(WAL_TEST_PAYLOAD)) != 0);
+    assert(log_size() == 0);
+
+    drop_wal_table("wal_disc");
+    printf("PASS\n");
+}
+
+/* A commit marker that fails its checksum (e.g. torn) means the transaction never committed. */
+void test_wal_recover_rejects_damaged_marker(void) {
+    printf("  test_wal_recover_rejects_damaged_marker ... ");
+    address addr = make_wal_table("wal_dmgm");
+    assert(initManager());
+    assert(addLogEntry("wal_dmgm", WAL_PAGE, addr, (const uint8_t*)WAL_TEST_PAYLOAD, sizeof(WAL_TEST_PAYLOAD)));
+    assert(markLogCommitted());
+    corrupt_log_byte(log_size() - 1);  // last byte of the marker's checksum
+
+    assert(recover());
+    char got[sizeof(WAL_TEST_PAYLOAD)] = {0};
+    read_tbl_bytes("wal_dmgm", addr, got, sizeof(got));
+    assert(memcmp(got, WAL_TEST_PAYLOAD, sizeof(WAL_TEST_PAYLOAD)) != 0);
+    assert(log_size() == 0);
+
+    drop_wal_table("wal_dmgm");
+    printf("PASS\n");
+}
+
+/*
+A committed log with a damaged entry can't be finished: recover() must report
+failure, write nothing, and leave the log in place for inspection.
+*/
+void test_wal_recover_reports_damaged_entry(void) {
+    printf("  test_wal_recover_reports_damaged_entry ... ");
+    address addr = make_wal_table("wal_dmge");
+    assert(initManager());
+    assert(addLogEntry("wal_dmge", WAL_PAGE, addr, (const uint8_t*)WAL_TEST_PAYLOAD, sizeof(WAL_TEST_PAYLOAD)));
+    assert(markLogCommitted());
+    long size = log_size();
+    corrupt_log_byte(100);  // inside the first entry's table name
+
+    assert(!recover());
+    char got[sizeof(WAL_TEST_PAYLOAD)] = {0};
+    read_tbl_bytes("wal_dmge", addr, got, sizeof(got));
+    assert(memcmp(got, WAL_TEST_PAYLOAD, sizeof(WAL_TEST_PAYLOAD)) != 0);
+    assert(log_size() == size);
+
+    assert(resetLog());  // clean up for the tests that follow
+    drop_wal_table("wal_dmge");
+    printf("PASS\n");
+}
+
+/* Run all write-ahead log tests. */
+void test_wal(void) {
+    printf("=== Write-Ahead Log Tests ===\n");
+    test_wal_crc32c_check_value();
+    test_wal_recover_redoes_committed_log();
+    test_wal_recover_discards_uncommitted_log();
+    test_wal_recover_rejects_damaged_marker();
+    test_wal_recover_reports_damaged_entry();
+    printf("=== All write-ahead log tests passed ===\n");
 }

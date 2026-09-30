@@ -16,27 +16,22 @@ DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
 
-/*
-This file includes constants that can be tweaked to alter the behavior and performance of this DBMS
-Some combinations of constant values may break the DBMS
-*/
+#ifndef FILE_H
+#define FILE_H
 
-#ifndef CONST_H
-#define CONST_H
+#include <stdint.h>
+#include "../common.h"
 
-#define M_GLOBAL 45		// order (number of children a node can have) of the tree
-#define PAGE_SIZE 4096 		// size in bytes of each page
-#define FULL_FSYNC 0		// 1: sync commits with F_FULLFSYNC, which also flushes the drive's cache on macOS; 0: plain fsync (SQLite's default)
+// durability
+bool syncFile(FILE* file); // flush a stream and force it to stable storage
+bool syncDirectory(const char* path); // make the creation/removal of entries in a directory durable
 
-// NEED TO PROGRAMMATICALLY CALCULATE THESE BASED ON PAGE SIZE
-// THE VALUES BELOW ARE PLACEHOLDERS
-#define PAGE_NUM_SLOTS 64 		// Size of slot array within each page (each page can hold 72 tuples)
-#define PAGE_NUM_ENTRIES 700 		// in reality this will be the size of the page minus the slot array and the header
-#define PAGE_ARR_CAP 4000  		// page slot array size
-
-#define MAX_REPL_INPUT_LEN 1024
-
-#define TABLE_DIRECTORY "tables/" // directory in which table files (and the write-ahead log) are placed
-#define TABLE_EXTENSION ".tbl" // file extension for table files
+// big-endian byte encoding (UNSAFE - assume there's enough space in the buffer)
+void writeULongBytewise(char* arr, uint64_t lui);
+void writeUIntBytewise(char* arr, uint32_t ui);
+void writeUShortBytewise(char* arr, uint16_t us);
+uint64_t readULongBytewise(const char* arr);
+uint32_t readUIntBytewise(const char* arr);
+uint16_t readUShortBytewise(const char* arr);
 
 #endif

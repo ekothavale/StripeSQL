@@ -39,13 +39,14 @@ TODO:
 */
 
 #include "tableIO.h"
+#include "file.h"
+#include "wal.h"
 #include "../memory.h"
 #include <stdbool.h>
 #include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
 
 #define ADDR_TABLE_MAX_LOAD_FACTOR 0.8
+#define GARBAGE_MARKER 2 // a two in the first byte of an object means it's garbage
 
 // ##########################################################################################################################################
 // ##########################################################################################################################################
@@ -78,24 +79,6 @@ static bool jumpRel(long offset, table* t) {
 	}
 }
 
-
-/*
-UNSAFE FUNCTION - assumes there's enough space in the array for the long
-big endian
-*/
-static void writeULongBytewise(char* arr, uint64_t lui) {
-	for (int i = 7; i >= 0; i--) {
-		*(arr+i) = lui & 0xFF;
-		lui >>= 8;
-	}
-}
-
-static void writeUIntBytewise(char* arr, uint32_t ui) {
-	for (int i = 3; i >= 0; i--) {
-		*(arr+i) = ui & 0xFF;
-		ui >>= 8;
-	}
-}
 
 /*
 Serializes a page_num into exactly PAGE_NUM_DISK_SIZE bytes at buf.
@@ -335,8 +318,11 @@ static bool loadMeta(FILE* file, char* fname, table* table) {
 	return true;
 }
 
-bool writeMeta(FILE* file, table* t) {
-	uint32_t buf[] = {
+/*
+fills buf with the table's METALEN metadata words, in the order they're stored at the start of the file
+*/
+static void fillMeta(table* t, uint32_t* buf) {
+	uint32_t meta[METALEN] = {
 		MAGIC,
 		t->metalen,
 		t->pageStripes,
@@ -354,6 +340,12 @@ bool writeMeta(FILE* file, table* t) {
 		(uint32_t) (t->root & 0xFFFFFFFF),
 		t->M
 	};
+	memcpy(buf, meta, sizeof(meta));
+}
+
+bool writeMeta(FILE* file, table* t) {
+	uint32_t buf[METALEN];
+	fillMeta(t, buf);
 	jump(0, t);
 	fwrite(buf, 4, METALEN, file);
 	return true;
@@ -714,7 +706,7 @@ bool readNode(address addr, node* n, table* t) {
 }
 // write page
 /*
-writes the given page to the given address
+serializes the given page into a newly allocated buffer of exactly t->pageSize bytes (caller frees)
 page layout:
  | 0 | pageNum | usedData | numRecords | numEntries | arrCap |
  | maxEntries | maxSlots | slots | ... | records |
@@ -723,9 +715,7 @@ the code in page.c -> hasSpace() relies on the number of bytes used to represent
 if any changes are made to that encoding, hasSpace() must be updated as well
 please feel free to change the design of this system because I feel unclean using code like this
 */
-static void writePage(slotted_page* p, address address, table* t) {
-	// setup
-	jump(address, t);
+static char* serializePage(slotted_page* p, table* t) {
 	char* buffer = calloc(t->pageSize, 1);
 	// write header
 	// page header layout: 0(1B) | pageNum(19B) | usedData(4B) | numRecords(4B) |
@@ -764,7 +754,15 @@ static void writePage(slotted_page* p, address address, table* t) {
 		memcpy(entryStart - 5 - e.size, e.data, e.size); // potentially dangerous
 		entryOffset += addition;
 	}
-	// copy buffer to disk and clean up
+	return buffer;
+}
+
+/*
+writes the given page to the given address
+*/
+static void writePage(slotted_page* p, address address, table* t) {
+	jump(address, t);
+	char* buffer = serializePage(p, t);
 	fwrite(buffer, 1, t->pageSize, t->source);
 	free(buffer);
 }
@@ -793,11 +791,9 @@ void writeNextPage(table* t) {
 // write node
 
 /*
-writes the given node to the given address
+serializes the given node into a newly allocated buffer of exactly t->nodeSize bytes (caller frees)
 */
-static void writeNode(node* n, address address, table* t) {
-	// setup
-	jump(address, t);
+static char* serializeNode(node* n, table* t) {
 	char* buffer = calloc(t->nodeSize, 1);
 	// write metadata
 	// node layout: 0(1B) | parent(8B) | prev(8B) | next(8B) | childCount(4B) | maxKey(19B) | isLeaf(1B) |
@@ -822,7 +818,15 @@ static void writeNode(node* n, address address, table* t) {
 		writePageNumBytewise(buffer+offset, n->keys[i]);
 		offset += PAGE_NUM_DISK_SIZE;
 	}
-	// copy buffer to disk and clean up
+	return buffer;
+}
+
+/*
+writes the given node to the given address
+*/
+static void writeNode(node* n, address address, table* t) {
+	jump(address, t);
+	char* buffer = serializeNode(n, t);
 	fwrite(buffer, 1, t->nodeSize, t->source);
 	free(buffer);
 }
@@ -861,20 +865,6 @@ bool writeNewTree(slotted_page* p, address pageAddr, node* n, address nodeAddr, 
 		return false;
 	}
 	return true;
-}
-
-/*
-flushes a stream's buffered writes and forces them to stable storage
-fails if the flush or sync fails, or if any write since the stream's error indicator was last cleared failed
-FULL_FSYNC (see const.h) selects F_FULLFSYNC on platforms that have it
-*/
-bool syncFile(FILE* file) {
-	if (fflush(file) != 0 || ferror(file)) return false;
-#if FULL_FSYNC && defined(F_FULLFSYNC)
-	return fcntl(fileno(file), F_FULLFSYNC) != -1;
-#else
-	return fsync(fileno(file)) == 0;
-#endif
 }
 
 /*MIGHT NEED THESE TO RETURN TRUE OR FALSE*/
@@ -922,18 +912,52 @@ void markDelete(address address, table* t) {
 
 // delete object
 void deleteObject(address address, table* t) {
-	char code = 2; // a two in the first byte of an obejct means it's garbage
+	char code = GARBAGE_MARKER;
 	jump(address, t);
 	fwrite(&code, 1, 1, t->source);
 }
 
+static bool isDirty(table* t) {
+	return t->pageDirty.count > 0 || t->nodeDirty.count > 0 || t->delete.count > 0;
+}
+
+/*
+appends every write applyTable() will make to this table to the write-ahead log, in the same order,
+without touching the table file
+*/
+static bool logTable(table* t) {
+	for (int i = 0; i < t->pageDirty.capacity; i++) {
+		addr_entry* e = &t->pageDirty.entries[i];
+		if (e->key == 0) continue;
+		char* bytes = serializePage((slotted_page*)e->value, t);
+		bool logged = addLogEntry(t->name, WAL_PAGE, e->key, (uint8_t*)bytes, t->pageSize);
+		free(bytes);
+		if (!logged) return false;
+	}
+	for (int i = 0; i < t->nodeDirty.capacity; i++) {
+		addr_entry* e = &t->nodeDirty.entries[i];
+		if (e->key == 0) continue;
+		char* bytes = serializeNode((node*)e->value, t);
+		bool logged = addLogEntry(t->name, WAL_NODE, e->key, (uint8_t*)bytes, t->nodeSize);
+		free(bytes);
+		if (!logged) return false;
+	}
+	uint8_t garbage = GARBAGE_MARKER;
+	for (int i = 0; i < t->delete.capacity; i++) {
+		addr_entry* e = &t->delete.entries[i];
+		if (e->key == 0) continue;
+		if (!addLogEntry(t->name, WAL_DELETE, e->key, &garbage, 1)) return false;
+	}
+	uint32_t meta[METALEN];
+	fillMeta(t, meta);
+	return addLogEntry(t->name, WAL_META, 0, (uint8_t*)meta, sizeof(meta));
+}
+
 /*
 empties a table's write tables and makes the changes to the file on disk, then syncs the file
-a table with nothing dirty (e.g. after a read-only statement) is left untouched and not synced
 @return false if any write or the sync failed; the file may then hold a partial commit
 */
-bool commit(table* t) {
-	if (t->pageDirty.count == 0 && t->nodeDirty.count == 0 && t->delete.count == 0) return true;
+static bool applyTable(table* t) {
 	clearerr(t->source); // scope syncFile()'s error check to this commit's writes
 
 	for (int i = 0; i < t->pageDirty.capacity; i++) {
@@ -975,6 +999,67 @@ bool commit(table* t) {
 		return false;
 	}
 	return true;
+}
+
+/*
+commits a transaction's tables through the write-ahead log (see wal.c):
+ 1. every dirty page, node, delete marker and header of every table is appended to the log
+ 2. the log is synced and marked committed  <- commit point
+ 3. the same writes are made to each table file, which is then synced
+ 4. the log is reset
+a failure before the commit point aborts the transaction: its changes are dropped and false is returned
+a failure after it leaves a committed log and possibly half-written tables, so the process exits and
+recovery finishes the commit on the next startup
+tables with nothing dirty (e.g. after a read-only statement) are skipped; if none are dirty, nothing is logged or synced
+*/
+bool commitTables(table** tables, int count) {
+	bool anyDirty = false;
+	for (int i = 0; i < count; i++) {
+		if (isDirty(tables[i])) anyDirty = true;
+	}
+	if (!anyDirty) return true;
+
+	// if the log can't be started (e.g. it still holds another transaction), leave it untouched
+	if (!initManager()) {
+		printf("Error: failed to start logging the transaction; its changes were discarded\n");
+		for (int i = 0; i < count; i++) discard(tables[i]);
+		return false;
+	}
+	bool logged = true;
+	for (int i = 0; logged && i < count; i++) {
+		if (isDirty(tables[i])) logged = logTable(tables[i]);
+	}
+	if (logged) logged = markLogCommitted();
+	if (!logged) {
+		printf("Error: failed to write the transaction to the log; its changes were discarded\n");
+		for (int i = 0; i < count; i++) discard(tables[i]);
+		// a leftover partial transaction would corrupt the next one appended after it
+		if (!resetLog()) {
+			printf("Error: failed to reset the log; exiting so recovery can resolve it on startup\n");
+			exit(74);
+		}
+		return false;
+	}
+
+	for (int i = 0; i < count; i++) {
+		if (isDirty(tables[i]) && !applyTable(tables[i])) {
+			printf("Error: table '%s' is only partly written; exiting so recovery can finish the commit on startup\n", tables[i]->name);
+			exit(74);
+		}
+	}
+	if (!resetLog()) {
+		// a stale committed log would be replayed over later commits, so don't continue
+		printf("Error: failed to reset the log after a commit; exiting so recovery can clean it up on startup\n");
+		exit(74);
+	}
+	return true;
+}
+
+/*
+commits a single table (the implicit commit at the end of a statement outside a transaction)
+*/
+bool commit(table* t) {
+	return commitTables(&t, 1);
 }
 
 /*

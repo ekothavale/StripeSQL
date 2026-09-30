@@ -36,7 +36,7 @@ void test_btree_commit_drains_hashmaps(void);
 void test_btree_commit_persist(void);
 void test_btree_commit_delete_persist(void);
 void test_btree_commit_skips_clean(void);
-void test_btree_commit_reports_write_failure(void);
+void test_btree_commit_apply_failure_recovers(void);
 void test_btree_insert_new_page(void);
 void test_btree_insert_existing_page(void);
 void test_btree_split_structure(void);
@@ -49,6 +49,14 @@ void test_btree_delete_triggers_merge(void);
 void test_btree_full_roundtrip(void);
 void test_btree_delete_tree(void);
 void test_btree_delete_tree_not_reloadable(void);
+
+/* Write-ahead log tests */
+void test_wal(void);
+void test_wal_crc32c_check_value(void);
+void test_wal_recover_redoes_committed_log(void);
+void test_wal_recover_discards_uncommitted_log(void);
+void test_wal_recover_rejects_damaged_marker(void);
+void test_wal_recover_reports_damaged_entry(void);
 
 /* Slotted-page CRUD tests */
 void test_page_add();
