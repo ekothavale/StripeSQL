@@ -304,6 +304,19 @@ A table `(id int PRIMARY KEY, v int)` is loaded with N rows where `v = id`, so b
 
 Every commit writes each changed object twice — once to the write-ahead log as a 4.4 KB entry, once to the table file — and syncs four times: twice for the log, once per table file, and once to truncate the log. Autocommit pays that 10,000 times where the transaction pays it once. Each statement also copies the prior version of every already-pending page or node it changes, so a failed statement can be rolled back; that's what makes the transaction runs a few percent slower than the commit count alone would suggest. On macOS a plain `fsync` is cheap (about 40 µs here), so most of the autocommit time is per-statement work: opening the table file, logging and writing back its changes, and closing it. With `FULL_FSYNC` set, each sync costs about 3 ms on this machine, so syncs would dominate the autocommit runs instead.
 
+### Inserts at 100,000 rows
+
+The same one-column table, sequential integer keys, and built-in timer (including `COMMIT`), in two scenarios: building a 100,000-row table from empty, and adding keys 100,001–110,000 to a table that already holds 100,000 rows (restored from a snapshot before each trial). Each figure is the median of 5 trials, except the autocommit build (3 trials of about 95 s each); no warm-up run was discarded.
+
+| Scenario | Autocommit | Single transaction |
+|----------|-----------:|-------------------:|
+| Build a 100,000-row table (keys 1–100,000) | 95.7 s (~1,050 inserts/s) | 7.25 s (~13,800 inserts/s) |
+| Add 10,000 rows to a 100,000-row table | 10.0 s (~1,000 inserts/s) | 3.09 s (~3,200 inserts/s) |
+
+- **Throughput falls as the table grows.** Compared with the 10,000-row runs above (~1,300 and ~22,300 inserts/s), the deeper tree means more nodes are read for every insert.
+- **Adding to an existing table in one transaction is about 4× slower than building one.** While a table is being built, every node is new and stays in memory until the commit. When adding to an existing table, each insert reads the nodes on its path from disk until the transaction changes them, and sequential keys are spread across the tree (see Known Issues), so most inserts reach leaves that haven't been read yet.
+- One trial of each build was an outlier (13.2 s in a transaction, 189 s in autocommit), likely from memory pressure — the 100,000-row transaction holds about 1.2 GB of pending pages — or other activity on the machine. The medians aren't affected.
+
 ### Comparison with SQLite
 
 The `benchmarks/` directory contains four workloads. Each creates a table, inserts 10,000 sequential rows (integer or text primary key, bare or wrapped in one transaction), then runs `DELETE FROM` and `DROP TABLE`. Both engines are timed the same way: wall-clock time for the whole process, including startup, with a fresh database every trial. SQLite 3.45.3 runs the identical script through its CLI on default settings: rollback journal (`journal_mode=delete`), `synchronous=FULL`, no custom pragmas.
