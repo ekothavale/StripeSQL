@@ -9,7 +9,7 @@ markdown table.
   inserts100k  building a 100k-row table, and adding 10k rows to one
   sqlite       StripeSQL vs. the sqlite3 CLI on four 10k-row insert/delete workloads
 
-Usage, from the repository root:  make bench            (all of them, about 25 minutes)
+Usage, from the repository root:  make bench            (all of them, about 5 minutes)
                                   make bench BENCH=lookup  (one or more, space-separated)
 Set STRIPESQL_BIN to benchmark a different binary.
 
@@ -63,7 +63,7 @@ def table(header, rows):
 
 
 def ms(seconds):
-    return f"{seconds * 1000:,.2f} ms" if seconds < 0.01 else f"{seconds * 1000:,.1f} ms" if seconds < 1 else f"{seconds * 1000:,.0f} ms"
+    return f"{seconds * 1000:,.3f} ms" if seconds < 0.0001 else f"{seconds * 1000:,.2f} ms" if seconds < 0.01 else f"{seconds * 1000:,.1f} ms" if seconds < 1 else f"{seconds * 1000:,.0f} ms"
 
 
 def inserts(lo, hi, text=False, table_name="s"):
@@ -153,8 +153,8 @@ def bench_inserts100k():
     shutil.copytree("tables", "snapshot")
     add_txn = trials("add_txn.sql", TRIALS, "snapshot")
     add_auto = trials("add_auto.sql", TRIALS, "snapshot")
-    print("  (adding rows done; the autocommit build takes a few minutes)", file=sys.stderr, flush=True)
-    build_auto = trials("build_auto.sql", 3)  # about 95 s per run
+    print("  (adding rows done; the autocommit build takes about a minute and a half)", file=sys.stderr, flush=True)
+    build_auto = trials("build_auto.sql", 3)  # about 30 s per run
     shutil.rmtree("snapshot", ignore_errors=True)
 
     cell = lambda t, n: f"{t:,.2f} s (~{n / t:,.0f} inserts/s)" if t < 10 else f"{t:,.1f} s (~{n / t:,.0f} inserts/s)"

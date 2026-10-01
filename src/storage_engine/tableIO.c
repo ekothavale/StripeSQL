@@ -67,19 +67,6 @@ static bool jump(address address, table* t) {
 	}
 }
 
-/*
-jumps to an offset relative to the cursor's current position in the table's source
-*/
-static bool jumpRel(long offset, table* t) {
-	if (fseek(t->source, offset, SEEK_CUR) == 0) {
-		t->cursor += offset;
-		return true;
-	} else {
-		printf("Error: failed to make relative jump to address: %llu when reading a binary file\n", t->cursor);
-		return false;
-	}
-}
-
 
 /*
 Serializes a page_num into exactly PAGE_NUM_DISK_SIZE bytes at buf.
@@ -111,35 +98,29 @@ static void writePageOffsetBytewise(char* buf, page_offset k) {
 }
 
 /*
-Reads a page_num from (cursor + offset), restores cursor.
+Reads a page_num from a byte array
+Does not check the byte array for correctness
 */
-static page_num readPageNum(long offset, table* t) {
-	unsigned char buf[PAGE_NUM_DISK_SIZE];
-	jumpRel(offset, t);
-	fread(buf, 1, PAGE_NUM_DISK_SIZE, t->source);
-	jumpRel(-(long)offset - PAGE_NUM_DISK_SIZE, t);
+static page_num readPageNum(ubyte* start) {
 	page_num out;
-	out.type = (ordering_type)buf[0];
+	out.type = (ordering_type)start[0];
 	if (out.type == ORDERING_STRING) {
 		memset(out.as.string, 0, sizeof(out.as.string));
-		memcpy(out.as.string, buf + 1, TEXT_PAGE_NUM_LEN);
+		memcpy(out.as.string, start + 1, TEXT_PAGE_NUM_LEN);
 	} else {
-		out.as.u64 = ((uint64_t)buf[1] << 56) | ((uint64_t)buf[2] << 48) |
-		             ((uint64_t)buf[3] << 40) | ((uint64_t)buf[4] << 32) |
-		             ((uint64_t)buf[5] << 24) | ((uint64_t)buf[6] << 16) |
-		             ((uint64_t)buf[7] <<  8) | (uint64_t)buf[8];
+		out.as.u64 = ((uint64_t)start[1] << 56) | ((uint64_t)start[2] << 48) |
+		             ((uint64_t)start[3] << 40) | ((uint64_t)start[4] << 32) |
+		             ((uint64_t)start[5] << 24) | ((uint64_t)start[6] << 16) |
+		             ((uint64_t)start[7] <<  8) | (uint64_t)start[8];
 	}
 	return out;
 }
 
 /*
-Reads a page_offset from (cursor + offset), restores cursor.
+Reads a page offset from a byte stream 
+Assumes @param buf points to the beginning of the offset (ordering type)
 */
-static page_offset readPageOffset(long offset, table* t) {
-	unsigned char buf[PAGE_OFFSET_DISK_SIZE];
-	jumpRel(offset, t);
-	fread(buf, 1, PAGE_OFFSET_DISK_SIZE, t->source);
-	jumpRel(-(long)offset - PAGE_OFFSET_DISK_SIZE, t);
+static page_offset readPageOffset(ubyte* buf) {
 	page_offset out;
 	out.type = (ordering_type)buf[0];
 	if (out.type == ORDERING_STRING) {
@@ -153,97 +134,43 @@ static page_offset readPageOffset(long offset, table* t) {
 	}
 	return out;
 }
-
 /*
-reads one byte at the table's cursor + an offset
-returns the cursor to the original position
+reads an unsigned integer from a byte stream in memory
 */
-static char readByte(long offset, table* t) {
-	char a;
-	jumpRel(offset, t);
-	fread(&a, 1, 1, t->source);
-	jumpRel(-offset - 1, t);
-	return a;
-}
-
-/*
-reads an unsigned integer at the table's cursor + an offset
-returns the cursor to the original position
-*/
-static uint32_t readUInt(long offset, table* t) {
-	unsigned char a[4];
-	jumpRel(offset, t);
-	fread(a, 4, 1, t->source);
-	jumpRel(-offset - 4, t);
-	uint32_t out = (uint32_t) a[0] << 24 | (uint32_t) a[1] << 16 | (uint32_t) a[2] << 8 | (uint32_t) a[3];
+static uint32_t readUInt(ubyte* bytes) {
+	uint32_t out = (uint32_t) bytes[0] << 24 | (uint32_t) bytes[1] << 16 | (uint32_t) bytes[2] << 8 | (uint32_t) bytes[3];
 	return out;
 }
 
 /*
-reads an unsigned long at the table's cursor + an offset
-returns the cursor to the original position
+reads an unsigned long from a byte stream in memory
 */
-static uint64_t readULong(long offset, table* t) {
-	unsigned char a[8];
-	jumpRel(offset, t);
-	fread(a, 8, 1, t->source);
-	jumpRel(-offset - 8, t);
+static uint64_t readULong(ubyte* a) {
 	uint64_t out = (uint64_t) a[0] << 56 | (uint64_t) a[1] << 48 | (uint64_t) a[2] << 40 | (uint64_t) a[3] << 32
 					| (uint64_t) a[4] << 24 | (uint64_t) a[5] << 16 | (uint64_t) a[6] << 8 | (uint64_t) a[7];
 	return out;
 }
 
 /*
-reads an arbitrary number of bytes from the source file into the buffer
-returns the cursor to the original position
+reads a page from disk into a PAGE_SIZE memory blob @param buffer
 */
-static void readArbitrary(char* buffer, uint32_t len, long offset, table* t) {
-	jumpRel(offset, t);
-	fread(buffer, 1, len, t->source);
-	jumpRel(-offset-len, t);
+static bool consumePageRaw(ubyte* buffer, address addr, table* t) {
+	if (!jump(addr, t)) return false;
+	size_t back = fread(buffer, 1, t->pageSize, t->source);
+	if (back < t->pageSize) return false;
+	t->cursor += t->pageSize;
+	return true;
 }
 
-/*
-reads one byte at the table's cursor + an offset
-does not return the cursor to the original position
-*/
-static char consumeByte(long offset, table* t) {
-	char a;
-	jumpRel(offset, t);
-	fread(&a, 1, 1, t->source);
-	return a;
+static bool consumeNodeRaw(ubyte* buffer, address addr, table* t) {
+	if (!jump(addr, t)) return false;
+	size_t back = fread(buffer, 1, t->nodeSize, t->source);
+	if (back < t->nodeSize) return false;
+	t->cursor += t->nodeSize;
+	return true;
 }
 
-/*
-reads an unsigned integer at the table's cursor + an offset
-does not return the cursor to the original position
-*/
-static uint32_t consumeUInt(long offset, table* t) {
-	uint32_t a;
-	jumpRel(offset, t);
-	fread(&a, 4, 1, t->source);
-	return a;
-}
 
-/*
-reads an unsigned long at the table's cursor + an offset
-does not return the cursor to the original position
-*/
-static uint64_t consumeULong(long offset, table* t) {
-	uint64_t a;
-	jumpRel(offset, t);
-	fread(&a, 8, 1, t->source);
-	return a;
-}
-
-/*
-reads an arbitrary number of bytes from the source file into the buffer
-does not return the cursor to the original position
-*/
-static void consumeArbitrary(char* buffer, uint32_t len, long offset, table* t) {
-	jumpRel(offset, t);
-	fread(buffer, 1, len, t->source);
-}
 
 /*
 deep copies the contents of the source page into the target page
@@ -311,7 +238,9 @@ static bool loadMeta(FILE* file, char* fname, table* table) {
 	table->pageStripeLen = buf[5];
 	table->nodeStripeLen = buf[6];
 	table->pageSize = buf[7];
+	if (table->pageSize < 44 + SP_SLOT_DISK_SIZE || table->pageSize > 1024 * 64) return false;
 	table->nodeSize = buf[8];
+	if (table->nodeSize < 69 || table->nodeSize > 1024 * 64) return false;
 	table->pageFree = ((uint64_t) (uint32_t) buf[9] << 32) | (uint32_t) buf[10];
 	table->nodeFree = ((uint64_t) (uint32_t) buf[11] << 32) | (uint32_t) buf[12];
 	table->root    = ((uint64_t) (uint32_t) buf[13] << 32) | (uint32_t) buf[14];
@@ -614,7 +543,11 @@ bool loadTable(char* tablename, table* t) {
 	t->isNew  = false;
 	t->cursor = 0;
 	t->name   = strdup(tablename);
-	loadMeta(tfile, fname, t);
+	if (!loadMeta(tfile, fname, t)) {
+		printf("Error: tried to load a table from %s but it contained corrupted metadata\n", fname);
+		free(fname);
+		return false;
+	}
 	initDirtyHashmaps(t);
 	free(fname);
 	return true;
@@ -662,9 +595,12 @@ bool readPage(address addr, slotted_page* p, table* t) {
 	}
 
 	// otherwise read from disk
-	address prev = t->cursor;
-	jump(addr, t);
-	if (readByte(0, t) != 0) {
+	ubyte raw[t->pageSize];
+	// read page from disk with a single seek and read
+	if (!consumePageRaw(raw, addr, t)) {
+		return false;
+	}
+	if (raw[0] != 0) {
 		printf("Error: attempted to read page at address %llu but page was invalid\n", addr);
 		return false;
 	}
@@ -675,54 +611,69 @@ bool readPage(address addr, slotted_page* p, table* t) {
 	// header
 	// page header layout: 0(1B) | pageNum(19B) | usedData(4B) | numRecords(4B) |
 	//                     numEntries(4B) | arrCap(4B) | maxEntries(4B) | maxSlots(4B)  = 44B
-	p->header.pageNum    = readPageNum(1, t);
-	p->header.usedData   = readUInt(20, t);
-	p->header.numRecords = readUInt(24, t);
-	p->header.numEntries = readUInt(28, t);
-	p->header.arrCap     = readUInt(32, t);
-	p->header.maxEntries = readUInt(36, t);
-	p->header.maxSlots   = readUInt(40, t);
+	p->header.pageNum    = readPageNum(raw+1);
+	p->header.usedData   = readUInt(raw+20);
+	p->header.numRecords = readUInt(raw+24);
+	p->header.numEntries = readUInt(raw+28);
+	p->header.arrCap     = readUInt(raw+32);
+	p->header.maxEntries = readUInt(raw+36);
+	p->header.maxSlots   = readUInt(raw+40);
+	if (p->header.numRecords > p->header.maxSlots || p->header.numEntries > p->header.maxEntries) {
+		printf("Error: tried to read a page into a chunk of memory but it had corrupted metadata\n");
+		return false;
+	}
 	// slots (each slot on disk: ID(9B) | len(4B) | size(4B) | ptr(4B) = 21B)
 	if (!p->slots) {
 		p->slots = calloc(p->header.maxSlots, sizeof(sp_slot));
 	}
 	int offset = 44;
+	if (p->header.numRecords > (t->pageSize - 44) / 21) {
+		printf("Error: tried to read a page into a chunk of memory but it had corrupted metadata\n");
+		return false;
+	}
 	for (int i = 0; i < p->header.numRecords; i++) {
-		p->slots[i].ID   = readPageOffset(offset,    t);
-		p->slots[i].len  = readUInt(offset + 9,  t);
-		p->slots[i].size = readUInt(offset + 13, t);
-		p->slots[i].ptr  = readUInt(offset + 17, t);
+		p->slots[i].ID   = readPageOffset(raw+offset);
+		p->slots[i].len  = readUInt(raw+offset + 9);
+		p->slots[i].size = readUInt(raw+offset + 13);
+		p->slots[i].ptr  = readUInt(raw+offset + 17);
 		offset += SP_SLOT_DISK_SIZE;
 	}
 	// records
-	int entryOffset = 0;
-	jump(addr + t->pageSize, t); // navigating to 1 byte after the end of the page
+	int entryCursor = t->pageSize;
 	if(!p->entries) {
 		p->entries = calloc(p->header.maxEntries, sizeof(entry));
 	}
+	uint32_t slotEnd = 44 + 21*p->header.numRecords;
 	for (int i = 0; i < p->header.numEntries; i++) {
 		// entry: <--  data | size (4B) | type (2B)  <--
-		char code = readByte(-1, t);
-		jumpRel(-2, t);
+		if (entryCursor - 6 < slotEnd) {
+			printf("Error: tried to read a page into a chunk of memory but it had corrupted metadata\n");
+			return false;
+		}
+		char code = raw[entryCursor-1];
+		entryCursor -= 2;
 		for (int j = 0; j < NUM_DATATYPES; j++) {
 			if (DATATYPE_CODES[j] == code) p->entries[i].type = j;
 		}
 
-		uint32_t size = readUInt(-4, t);
-		jumpRel(-4, t);
+		entryCursor -= 4;
+		uint32_t size = readUInt(raw + entryCursor);
 		p->entries[i].size = size;
+		if (size > entryCursor - slotEnd) {
+			printf("Error: tried to read a page into a chunk of memory but it had corrupted metadata\n");
+			return false;
+		}
 		if (p->entries[i].data) free(p->entries[i].data);
 		p->entries[i].data = malloc(size);
-		readArbitrary(p->entries[i].data, size, -(long)size, t);
-		jumpRel(-(long)size, t);
+		entryCursor -= size;
+		memcpy(p->entries[i].data, raw+entryCursor, size);
 	}
-	jump(prev, t);
 	return true;
 }
 
 /*
-reads a page from an address into a chunk of memory
-@param: p - a slotted page to load the data from disk into
+reads a node from an address into a chunk of memory
+@param: n - a node e to load the data from disk into
 */
 bool readNode(address addr, node* n, table* t) {
 	// checking dirty table
@@ -733,10 +684,12 @@ bool readNode(address addr, node* n, table* t) {
 	}
 
 	// otherwise search disk
-	address prev = t->cursor;
-	jump(addr, t);
+	ubyte raw[t->nodeSize];
+	if (!consumeNodeRaw(raw, addr, t)) {
+		return false;
+	}
 
-	if (readByte(0, t) != 1) {
+	if (raw[0] != 1) {
 		printf("Error: attempted to read page at address %llu but page was invalid\n", addr);
 		return false;
 	}
@@ -748,31 +701,38 @@ bool readNode(address addr, node* n, table* t) {
 	// read metadata
 	// node layout: 0(1B) | parent(8B) | prev(8B) | next(8B) | childCount(4B) | maxKey(19B) | isLeaf(1B) |
 	//              children(8B each) | keys(19B each)
-	n->parent = readULong(1, t);
-	n->prev = readULong(9, t);
-	n->next = readULong(17, t);
-	n->childCount = readUInt(25, t);
-	n->maxKey = readPageNum(29, t);
-	n->isLeaf = readByte(48, t);
-
-	// read children
-	int offset = 49;
-	for (int i = 0; i < n->childCount; i++) {
-		n->children[i] = readULong(offset, t);
-		offset += 8;
+	n->parent = readULong(raw+1);
+	n->prev = readULong(raw+9);
+	n->next = readULong(raw+17);
+	n->childCount = readUInt(raw+25);
+	if (n->childCount > M_GLOBAL) {
+		return false;
 	}
-	// read keys
+	n->maxKey = readPageNum(raw+29);
+	n->isLeaf = raw[48];
+
+	// check node size to prevent out of bounds accesses
 	int keylim = n->childCount;
 	if (!n->isLeaf) {
 		keylim--;
 	}
+	if (49 + n->childCount*8 + keylim * PAGE_NUM_DISK_SIZE > t->nodeSize) {
+		return false;
+	}
+
+	// read children
+	int offset = 49;
+	for (int i = 0; i < n->childCount; i++) {
+		n->children[i] = readULong(raw+offset);
+		offset += 8;
+	}
+	// read keys
 	for (int i = 0; i < keylim; i++) {
-		n->keys[i] = readPageNum(offset, t);
+		n->keys[i] = readPageNum(raw+offset);
 		offset += PAGE_NUM_DISK_SIZE;
 	}
 
-	// return to original cursor position
-	jump(prev, t);
+	// cleanup and return
 	return true;
 }
 // write page

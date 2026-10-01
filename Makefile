@@ -45,7 +45,7 @@ coverage:
 	$(LLVM_COV) report $$dir/run_tests -instr-profile=$$dir/all.profdata -ignore-filename-regex=$(COV_IGNORE); \
 	status=$$?; rm -rf $$dir; exit $$status
 
-# the unit tests plus the crash-recovery test, run against an instrumented binary (macOS only, ~15 min)
+# the unit tests plus the crash-recovery test, run against an instrumented binary (macOS only, under a minute)
 # processes the crash test kills can leave unreadable profiles, so merging skips them (--failure-mode=all)
 coverage-full:
 	@dir=$$(mktemp -d); mkdir $$dir/tables $$dir/profiles; \
