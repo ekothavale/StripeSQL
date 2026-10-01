@@ -57,7 +57,17 @@ coverage-full:
 	$(LLVM_COV) report $$dir/main -object $$dir/run_tests -instr-profile=$$dir/all.profdata -ignore-filename-regex=$(COV_IGNORE); \
 	status=$$?; rm -rf $$dir; exit $$status
 
-.PHONY: clean crashtest test coverage coverage-full
+# --- benchmarks and profiling (see bench/) ---
+# make bench BENCH="lookup batch" runs a subset; make profile PROFILE="lookup --io" likewise
+
+bench: main
+	python3 bench/bench.py $(BENCH)
+
+# macOS only
+profile: main
+	python3 bench/profile.py $(PROFILE)
+
+.PHONY: clean crashtest test coverage coverage-full bench profile
 
 # --- core ---
 

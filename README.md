@@ -278,6 +278,17 @@ Execution time is reported automatically after every file-mode run (wall-clock, 
  1.243 ms
 ```
 
+### Running the benchmarks
+
+```sh
+make bench                        # every benchmark below (about 25 minutes)
+make bench BENCH="lookup batch"   # a subset: lookup, batch, inserts100k, sqlite
+make profile                      # where the time goes, function by function (macOS only)
+make profile PROFILE=--io         # file calls per statement (macOS only)
+```
+
+`make bench` builds `main` and runs `bench/bench.py`, which generates every workload, runs each trial against a fresh database in a temporary directory, and prints each table below as markdown. `make profile` runs `bench/profile.py`, which attaches macOS's `sample` to StripeSQL on five workloads (lookups, scans, autocommit inserts, a 100,000-row transaction, and `DELETE FROM`) and reports each function's share of the time, including what it calls, along with peak memory. With `--io` it instead counts the file calls a lookup, a scanned row, and an autocommit insert make, using `bench/iocount.c`. Both use the binary in `STRIPESQL_BIN` instead of `./main` when it's set.
+
 All figures below were measured on an Apple M2 with an `-O3` build (the Makefile's flags, no sanitizers; default `FULL_FSYNC 0`, so every commit goes through the write-ahead log with plain `fsync`) and a warm OS page cache. Each is the median of 5 trials, taken after one discarded warm-up run. They will vary with page fill factor, tree depth, `M_GLOBAL`, and disk speed.
 
 ### Primary-key lookup vs. full scan
@@ -319,7 +330,7 @@ The same one-column table, sequential integer keys, and built-in timer (includin
 
 ### Comparison with SQLite
 
-The `benchmarks/` directory contains four workloads. Each creates a table, inserts 10,000 sequential rows (integer or text primary key, bare or wrapped in one transaction), then runs `DELETE FROM` and `DROP TABLE`. Both engines are timed the same way: wall-clock time for the whole process, including startup, with a fresh database every trial. SQLite 3.45.3 runs the identical script through its CLI on default settings: rollback journal (`journal_mode=delete`), `synchronous=FULL`, no custom pragmas.
+`make bench BENCH=sqlite` generates four workloads. Each creates a table, inserts 10,000 sequential rows (integer or text primary key, bare or wrapped in one transaction), then runs `DELETE FROM` and `DROP TABLE`. Both engines are timed the same way: wall-clock time for the whole process, including startup, with a fresh database every trial. SQLite 3.45.3 runs the identical script through its CLI on default settings: rollback journal (`journal_mode=delete`), `synchronous=FULL`, no custom pragmas.
 
 | Benchmark | StripeSQL | SQLite | Ratio |
 |-----------|----------:|-------:|------:|
