@@ -116,6 +116,8 @@ void test_interpret_no_schema_returns_load_error();
 void test_interpret_select_projection_types();
 void test_interpret_failed_statement_rolls_back();
 void test_interpret_errors_halt_statements();
+void test_interpret_ordering_comparisons();
+void test_interpret_filtered_delete();
 
 /* Generator tests */
 void test_generator();

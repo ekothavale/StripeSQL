@@ -1637,6 +1637,104 @@ void test_interpret_errors_halt_statements(void) {
     remove(schema_path());
 }
 
+void test_interpret_ordering_comparisons(void) {
+    // <, <=, > and >= compare their left operand against their right one,
+    // whichever side the column is on (they once ran with the two swapped,
+    // so "v > 2" matched the rows where v < 2)
+    remove(schema_path());
+    remove(TABLE_DIRECTORY "oc.tbl");
+    assert(interpret("create table oc (id int primary key, v int)").ir == INTERPRET_OK);
+    char sql[96];
+    for (int i = 1; i <= 6; i++) {
+        snprintf(sql, sizeof(sql), "insert into oc values (%d, %d)", i, i);
+        assert(interpret(sql).ir == INTERPRET_OK);
+    }
+    // each condition matches exactly the rows with lo <= v <= hi
+    struct { const char* where; int64_t lo, hi; } cases[] = {
+        {"v > 2", 3, 6}, {"v >= 2", 2, 6}, {"v < 3", 1, 2}, {"v <= 3", 1, 3},
+        {"2 < v", 3, 6}, {"3 >= v", 1, 3}, {"id > 4", 5, 6}, {"id <= 1", 1, 1},
+        {"v > 2 and v < 5", 3, 4}, {"v - 3 > 0", 4, 6},
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        snprintf(sql, sizeof(sql), "select v from oc where %s", cases[c].where);
+        result_buffer r = interpret(sql);
+        assert(r.ir == INTERPRET_OK && r.count == cases[c].hi - cases[c].lo + 1);
+        for (int i = 0; i < r.count; i++)
+            assert(r.rows[i][0].as.integer >= cases[c].lo && r.rows[i][0].as.integer <= cases[c].hi);
+    }
+    // the same comparisons choose the rows UPDATE and DELETE act on
+    assert(interpret("update oc set v = 0 where v > 4").ir == INTERPRET_OK);
+    result_buffer updated = interpret("select id from oc where v = 0");
+    assert(updated.ir == INTERPRET_OK && updated.count == 2);
+    for (int i = 0; i < updated.count; i++) assert(updated.rows[i][0].as.integer >= 5);
+    assert(interpret("delete from oc where id < 3").ir == INTERPRET_OK);
+    result_buffer kept = interpret("select id from oc");
+    assert(kept.ir == INTERPRET_OK && kept.count == 4);
+    for (int i = 0; i < kept.count; i++) assert(kept.rows[i][0].as.integer >= 3);
+
+    assert(interpret("drop table oc").ir == INTERPRET_OK);
+    remove(schema_path());
+}
+
+/*
+asserts that table fd holds exactly the rows whose id passes keep(), each with v = id: a full
+scan returns them and nothing else, and looking up every id from 1 to maxId by key agrees
+*/
+static void check_fd(int maxId, bool (*keep)(int64_t)) {
+    int expected = 0;
+    for (int id = 1; id <= maxId; id++) expected += keep(id);
+    result_buffer scan = interpret("select id, v from fd");
+    assert(scan.ir == INTERPRET_OK && scan.count == expected);
+    for (int i = 0; i < scan.count; i++) {
+        assert(keep(scan.rows[i][0].as.integer));
+        assert(scan.rows[i][1].as.integer == scan.rows[i][0].as.integer);
+    }
+    char sql[64];
+    for (int id = 1; id <= maxId; id++) {
+        snprintf(sql, sizeof(sql), "select v from fd where id = %d", id);
+        result_buffer one = interpret(sql);
+        assert(one.ir == INTERPRET_OK && one.count == (keep(id) ? 1 : 0));
+    }
+}
+static bool fd_low(int64_t id)       { return id <= 200; }
+static bool fd_scattered(int64_t id) { return id <= 200 && (id < 50 || id > 150); }
+static bool fd_few(int64_t id)       { return id > 150 && id <= 200; }
+
+void test_interpret_filtered_delete(void) {
+    // a DELETE with a WHERE clause empties pages all over the tree, so leaves
+    // borrow from and merge into the siblings on both sides while the scan that
+    // drives the delete is still walking them. It must delete exactly the rows
+    // that match, and leave the others reachable by a scan and by key
+    remove(schema_path());
+    remove(TABLE_DIRECTORY "fd.tbl");
+    assert(interpret("create table fd (id int primary key, v int)").ir == INTERPRET_OK);
+    char sql[64];
+    assert(interpret("begin transaction").ir == INTERPRET_OK);
+    for (int i = 1; i <= 600; i++) {
+        snprintf(sql, sizeof(sql), "insert into fd values (%d, %d)", i, i);
+        assert(interpret(sql).ir == INTERPRET_OK);
+    }
+    assert(interpret("commit").ir == INTERPRET_OK);
+
+    assert(interpret("delete from fd where v > 200").ir == INTERPRET_OK);  // autocommit
+    check_fd(600, fd_low);
+
+    assert(interpret("begin transaction").ir == INTERPRET_OK);
+    assert(interpret("delete from fd where v >= 50 and v <= 150").ir == INTERPRET_OK);
+    check_fd(600, fd_scattered);  // as pending in the transaction
+    assert(interpret("commit").ir == INTERPRET_OK);
+    check_fd(600, fd_scattered);  // as reloaded from disk
+
+    assert(interpret("begin transaction").ir == INTERPRET_OK);
+    assert(interpret("delete from fd where v < 100").ir == INTERPRET_OK);
+    check_fd(600, fd_few);
+    assert(interpret("discard").ir == INTERPRET_OK);
+    check_fd(600, fd_scattered);  // the discarded delete left nothing behind
+
+    assert(interpret("drop table fd").ir == INTERPRET_OK);
+    remove(schema_path());
+}
+
 // --- master ---
 
 void test_vm(void) {
@@ -1649,6 +1747,8 @@ void test_vm(void) {
     test_interpret_select_projection_types();
     test_interpret_failed_statement_rolls_back();
     test_interpret_errors_halt_statements();
+    test_interpret_ordering_comparisons();
+    test_interpret_filtered_delete();
     printf("All VM tests passed.\n");
 }
 

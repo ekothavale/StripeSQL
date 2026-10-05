@@ -576,20 +576,29 @@ static interpret_result run() {
 				push(BOOL_VAL(!equal(pop(), pop())));
 				break;
 			}
+			// the right operand is on top of the stack, so it's popped first
 			case OP_LESS: {
-				push(BOOL_VAL(lessThan(pop(), pop())));
+				value b = pop();
+				value a = pop();
+				push(BOOL_VAL(lessThan(a, b)));
 				break;
 			}
 			case OP_LESS_EQUAL: {
-				push(BOOL_VAL(!greaterThan(pop(), pop())));
+				value b = pop();
+				value a = pop();
+				push(BOOL_VAL(!greaterThan(a, b)));
 				break;
 			}
 			case OP_GREATER: {
-				push(BOOL_VAL(greaterThan(pop(), pop())));
+				value b = pop();
+				value a = pop();
+				push(BOOL_VAL(greaterThan(a, b)));
 				break;
 			}
 			case OP_GREATER_EQUAL: {
-				push(BOOL_VAL(!lessThan(pop(), pop())));
+				value b = pop();
+				value a = pop();
+				push(BOOL_VAL(!lessThan(a, b)));
 				break;
 			}
 			case OP_LIKE: {
