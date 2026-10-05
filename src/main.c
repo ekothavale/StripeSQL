@@ -107,15 +107,17 @@ static char* isolateQuery(int* start, int len, const char* source) {
     bool lineComment = false;
     bool multiLineComment = false;
     for (int i = *start; i <= len; i++) {
-        if (lineComment) {
-            if (source[i] != '\n') continue;
-            lineComment = false;
+        // a comment ends at its terminator or at the end of the file, where the '\0' case below
+        // returns what's left
+        if (lineComment && source[i] != '\0') {
+            if (source[i] == '\n') lineComment = false;
             continue;
-
         }
-        if (multiLineComment) {
-            if (source[i] != '*' || PEEK() != '/') continue;
-            multiLineComment = false;
+        if (multiLineComment && source[i] != '\0') {
+            if (source[i] == '*' && PEEK() == '/') {
+                i++; // the closing '/' is part of the comment, so it can't open another one
+                multiLineComment = false;
+            }
             continue;
         }
         switch (source[i]) {
@@ -127,14 +129,15 @@ static char* isolateQuery(int* start, int len, const char* source) {
                 if (PEEK() == '\'') i++;
                 break;
             }
+            // comments don't start inside a string
             case '-':
-                if (PEEK() == '-') {
+                if (!singleQuote && PEEK() == '-') {
                     i++;
                     lineComment = true;
                 }
                 break;
             case '/': {
-                if (PEEK() == '*') {
+                if (!singleQuote && PEEK() == '*') {
                     i++;
                     multiLineComment = true;
                 }

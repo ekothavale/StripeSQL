@@ -96,6 +96,9 @@ void test_scan_empty_string();
 void test_scan_unterminated_string();
 void test_scan_skips_whitespace();
 void test_scan_skips_comment();
+void test_scan_skips_block_comment();
+void test_scan_unterminated_block_comment();
+void test_scan_slash_is_still_division();
 void test_scan_line_tracking();
 void test_init_tokenized();
 void test_add_token_count();
@@ -116,6 +119,7 @@ void test_interpret_no_schema_returns_load_error();
 void test_interpret_select_projection_types();
 void test_interpret_failed_statement_rolls_back();
 void test_interpret_errors_halt_statements();
+void test_interpret_block_comments();
 void test_interpret_ordering_comparisons();
 void test_interpret_filtered_delete();
 

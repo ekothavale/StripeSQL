@@ -62,7 +62,7 @@ A SQL query moves through five stages before touching the disk:
   and VM to resolve column names and primary key positions.
 ```
 
-**Lexer** (`src/SQL_interpreter/lexer.c`) — scans the raw query string into a flat token array. Multi-word clauses such as `INSERT INTO` are matched at the parse level, not here.
+**Lexer** (`src/SQL_interpreter/lexer.c`) — scans the raw query string into a flat token array, skipping whitespace and comments. Multi-word clauses such as `INSERT INTO` are matched at the parse level, not here.
 
 **Parser** (`src/SQL_interpreter/parser.c`) — consumes the token array and produces an AST. Each node carries a type tag, a keyword token, a flag for sub-variants (e.g. `DISTINCT`, `PRIMARY KEY`), and up to seven children.
 
@@ -126,7 +126,7 @@ A SQL query moves through five stages before touching the disk:
 **Execution Modes**
 - Interactive REPL (`./main`)
 - Batch file execution (`./main file.sql`) supporting multiple semicolon-delimited statements
-- Single-line comments (`-- ...`) in SQL files; block comments (`/* ... */`) aren't supported yet (see Known Issues)
+- Single-line comments (`-- ...`) and block comments (`/* ... */`), in SQL files and in the REPL. Block comments don't nest, and one that is never closed runs to the end of the input. The REPL runs each line as it's entered, so a block comment there has to close on the line it opens on
 - One process at a time: StripeSQL holds an exclusive lock on `tables/stripe.lock` for as long as it runs; a second process exits with code `75`. The OS releases the lock when the process exits, even after a crash
 
 ---
@@ -149,11 +149,10 @@ The following features are next on the todo list, roughly in priority order:
 |---|-------------|
 | 1 | `ORDER BY`, `LIMIT`, and `SELECT DISTINCT` are parsed but have no effect on the result. |
 | 2 | `INSERT` ignores its column list: `INSERT INTO t (b, a) VALUES (2, 1)` assigns the values in the order the columns were declared in `CREATE TABLE`. `SELECT` returns columns in the order they're listed. |
-| 3 | Block comments (`/* ... */`) aren't supported: the lexer doesn't skip them, so a statement or SQL file that contains one fails with a syntax error. Line comments (`-- ...`) work. |
-| 4 | `readNode` and `readPage` report a failed read or a damaged page or node, but most of their callers — the B+ tree's descents and rebalancing in particular — ignore the result, so an I/O error partway through a statement doesn't fail the statement. |
-| 5 | Most syntax errors call `exit()`, which also ends a REPL session. A transaction open at that point is lost without a `DISCARD`; nothing it changed was written to disk, so the tables are unharmed. |
-| 6 | There is no page overflow policy — if enough records collide onto the same physical page, insertion becomes impossible until the page is emptied. Primary-key dispersion (both integer and text keys use a reversible bit/byte-reversal transform before bucketing) makes this rare in practice, and a failed insert now reports an error rather than silently dropping the row, but no page-split or overflow-chain mechanism exists yet. |
-| 7 | Power loss on macOS: with the default `FULL_FSYNC 0`, a plain `fsync` leaves data in the drive's cache, which the drive may also reorder, so recently committed transactions are only guaranteed to survive a process or OS crash. Set `FULL_FSYNC 1` in `const.h` to survive power loss (at about 3 ms per sync). |
+| 3 | `readNode` and `readPage` report a failed read or a damaged page or node, but most of their callers — the B+ tree's descents and rebalancing in particular — ignore the result, so an I/O error partway through a statement doesn't fail the statement. |
+| 4 | Most syntax errors call `exit()`, which also ends a REPL session. A transaction open at that point is lost without a `DISCARD`; nothing it changed was written to disk, so the tables are unharmed. |
+| 5 | There is no page overflow policy — if enough records collide onto the same physical page, insertion becomes impossible until the page is emptied. Primary-key dispersion (both integer and text keys use a reversible bit/byte-reversal transform before bucketing) makes this rare in practice, and a failed insert now reports an error rather than silently dropping the row, but no page-split or overflow-chain mechanism exists yet. |
+| 6 | Power loss on macOS: with the default `FULL_FSYNC 0`, a plain `fsync` leaves data in the drive's cache, which the drive may also reorder, so recently committed transactions are only guaranteed to survive a process or OS crash. Set `FULL_FSYNC 1` in `const.h` to survive power loss (at about 3 ms per sync). |
 
 ---
 
@@ -380,9 +379,9 @@ Measured with clang's source-based coverage (`-fprofile-instr-generate -fcoverag
 
 | Tests | Lines | Functions | Branches |
 |-------|------:|----------:|---------:|
-| Unit tests (`make coverage`) | 78.2% | 89.7% | 68.5% |
-| Crash-recovery test alone | 55.9% | 75.6% | 45.7% |
-| Both (`make coverage-full`) | **77.7%** | **89.7%** | **68.0%** |
+| Unit tests (`make coverage`) | 78.3% | 89.7% | 68.7% |
+| Crash-recovery test alone | 55.8% | 75.6% | 45.4% |
+| Both (`make coverage-full`) | **77.7%** | **89.7%** | **68.1%** |
 
 The unit-test row covers every file except `main.c`, which the unit tests don't link; the other two rows include it. `debug.c`, the bytecode disassembler and execution tracer used only in debug builds, never runs. Without it, both suites together cover 82% of lines and 95% of functions.
 
@@ -393,17 +392,17 @@ The unit-test row covers every file except `main.c`, which the unit tests don't 
 |------|------:|----------:|---------:|
 | `SQL_interpreter/chunk.c` | 100.0% | 100.0% | 100.0% |
 | `SQL_interpreter/generator.c` | 76.9% | 100.0% | 68.4% |
-| `SQL_interpreter/lexer.c` | 85.4% | 100.0% | 80.4% |
+| `SQL_interpreter/lexer.c` | 86.0% | 100.0% | 81.1% |
 | `SQL_interpreter/parser.c` | 77.4% | 97.7% | 73.2% |
 | `SQL_interpreter/schema.c` | 92.8% | 100.0% | 83.3% |
-| `SQL_interpreter/vm.c` | 75.5% | 96.3% | 62.7% |
+| `SQL_interpreter/vm.c` | 75.8% | 96.3% | 63.0% |
 | `storage_engine/bplus.c` | 88.6% | 86.8% | 79.4% |
 | `storage_engine/file.c` | 94.3% | 100.0% | 75.0% |
 | `storage_engine/ordering.c` | 64.1% | 88.9% | 55.2% |
 | `storage_engine/page.c` | 86.4% | 100.0% | 78.6% |
 | `storage_engine/tableIO.c` | 88.2% | 94.7% | 75.7% |
 | `storage_engine/wal.c` | 97.1% | 100.0% | 69.6% |
-| `main.c` | 50.2% | 85.7% | 44.9% |
+| `main.c` | 50.0% | 85.7% | 43.1% |
 | `memory.c` | 75.0% | 100.0% | 75.0% |
 | `value.c` | 76.9% | 66.7% | 100.0% |
 | `debug.c` | 0.0% | 0.0% | 0.0% |

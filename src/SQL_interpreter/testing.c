@@ -816,6 +816,52 @@ void test_scan_skips_comment() {
     assert(t.line == 2);
 }
 
+void test_scan_skips_block_comment() {
+    // Everything between '/*' and '*/' is skipped, wherever whitespace could go
+    initLexer("/* a comment */ select /* another */ from");
+    assert(scanToken().type == TOKEN_SELECT);
+    assert(scanToken().type == TOKEN_FROM);
+    assert(scanToken().type == TOKEN_EOF);
+
+    // nothing inside a comment is read as SQL, and its newlines still count
+    initLexer("/* select ;\n 'quote\n -- */ from");
+    token t = scanToken();
+    assert(t.type == TOKEN_FROM);
+    assert(t.line == 3);
+    assert(scanToken().type == TOKEN_EOF);
+
+    // an empty comment, stars inside one, and two back to back
+    initLexer("/**/select/*** a * b ***//* c */from");
+    assert(scanToken().type == TOKEN_SELECT);
+    assert(scanToken().type == TOKEN_FROM);
+    assert(scanToken().type == TOKEN_EOF);
+
+    // comments don't nest: the first closing mark ends the comment
+    initLexer("/* a /* b */ select");
+    assert(scanToken().type == TOKEN_SELECT);
+    assert(scanToken().type == TOKEN_EOF);
+}
+
+void test_scan_unterminated_block_comment() {
+    // a comment that is never closed runs to the end of the input
+    initLexer("select /* never closed\nfrom");
+    assert(scanToken().type == TOKEN_SELECT);
+    assert(scanToken().type == TOKEN_EOF);
+}
+
+void test_scan_slash_is_still_division() {
+    // a slash that doesn't open a comment is a token, even right after one closes
+    initLexer("8 / 2 /* halve again */ / 2 /* then triple */* 3");
+    assert(scanToken().type == TOKEN_NUMBER);
+    assert(scanToken().type == TOKEN_SLASH);
+    assert(scanToken().type == TOKEN_NUMBER);
+    assert(scanToken().type == TOKEN_SLASH);
+    assert(scanToken().type == TOKEN_NUMBER);
+    assert(scanToken().type == TOKEN_STAR);
+    assert(scanToken().type == TOKEN_NUMBER);
+    assert(scanToken().type == TOKEN_EOF);
+}
+
 void test_scan_line_tracking() {
     initLexer("select\nfrom\ntable");
     token t;
@@ -920,6 +966,9 @@ void test_lexer() {
     test_scan_unterminated_string();
     test_scan_skips_whitespace();
     test_scan_skips_comment();
+    test_scan_skips_block_comment();
+    test_scan_unterminated_block_comment();
+    test_scan_slash_is_still_division();
     test_scan_line_tracking();
     test_init_tokenized();
     test_add_token_count();
@@ -1637,6 +1686,21 @@ void test_interpret_errors_halt_statements(void) {
     remove(schema_path());
 }
 
+void test_interpret_block_comments(void) {
+    // a block comment can go anywhere whitespace can, including inside an
+    // expression, and a statement that is only a comment does nothing
+    remove(schema_path());
+    remove(TABLE_DIRECTORY "bc.tbl");
+    assert(interpret("create table bc (id int primary key, v int)").ir == INTERPRET_OK);
+    assert(interpret("insert /* a row */ into bc values (1, /* v */ 8)").ir == INTERPRET_OK);
+    result_buffer r = interpret("/* halve it */ select v /* by two */ / 2 from bc /* every row */");
+    assert(r.ir == INTERPRET_OK && r.count == 1 && r.rows[0][0].as.integer == 4);
+    assert(interpret("/* nothing but a comment */").ir == INTERPRET_OK);
+    assert(interpret("select v from bc /* never closed").ir == INTERPRET_OK);
+    assert(interpret("drop table bc").ir == INTERPRET_OK);
+    remove(schema_path());
+}
+
 void test_interpret_ordering_comparisons(void) {
     // <, <=, > and >= compare their left operand against their right one,
     // whichever side the column is on (they once ran with the two swapped,
@@ -1747,6 +1811,7 @@ void test_vm(void) {
     test_interpret_select_projection_types();
     test_interpret_failed_statement_rolls_back();
     test_interpret_errors_halt_statements();
+    test_interpret_block_comments();
     test_interpret_ordering_comparisons();
     test_interpret_filtered_delete();
     printf("All VM tests passed.\n");
