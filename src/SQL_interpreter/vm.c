@@ -732,16 +732,21 @@ static interpret_result run() {
 				}
 				ordering_key ik = pkToOk(pk);
 				sp_record r = { .entries = entries, .len = count, .size = totalSize };
-				if (searchRecord(ik, t)) {
+				int result = insertRecord(&r, ik, t);
+				if (result == 1) {
 					printf("Error: a row with primary key ");
 					printPK(pk);
 					printf(" already exists\n");
 					vm.failed = true;
-				} else if (!insertRecord(&r, ik, t)) {
+				} else if (result == 2) {
 					printf("Error: failed to insert the row with primary key ");
 					printPK(pk);
 					printf(" (page full)\n");
 					vm.failed = true;
+				}
+				// when insertRecord fails, the data is never freed
+				if (result != 0) {
+					for (int i = 0; i < count; i++) free(entries[i].data);
 				}
 				free(entries);  // page owns the data pointers; release only the metadata array
 				break;

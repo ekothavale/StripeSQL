@@ -961,16 +961,27 @@ bool findAndDelete(page_num pageNum, table* t) {
 	return false;
 }
 
-bool insertRecord(sp_record* record, ordering_key key, table* t) {
+// 0 = inserted, 1 = key already exists, 2 = failed
+int insertRecord(sp_record* record, ordering_key key, table* t) {
+	// find the right page and create it if necessary
 	address addr = findAndInsert(key.pageNum, t);
+	if (!addr) return 2;
+	// read the page in from disk
 	slotted_page p = {0};
-	if (!readPage(addr, &p, t)) return false;
+	if (!readPage(addr, &p, t)) return 2;
+	// if record already exists, reject insertion
+	if (SPSearch(&p, key.offset) >= 0) { freeSPage(&p); return 1; }
+	// else, insert the row and return its success
 	bool out = SPInsert(&p, key.offset, *record);
 	if (out) markPage(addr, &p, t);
 	freeSPage(&p);
-	return out;
+	return out ? 0 : 2;
 }
 
+/*
+searches a table for a record
+returns whether the record was found in the table
+*/
 bool searchRecord(ordering_key key, table* t) {
 	address addr = findPage(key.pageNum, t);
 	if (!addr) return false;

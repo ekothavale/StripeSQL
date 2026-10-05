@@ -56,7 +56,7 @@ def median(xs):
 
 def table(header, rows):
     print("| " + " | ".join(header) + " |")
-    print("|" + "|".join("---" for _ in header) + "|")
+    print("|" + "|".join("-"*(len(_)+2) for _ in header) + "|")
     for row in rows:
         print("| " + " | ".join(row) + " |")
     print(flush=True)
