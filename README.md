@@ -111,7 +111,7 @@ A SQL query moves through five stages before touching the disk:
 - A write failure before the commit point aborts the transaction with a runtime error. A failure after it, when the commit is already in the log but a table may be half-written, exits with code `74`, and recovery completes the commit on the next startup. Failures are never retried.
 
 **Filtering and Expressions**
-- `WHERE` clause with `=`, `!=`, `<`, `<=`, `>`, `>=` (the four ordering comparisons currently run with their operands swapped; see Known Issues)
+- `WHERE` clause with `=`, `!=`, `<`, `<=`, `>`, `>=`
 - `AND`, `OR`, `NOT` logical operators with correct precedence
 - `LIKE` pattern matching
 - `IS NULL` and `IS NOT NULL`
@@ -126,7 +126,7 @@ A SQL query moves through five stages before touching the disk:
 **Execution Modes**
 - Interactive REPL (`./main`)
 - Batch file execution (`./main file.sql`) supporting multiple semicolon-delimited statements
-- Single-line comments (`-- ...`) and block comments (`/* ... */`) in SQL files
+- Single-line comments (`-- ...`) in SQL files; block comments (`/* ... */`) aren't supported yet (see Known Issues)
 - One process at a time: StripeSQL holds an exclusive lock on `tables/stripe.lock` for as long as it runs; a second process exits with code `75`. The OS releases the lock when the process exits, even after a crash
 
 ---
@@ -147,14 +147,13 @@ The following features are next on the todo list, roughly in priority order:
 
 | # | Description |
 |---|-------------|
-| 1 | `<`, `<=`, `>`, and `>=` are evaluated with their operands swapped, so `WHERE v > 2` matches the rows where `v < 2`. This affects `SELECT`, `UPDATE`, and `DELETE` alike; `=`, `!=`, and arithmetic are correct. |
-| 2 | `ORDER BY`, `LIMIT`, and `SELECT DISTINCT` are parsed but have no effect on the result. |
-| 3 | `INSERT` ignores its column list: `INSERT INTO t (b, a) VALUES (2, 1)` assigns the values in the order the columns were declared in `CREATE TABLE`. `SELECT` returns columns in the order they're listed. |
+| 1 | `ORDER BY`, `LIMIT`, and `SELECT DISTINCT` are parsed but have no effect on the result. |
+| 2 | `INSERT` ignores its column list: `INSERT INTO t (b, a) VALUES (2, 1)` assigns the values in the order the columns were declared in `CREATE TABLE`. `SELECT` returns columns in the order they're listed. |
+| 3 | Block comments (`/* ... */`) aren't supported: the lexer doesn't skip them, so a statement or SQL file that contains one fails with a syntax error. Line comments (`-- ...`) work. |
 | 4 | `readNode` and `readPage` report a failed read or a damaged page or node, but most of their callers — the B+ tree's descents and rebalancing in particular — ignore the result, so an I/O error partway through a statement doesn't fail the statement. |
 | 5 | Most syntax errors call `exit()`, which also ends a REPL session. A transaction open at that point is lost without a `DISCARD`; nothing it changed was written to disk, so the tables are unharmed. |
-| 6 | `DELETE ... WHERE pk = value` prints `Error: attempted to read page at address 0 but page was invalid` after it removes the row. The message is spurious: the row is deleted and the statement succeeds. |
-| 7 | There is no page overflow policy — if enough records collide onto the same physical page, insertion becomes impossible until the page is emptied. Primary-key dispersion (both integer and text keys use a reversible bit/byte-reversal transform before bucketing) makes this rare in practice, and a failed insert now reports an error rather than silently dropping the row, but no page-split or overflow-chain mechanism exists yet. |
-| 8 | Power loss on macOS: with the default `FULL_FSYNC 0`, a plain `fsync` leaves data in the drive's cache, which the drive may also reorder, so recently committed transactions are only guaranteed to survive a process or OS crash. Set `FULL_FSYNC 1` in `const.h` to survive power loss (at about 3 ms per sync). |
+| 6 | There is no page overflow policy — if enough records collide onto the same physical page, insertion becomes impossible until the page is emptied. Primary-key dispersion (both integer and text keys use a reversible bit/byte-reversal transform before bucketing) makes this rare in practice, and a failed insert now reports an error rather than silently dropping the row, but no page-split or overflow-chain mechanism exists yet. |
+| 7 | Power loss on macOS: with the default `FULL_FSYNC 0`, a plain `fsync` leaves data in the drive's cache, which the drive may also reorder, so recently committed transactions are only guaranteed to survive a process or OS crash. Set `FULL_FSYNC 1` in `const.h` to survive power loss (at about 3 ms per sync). |
 
 ---
 
@@ -371,8 +370,8 @@ make coverage-full   # coverage report for both test suites (macOS only, under a
 
 | Suite | Source | Covers |
 |-------|--------|--------|
-| Storage engine | `src/storage_engine/testing.c` | Slotted pages; table files, headers, and dirty hashmaps; creating, loading, and deleting tables; B+ tree search, splits, deletion, borrowing, and merging; the process lock; the write-ahead log and crash recovery, including a forked process whose commit fails after the commit point |
-| SQL interpreter | `src/SQL_interpreter/testing.c` | Bytecode chunks, values, the lexer, the parser, the schema hashtable and file, the bytecode generator, the VM, and whole statements run through `interpret()`: result types, statement rollback, and errors halting statements |
+| Storage engine | `src/storage_engine/testing.c` | Slotted pages; table files, headers, and dirty hashmaps; creating, loading, and deleting tables; B+ tree search, splits, deletion, borrowing, and merging, with the whole tree's structure checked while pages are deleted in order, from the middle, and at random from a three-level tree; the process lock; the write-ahead log and crash recovery, including a forked process whose commit fails after the commit point |
+| SQL interpreter | `src/SQL_interpreter/testing.c` | Bytecode chunks, values, the lexer, the parser, the schema hashtable and file, the bytecode generator, the VM, and whole statements run through `interpret()`: result types, comparison operators, deletes with a `WHERE` clause, statement rollback, and errors halting statements |
 | Crash recovery | `crashtest/` | The built binary end to end, killed just before every file write and `fsync` of a commit (see *Crash-recovery test* under Usage) |
 
 ### Coverage
@@ -381,11 +380,11 @@ Measured with clang's source-based coverage (`-fprofile-instr-generate -fcoverag
 
 | Tests | Lines | Functions | Branches |
 |-------|------:|----------:|---------:|
-| Unit tests (`make coverage`) | 72.2% | 87.5% | 61.7% |
-| Crash-recovery test alone | 56.1% | 75.6% | 45.7% |
-| Both (`make coverage-full`) | **73.0%** | **88.1%** | **62.7%** |
+| Unit tests (`make coverage`) | 78.2% | 89.7% | 68.5% |
+| Crash-recovery test alone | 55.9% | 75.6% | 45.7% |
+| Both (`make coverage-full`) | **77.7%** | **89.7%** | **68.0%** |
 
-The unit-test row covers every file except `main.c`, which the unit tests don't link; the other two rows include it. `debug.c`, the bytecode disassembler and execution tracer used only in debug builds, never runs. Without it, both suites together cover 77% of lines and 93% of functions.
+The unit-test row covers every file except `main.c`, which the unit tests don't link; the other two rows include it. `debug.c`, the bytecode disassembler and execution tracer used only in debug builds, never runs. Without it, both suites together cover 82% of lines and 95% of functions.
 
 <details>
 <summary>Per-file coverage (both suites)</summary>
@@ -393,16 +392,16 @@ The unit-test row covers every file except `main.c`, which the unit tests don't 
 | File | Lines | Functions | Branches |
 |------|------:|----------:|---------:|
 | `SQL_interpreter/chunk.c` | 100.0% | 100.0% | 100.0% |
-| `SQL_interpreter/generator.c` | 73.4% | 100.0% | 65.6% |
-| `SQL_interpreter/lexer.c` | 84.8% | 100.0% | 79.6% |
-| `SQL_interpreter/parser.c` | 77.4% | 97.7% | 71.3% |
+| `SQL_interpreter/generator.c` | 76.9% | 100.0% | 68.4% |
+| `SQL_interpreter/lexer.c` | 85.4% | 100.0% | 80.4% |
+| `SQL_interpreter/parser.c` | 77.4% | 97.7% | 73.2% |
 | `SQL_interpreter/schema.c` | 92.8% | 100.0% | 83.3% |
-| `SQL_interpreter/vm.c` | 71.1% | 88.9% | 55.7% |
-| `storage_engine/bplus.c` | 66.0% | 78.9% | 53.8% |
+| `SQL_interpreter/vm.c` | 75.5% | 96.3% | 62.7% |
+| `storage_engine/bplus.c` | 88.6% | 86.8% | 79.4% |
 | `storage_engine/file.c` | 94.3% | 100.0% | 75.0% |
 | `storage_engine/ordering.c` | 64.1% | 88.9% | 55.2% |
 | `storage_engine/page.c` | 86.4% | 100.0% | 78.6% |
-| `storage_engine/tableIO.c` | 86.4% | 94.7% | 72.0% |
+| `storage_engine/tableIO.c` | 88.2% | 94.7% | 75.7% |
 | `storage_engine/wal.c` | 97.1% | 100.0% | 69.6% |
 | `main.c` | 50.2% | 85.7% | 44.9% |
 | `memory.c` | 75.0% | 100.0% | 75.0% |
@@ -412,9 +411,8 @@ The unit-test row covers every file except `main.c`, which the unit tests don't 
 </details>
 
 The main gaps:
-- **Filtering on non-key columns.** The VM's `=`, `<`, and `LIKE` comparisons (`equal`, `lessThan`, `likeMatch`) never run; the tests filter only through primary-key lookups and one `>` comparison.
+- **`LIKE`.** `likeMatch` never runs; the other comparison operators are tested on key and non-key columns.
 - **The REPL** (`repl()` in `main.c`).
-- **Some B+ tree delete rebalancing:** `borrowPrev`, `borrowNextThroughParent`, and `borrowPrevThroughParent`.
 - **Floating-point primary keys** (`doubleToBits` in `ordering.c`).
 - **Code with no callers**, which no test can reach: `readRecord`, `updateRecord`, and `searchRecord` in `bplus.c`, `loadPrev`/`loadNext` and the garbage-collection stubs `moveNode`/`movePage` in `tableIO.c`, plus `getSQLType`/`encodeSQLType` in `value.c`.
 
