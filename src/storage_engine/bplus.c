@@ -472,7 +472,9 @@ static address mergeNode(node* n, address addr, table* t) {
 	// setup node pointers
 	node* survivor = n;
 	address survAddr = addr;
-	node* source = calloc(1, sizeof(node));
+	// source points at this buffer or at n, which belongs to the caller, so the buffer is freed by its own name
+	node* sourceBuf = calloc(1, sizeof(node));
+	node* source = sourceBuf;
 	address sourceAddr;
 	node* prev = calloc(1, sizeof(node));
 	// some operations differ whether n is a leaf node or not
@@ -574,7 +576,7 @@ static address mergeNode(node* n, address addr, table* t) {
 		markNode(n->parent, parent, t);
 	}
 	// clean up and return
-	free(source);
+	free(sourceBuf);
 	free(prev);
 	free(parent);
 	return survAddr;
@@ -604,18 +606,18 @@ static void borrowNext(node* n, address nAddr, node* next, address nextAddr, tab
 	shiftPageNumArrayL(next->keys, 0, M_GLOBAL);
 	markNode(nAddr, n, t);
 	markNode(nextAddr, next, t);
-	// update parent
+	// the borrowed key is n's new largest, so it becomes n's separator in the parent. n is found by
+	// address: comparing keys would pick the first child's separator whenever n isn't the first child
 	node parent = {0};
 	loadParent(n, &parent, t);
-	page_num borrowed = n->keys[n->childCount-1];
-	for (int i = 0; i < parent.childCount; i++) {
-		if (comparePageNums(borrowed, parent.keys[i]) > 0) {
-			parent.keys[i] = borrowed;
+	for (int i = 0; i < (int)parent.childCount - 1; i++) {
+		if (parent.children[i] == nAddr) {
+			parent.keys[i] = n->maxKey;
 			markNode(n->parent, &parent, t);
 			return;
 		}
 	}
-	printf("Error: Function borrowNext() borrowed a key from next that was less than a key from n\n");
+	printf("Error: Function borrowNext() couldn't find the borrowing node in its parent\n");
 	return;
 
 }
@@ -637,17 +639,18 @@ static void borrowPrev(node* n, address nAddr, node* prev, address prevAddr, tab
 	n->childCount++;
 	markNode(nAddr, n, t);
 	markNode(prevAddr, prev, t);
-	// update parent
+	// prev's separator in the parent shrinks to its new largest key. prev is found by address: its
+	// separator can be larger than the key it just gave up, if its largest page was deleted earlier
 	node parent = {0};
 	loadParent(n, &parent, t);
-	page_num borrowed = n->keys[0];
-	for (int i = 0; i < parent.childCount; i++) {
-		if (comparePageNums(borrowed, parent.keys[i]) == 0) {
-			parent.keys[i] = prev->keys[prev->childCount-1];
+	for (int i = 0; i < (int)parent.childCount - 1; i++) {
+		if (parent.children[i] == prevAddr) {
+			parent.keys[i] = prev->maxKey;
 			markNode(n->parent, &parent, t);
 			return;
 		}
 	}
+	printf("Error: Function borrowPrev() couldn't find the lending node in its parent\n");
 }
 
 /*
@@ -693,6 +696,7 @@ static void borrowPrevThroughParent(node* n, address nAddr, node* prev, address 
 			prev->childCount--;
 			address borrowedAddr = prev->children[prev->childCount];
 			n->children[0] = borrowedAddr;
+			n->childCount++;
 			parent.keys[i-1] = prev->keys[prev->childCount-1];
 			// prev just lost its highest child, so its own maxKey must shrink
 			prev->maxKey = prev->keys[prev->childCount-1];
@@ -776,16 +780,18 @@ static address balanceTreeDelete(node* n, address addr, table* t) {
 
 /*
 Deletes a page from a node
+@param nAddr - the node's address. Rebalancing can merge the node into a sibling first, so on return
+               this holds the address of the leaf the page was removed from, and n holds that leaf
 @return - whether the page was successfully deleted or not
 */
-static bool deletePage(node* n, address nAddr, page_num pageNum, table* t)  {
+static bool deletePage(node* n, address* nAddr, page_num pageNum, table* t)  {
 	if (!n->isLeaf) {
 		printf("Error: Tried to delete page in inner node\n");
 		return false;
 	}
 	if (n->childCount == HALF_M && !isRoot(n)) {
-		nAddr = balanceTreeDelete(n, nAddr, t);
-		readNode(nAddr, n, t);
+		*nAddr = balanceTreeDelete(n, *nAddr, t);
+		readNode(*nAddr, n, t);
 	}
 	// search for page in node's children
 	for (int i = 0; i < n->childCount; i++) {
@@ -794,8 +800,8 @@ static bool deletePage(node* n, address nAddr, page_num pageNum, table* t)  {
 			shiftPageNumArrayL(n->keys, i, M_GLOBAL);
 			shiftAddressArrayL(n->children, i, M_GLOBAL);
 			n->childCount--;
-			if (i == n->childCount) n->maxKey = n->keys[n->childCount-1];
-			markNode(nAddr, n, t);
+			if (i == n->childCount && n->childCount > 0) n->maxKey = n->keys[n->childCount-1];
+			markNode(*nAddr, n, t);
 			return true;
 		}
 	}
@@ -955,7 +961,7 @@ bool findAndDelete(page_num pageNum, table* t) {
     for (int i = 0; i < cur.childCount; i++) {
         page_num key = cur.keys[i];
         if (comparePageNums(key, pageNum) == 0) {
-            return deletePage(&cur, nAddr, pageNum, t);
+            return deletePage(&cur, &nAddr, pageNum, t);
 		}
     }
 	return false;
@@ -1017,19 +1023,24 @@ bool updateRecord(sp_record* record, ordering_key key, table* t) {
 /*
 Deletes a record from the B+ tree.
 page is a caller-provided buffer; on return it holds the post-deletion state of the page.
+@param leafOut - set to the address of the leaf that holds the record's page, or held it if the page
+                 was emptied and removed. Removing a page can rebalance the tree, so this may not be
+                 the leaf the page was in before the call. Set to 0 if the page isn't in the tree
 @return true if the record was deleted or did not exist; false on failure.
 */
-bool deleteRecord(ordering_key key, table* t, slotted_page* page) {
+bool deleteRecord(ordering_key key, table* t, slotted_page* page, address* leafOut) {
 	address leafAddr = 0;
 	address addr = findPageAndLeaf(key.pageNum, t, &leafAddr);
+	*leafOut = leafAddr;
 	if (!addr) return true;
 	if (!readPage(addr, page, t)) return false;
 	bool out = SPDelete(page, key.offset);
 	if (!out) return false;
 	if (page->header.numRecords == 0) {
 		node leaf = {0};
-		readNode(leafAddr, &leaf, t);
-		deletePage(&leaf, leafAddr, key.pageNum, t);
+		if (!readNode(leafAddr, &leaf, t)) return false;
+		if (!deletePage(&leaf, &leafAddr, key.pageNum, t)) return false;
+		*leafOut = leafAddr;
 	} else {
 		markPage(addr, page, t);
 	}

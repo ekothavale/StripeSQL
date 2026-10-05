@@ -1742,6 +1742,203 @@ void test_btree_delete_triggers_merge(void) {
     printf("PASS\n");
 }
 
+// ── Group 5b: rebalancing anywhere in the tree ────────────────────────────
+
+/*
+Asserts the structural invariants of the subtree rooted at addr and returns how many pages it
+holds: every node points back at its parent, is at least half full unless it's the root, keeps its
+page numbers in order, and sits within the separator keys above it. lo is the largest page number
+to the left of this subtree (hasLo is false when there is none); *maxOut receives the largest page
+number in it.
+*/
+static uint32_t check_subtree(table* t, address addr, address parent, bool hasLo, page_num lo, page_num* maxOut) {
+    node n = {0};
+    assert(readNode(addr, &n, t));
+    assert(n.parent == parent);
+    assert(n.childCount >= 1 && n.childCount <= M_GLOBAL);
+    if (parent) assert(n.childCount >= HALF_M);
+    uint32_t pages = 0;
+    for (uint32_t i = 0; i < n.childCount; i++) {
+        assert(n.children[i] != 0);
+        if (n.isLeaf) {
+            if (hasLo) assert(comparePageNums(n.keys[i], lo) > 0);
+            lo = n.keys[i];
+            pages++;
+        } else {
+            page_num childMax;
+            pages += check_subtree(t, n.children[i], addr, hasLo, lo, &childMax);
+            // a separator key is an upper bound for everything under the child before it
+            if (i < n.childCount - 1) assert(comparePageNums(childMax, n.keys[i]) <= 0);
+            lo = (i < n.childCount - 1) ? n.keys[i] : childMax;
+        }
+        hasLo = true;
+    }
+    *maxOut = lo;
+    return pages;
+}
+
+/*
+Asserts that the tree holds exactly the pages marked in present[1..maxPage]: each can be found by
+key and no other can, the tree's structure is sound, and the leaves' linked list visits the same
+pages in order.
+*/
+static void check_tree(table* t, const bool* present, uint32_t maxPage) {
+    uint32_t expected = 0;
+    for (uint32_t k = 1; k <= maxPage; k++) expected += present[k];
+    node n = {0};
+    assert(readNode(t->root, &n, t));
+    if (expected == 0) {  // an empty tree is a root leaf with no pages
+        assert(n.isLeaf && n.childCount == 0);
+        return;
+    }
+    for (uint32_t k = 1; k <= maxPage; k++)
+        assert((findPage(pn(k), t) != 0) == present[k]);
+    page_num max;
+    assert(check_subtree(t, t->root, 0, false, pn(0), &max) == expected);
+
+    address addr = t->root;
+    while (!n.isLeaf) {
+        addr = n.children[0];
+        assert(readNode(addr, &n, t));
+    }
+    uint32_t seen = 0;
+    uint64_t last = 0;
+    address prevAddr = 0;
+    for (;;) {
+        assert(n.prev == prevAddr);
+        for (uint32_t i = 0; i < n.childCount; i++) {
+            uint64_t k = n.keys[i].as.u64;
+            assert(k > last && k <= maxPage && present[k]);
+            last = k;
+            seen++;
+        }
+        if (!n.next) break;
+        prevAddr = addr;
+        addr = n.next;
+        assert(readNode(addr, &n, t));
+    }
+    assert(seen == expected);
+}
+
+/* Returns a tree holding pages 1..count, and marks them in present. */
+static table* create_big_tree(char* name, uint32_t count, bool* present) {
+    table* t = createTree(name, pn(1));
+    assert(t != NULL);
+    insert_pages(t, 2, count - 1);
+    for (uint32_t k = 1; k <= count; k++) present[k] = true;
+    return t;
+}
+
+/* Deletes the pages listed in order, checking the whole tree after every checkEvery deletions. */
+static void delete_and_check(table* t, bool* present, uint32_t maxPage, const uint32_t* order, uint32_t count, uint32_t checkEvery) {
+    for (uint32_t i = 0; i < count; i++) {
+        assert(findAndDelete(pn(order[i]), t));
+        present[order[i]] = false;
+        if ((i + 1) % checkEvery == 0 || i + 1 == count) check_tree(t, present, maxPage);
+    }
+}
+
+/* A small deterministic generator, so the random tests run the same way everywhere. */
+static uint32_t test_rand(uint32_t* state) {
+    *state = *state * 1664525u + 1013904223u;
+    return *state >> 8;
+}
+
+static void shuffle(uint32_t* a, uint32_t count, uint32_t* state) {
+    for (uint32_t i = count - 1; i > 0; i--) {
+        uint32_t j = test_rand(state) % (i + 1);
+        uint32_t tmp = a[i]; a[i] = a[j]; a[j] = tmp;
+    }
+}
+
+#define REBALANCE_PAGES (6 * M_GLOBAL)
+
+/*
+Deleting from the last leaf backwards makes every rebalance borrow from, or merge into, the
+previous leaf, which deleting from the front of the tree never does.
+*/
+void test_btree_delete_from_the_end(void) {
+    printf("  test_btree_delete_from_the_end ... ");
+    bool present[REBALANCE_PAGES + 1] = {0};
+    uint32_t order[REBALANCE_PAGES];
+    table* t = create_big_tree("bt_dfe", REBALANCE_PAGES, present);
+    check_tree(t, present, REBALANCE_PAGES);
+    for (uint32_t i = 0; i < REBALANCE_PAGES; i++) order[i] = REBALANCE_PAGES - i;
+    delete_and_check(t, present, REBALANCE_PAGES, order, REBALANCE_PAGES, 1);
+    deleteTree(t);
+    printf("PASS\n");
+}
+
+/*
+Deleting outwards from the middle rebalances leaves that have siblings on both sides, so a leaf
+that isn't its parent's first child borrows from the next one.
+*/
+void test_btree_delete_from_the_middle(void) {
+    printf("  test_btree_delete_from_the_middle ... ");
+    bool present[REBALANCE_PAGES + 1] = {0};
+    uint32_t order[REBALANCE_PAGES];
+    table* t = create_big_tree("bt_dfm", REBALANCE_PAGES, present);
+    uint32_t lo = REBALANCE_PAGES / 2, hi = lo + 1;
+    for (uint32_t i = 0; i < REBALANCE_PAGES; i++) order[i] = (i % 2 == 0) ? hi++ : lo--;
+    delete_and_check(t, present, REBALANCE_PAGES, order, REBALANCE_PAGES, 1);
+    deleteTree(t);
+    printf("PASS\n");
+}
+
+/* Deleting every other page, then the rest, thins every leaf at once. */
+void test_btree_delete_alternating(void) {
+    printf("  test_btree_delete_alternating ... ");
+    bool present[REBALANCE_PAGES + 1] = {0};
+    uint32_t order[REBALANCE_PAGES];
+    table* t = create_big_tree("bt_dalt", REBALANCE_PAGES, present);
+    uint32_t count = 0;
+    for (uint32_t k = 2; k <= REBALANCE_PAGES; k += 2) order[count++] = k;
+    for (uint32_t k = 1; k <= REBALANCE_PAGES; k += 2) order[count++] = k;
+    delete_and_check(t, present, REBALANCE_PAGES, order, REBALANCE_PAGES, 1);
+    deleteTree(t);
+    printf("PASS\n");
+}
+
+#define DEEP_PAGES (50 * M_GLOBAL)
+
+/*
+A tree three levels deep is deleted from in random order, refilled, and emptied again, so internal
+nodes borrow through their parent and merge as well as leaves.
+*/
+void test_btree_delete_random_deep(void) {
+    printf("  test_btree_delete_random_deep ... ");
+    bool* present = calloc(DEEP_PAGES + 1, sizeof(bool));
+    uint32_t* order = malloc(DEEP_PAGES * sizeof(uint32_t));
+    table* t = create_big_tree("bt_drd", DEEP_PAGES, present);
+    node root = {0}, child = {0};
+    readNode(t->root, &root, t);
+    readNode(root.children[0], &child, t);
+    assert(!root.isLeaf && !child.isLeaf);  // three levels
+    check_tree(t, present, DEEP_PAGES);
+
+    uint32_t state = 12345;
+    for (uint32_t i = 0; i < DEEP_PAGES; i++) order[i] = i + 1;
+    shuffle(order, DEEP_PAGES, &state);
+    uint32_t most = DEEP_PAGES * 9 / 10;
+    delete_and_check(t, present, DEEP_PAGES, order, most, 16);
+    // put them back in a different order
+    shuffle(order, most, &state);
+    for (uint32_t i = 0; i < most; i++) {
+        findAndInsert(pn(order[i]), t);
+        present[order[i]] = true;
+        if ((i + 1) % 64 == 0 || i + 1 == most) check_tree(t, present, DEEP_PAGES);
+    }
+    // and empty the tree
+    for (uint32_t i = 0; i < DEEP_PAGES; i++) order[i] = i + 1;
+    shuffle(order, DEEP_PAGES, &state);
+    delete_and_check(t, present, DEEP_PAGES, order, DEEP_PAGES, 16);
+
+    deleteTree(t);
+    free(present);
+    free(order);
+    printf("PASS\n");
+}
+
 // ── Group 6: full persistence roundtrip ───────────────────────────────────
 
 /*
@@ -1832,6 +2029,10 @@ void test_btree(void) {
     test_btree_delete_page();
     test_btree_delete_triggers_borrow();
     test_btree_delete_triggers_merge();
+    test_btree_delete_from_the_end();
+    test_btree_delete_from_the_middle();
+    test_btree_delete_alternating();
+    test_btree_delete_random_deep();
     // full persistence roundtrip
     test_btree_full_roundtrip();
     // cleanup

@@ -779,17 +779,26 @@ static interpret_result run() {
 				ordering_key ik = { .pageNum = s->page.header.pageNum, .offset = s->page.slots[s->slotIdx].ID };
 				freeSPage(&s->page);
 				s->page = (slotted_page){0};
-				if (!deleteRecord(ik, t, &s->page)) {
+				address leafAddr = 0;
+				// the scanner is on this row, so its page must be in the tree
+				if (!deleteRecord(ik, t, &s->page, &leafAddr) || !leafAddr) {
 					statementError("Error: failed to delete a row\n");
 					break;
 				}
 				if (s->page.header.numRecords == 0) {
-					s->childIdx = (s->childIdx > 0) ? s->childIdx - 1 : (uint32_t)(-1);
-					// deleteRecord()'s rebalancing (borrow/merge) can modify nodes
-					// elsewhere in the tree, including our own current leaf out from
-					// under us. Re-sync from our own address rather than assume our
-					// cached leafNode is still accurate.
-					readNode(s->leafAddr, &s->leafNode, t);
+					// the row's page was removed from the tree. deleteRecord()'s rebalancing
+					// (borrow/merge) can shift the pages within the scanner's leaf, or merge
+					// that leaf into another, so neither the scanner's leaf address nor its
+					// index can be trusted. Find the position again by key: in the leaf the
+					// page was removed from, just before the first page past the deleted one.
+					s->leafAddr = leafAddr;
+					if (!readNode(s->leafAddr, &s->leafNode, t)) {
+						statementError("Error: scanner could not read node at address %llu; tree may be corrupt\n", s->leafAddr);
+						break;
+					}
+					uint32_t next = 0;
+					while (next < s->leafNode.childCount && comparePageNums(s->leafNode.keys[next], ik.pageNum) <= 0) next++;
+					s->childIdx = next - 1; // advanceScanner() steps forward from here (-1 wraps to 0)
 				} else {
 					s->slotIdx = (s->slotIdx > 0) ? s->slotIdx - 1 : (uint32_t)(-1);
 				}
