@@ -26,6 +26,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 #include "vm.h"
 
 VM vm;
+static hashtable* schemaCache = NULL;
 
 /*
 Session-scoped transaction state. Deliberately kept outside the VM struct:
@@ -139,6 +140,16 @@ void freeVM() {
 		vm.results.rows  = NULL;
 		vm.results.count = 0;
 	}
+}
+
+/*
+reset the schema cache
+*/
+static void invalidateSchema() {
+	if (!schemaCache) return;
+	freeHashTable(schemaCache);
+	free(schemaCache);
+	schemaCache = NULL;
 }
 
 static bool tableAlreadyExists(const char* tablename) {
@@ -803,7 +814,9 @@ static interpret_result run() {
 					break;
 				}
 				page_num firstKey = { .type = getPkOrderingType(s) };
-				if (vm.failed) break;
+				if (vm.failed) {
+					break;
+				}
 				// the new table's file and its schema entry are committed together, so a crash can't
 				// leave one without the other
 				table* t = newTree(s->tablename, firstKey);
@@ -935,14 +948,18 @@ static void abortStatement(void) {
 }
 
 result_buffer interpret(const char* source) {
+	// load up database schema and initialize bytecode chunk
 	chunk c;
-	hashtable* schema = loadSchema();
-	if (!schema) {
+	if (!schemaCache) {
+		schemaCache = loadSchema();
+	}
+	if (!schemaCache) {
 		vm.results.ir = INTERPRET_LOAD_ERROR;
 		return vm.results;
 	}
-	initVM(schema);
+	initVM(schemaCache);
 	initChunk(&c);
+	// lex the query
 	tokenized t = lexQuery(source);
 	if (t.count == 1) { // return if there is no meaningful input TOKEN_EOF is automatic
 		vm.results.ir = INTERPRET_OK;
@@ -951,27 +968,33 @@ result_buffer interpret(const char* source) {
 		vm.results.ir = INTERPRET_COMPILE_ERROR;
 		return vm.results;
 	}
+	// parse the query into an AST
 	ast_node* root = compile(t);
 	freeTokenized(&t);
 	if (!root) {
 		vm.results.ir = INTERPRET_COMPILE_ERROR;
 		return vm.results;
 	}
-	if (!generate(root, &c, schema)) {
+	// determine whether the query is DDL so we can update the schema
+	ast_node* stmt = root->children[0];
+	bool ddl = stmt->type == TYPE_CREATE_STMT || stmt->type == TYPE_DROP_STMT;
+	// generate bytecode from the AST
+	if (!generate(root, &c, vm.schema)) {
 		freeAST(root);
+		if (ddl) invalidateSchema();
 		vm.results.ir = INTERPRET_COMPILE_ERROR;
 		return vm.results;
 	}
 	freeAST(root);
 
+	// run bytecode 
 	vm.chunk = &c;
 	vm.ip = vm.chunk->code;
 
 	vm.results.ir = run();
 	if (vm.results.ir == INTERPRET_RUNTIME_ERROR) abortStatement();
+	if (ddl) invalidateSchema();
 
-	freeHashTable(schema);
-	free(schema);
 	freeChunk(&c);
 	return vm.results;
 }
