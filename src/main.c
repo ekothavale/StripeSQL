@@ -137,8 +137,8 @@ static char* isolateQuery(int* start, int len, const char* source) {
                 if (PEEK() == '*') {
                     i++;
                     multiLineComment = true;
-                    break;
                 }
+                break; // a lone '/' is division; without this it fell through and ended the statement
             }
             case ';': {
                 if (singleQuote) continue;
