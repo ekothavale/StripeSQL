@@ -321,12 +321,12 @@ The same one-column table, sequential integer keys, and built-in timer (includin
 
 | Scenario | Autocommit | Single transaction |
 |----------|-----------:|-------------------:|
-| Build a 100,000-row table (keys 1–100,000) | 27.0 s (~3,700 inserts/s) | 3.70 s (~27,000 inserts/s) |
-| Add 10,000 rows to a 100,000-row table | 2.79 s (~3,600 inserts/s) | 0.34 s (~29,500 inserts/s) |
+| Build a 100,000-row table (keys 1–100,000) | 27.4 s (~3,700 inserts/s) | 2.86 s (~35,000 inserts/s) |
+| Add 10,000 rows to a 100,000-row table | 2.79 s (~3,600 inserts/s) | 0.42 s (~23,800 inserts/s) |
 
-- **Throughput falls as the table grows, but only inside transactions.** Compared with the 10,000-row runs above (~3,700 and ~38,000 inserts/s), autocommit is unchanged, since each insert is dominated by its own commit, which costs about the same at any table size. The transaction build loses a little under a third.
-- **The commit takes nearly all of a transaction's time.** In the 100,000-row build, about 90% of the time is the commit — writing every changed page and node to the log, which is over half of the run by itself, then to the table file (`make profile PROFILE=insert-txn`). Running the inserts themselves is most of the rest. Every pending page and node is held in memory until the commit, and the build's memory footprint peaks at about 3 GB (`/usr/bin/time -l`).
-- **Adding to an existing table in one transaction runs at about the build's rate** (~29,500 against ~27,000 inserts/s). Each insert reads the nodes on its path from disk until the transaction changes them, and sequential keys are spread across the tree (see Known Issues), so most inserts reach leaves that haven't been read yet; since a node comes off disk in a single read, those reads cost little. This is also the figure most sensitive to what else the machine is doing, since each trial first restores the 536 MB table from a snapshot and then reads from the fresh copy.
+- **Throughput barely falls as the table grows.** Compared with the 10,000-row runs above (~3,700 and ~38,000 inserts/s), autocommit is unchanged, since each insert is dominated by its own commit, which costs about the same at any table size, and the transaction build loses under 10%.
+- **The commit takes nearly all of a transaction's time.** In the 100,000-row build, about 97% of the time is the commit — writing every changed page and node to the log, which is about 60% of the run by itself, then to the table file (`make profile PROFILE=insert-txn`). Every pending page and node is held in memory until the commit, and the build's memory footprint peaks at about 1.6 GB (`/usr/bin/time -l`).
+- **Adding to an existing table in one transaction is slower per row than building one** (~23,800 against ~35,000 inserts/s). Each insert reads the nodes on its path from disk until the transaction changes them, and sequential keys are spread across the tree (see Known Issues), so most inserts reach leaves that haven't been read yet, where a build finds every node already in memory. This is also the figure most sensitive to what else the machine is doing, since each trial first restores the 536 MB table from a snapshot and then reads from the fresh copy.
 
 ### Comparison with SQLite
 
@@ -400,7 +400,7 @@ The unit-test row covers every file except `main.c`, which the unit tests don't 
 | `storage_engine/file.c` | 94.3% | 100.0% | 75.0% |
 | `storage_engine/ordering.c` | 64.1% | 88.9% | 55.2% |
 | `storage_engine/page.c` | 86.4% | 100.0% | 78.6% |
-| `storage_engine/tableIO.c` | 88.9% | 94.7% | 76.5% |
+| `storage_engine/tableIO.c` | 88.9% | 94.7% | 76.4% |
 | `storage_engine/wal.c` | 97.1% | 100.0% | 69.6% |
 | `main.c` | 50.9% | 85.7% | 43.1% |
 | `memory.c` | 75.0% | 100.0% | 75.0% |

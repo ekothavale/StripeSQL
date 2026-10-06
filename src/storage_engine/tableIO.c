@@ -174,6 +174,8 @@ static bool consumeNodeRaw(ubyte* buffer, address addr, table* t) {
 
 /*
 deep copies the contents of the source page into the target page
+the target gets newly allocated arrays, so a target that already holds a page must be released with
+freeSPage() first, or that page's arrays and data are leaked
 */
 static void copyPage(slotted_page* source, slotted_page* target) {
 	target->header = source->header;
@@ -583,13 +585,15 @@ bool deleteTable(table* t) {
 
 /*
 reads a page from an address into a chunk of memory
-@param: p - a slotted page to load the data from disk into
+@param: p - a slotted page to load the data from disk into. It must either be zeroed or hold a page from
+            an earlier readPage(), which this one replaces
 mallocs page entries, page slots, and page entry data
 */
 bool readPage(address addr, slotted_page* p, table* t) {
 	// checking dirty table
 	slotted_page* dirty = (slotted_page*)findAddrTable(addr, &t->pageDirty);
 	if (dirty) {
+		freeSPage(p); // a scanner reads one page after another into the same struct
 		copyPage(dirty, p);
 		return true;
 	}
@@ -1055,6 +1059,8 @@ void markPage(address address, slotted_page* p, table* t) {
 	rememberPage(address, t);
 	slotted_page* existing = (slotted_page*)findAddrTable(address, &t->pageDirty);
 	if (existing) {
+		if (existing == p) return; // p is the pending version itself
+		freeSPage(existing); // the pending version is replaced, not added to
 		copyPage(p, existing);
 		return;
 	}

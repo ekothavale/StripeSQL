@@ -16,6 +16,12 @@ DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
 
+// heap_in_use() needs the allocator's statistics on macOS. The header also defines a PAGE_SIZE of its
+// own, so it comes first and gives the name back for const.h to define
+#ifdef __APPLE__
+#include <malloc/malloc.h>
+#undef PAGE_SIZE
+#endif
 #include "testing.h"
 #include "wal.h"
 #include "file.h"
@@ -740,6 +746,67 @@ void test_page_roundtrip(void) {
     printf("PASS\n");
 }
 
+// AddressSanitizer holds freed memory back instead of reusing it, so under it the heap grows without a leak
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define HEAP_HELD_BACK
+#endif
+#endif
+
+/*
+Bytes the program has allocated right now. Only macOS can report it, and not under AddressSanitizer;
+otherwise this returns 0, so a test that compares two readings still runs but can't fail on them.
+*/
+static size_t heap_in_use(void) {
+#if defined(__APPLE__) && !defined(HEAP_HELD_BACK)
+    malloc_statistics_t stats;
+    malloc_zone_statistics(NULL, &stats);
+    return stats.size_in_use;
+#else
+    return 0;
+#endif
+}
+
+/*
+Marking a page that is already pending replaces its pending version, and reading a pending page into a
+struct that already holds a page replaces that page. Neither may leave the old one's arrays allocated.
+Both once did, which lost about 15 KB for every row inserted and every pending page a scan read.
+*/
+void test_page_remark_and_reread_free_old(void) {
+    printf("  test_page_remark_and_reread_free_old ... ");
+    table t = make_test_table();
+    slotted_page* p = makeSPage(pn(7), PAGE_NUM_SLOTS, PAGE_NUM_ENTRIES, PAGE_ARR_CAP);
+    entry e[2] = { make_entry("hello", T_STRING), make_entry("world", T_STRING) };
+    sp_record rec = make_sp_record(e, 2);
+    rec.size = e[0].size + e[1].size;
+    assert(SPInsert(p, po(1), rec));
+    address addr = allocPage(&t);
+    markPage(addr, p, &t);
+    slotted_page r = {0};
+    assert(readPage(addr, &r, &t));
+
+    size_t before = heap_in_use();
+    for (int i = 0; i < 1000; i++) {
+        markPage(addr, p, &t);
+        assert(readPage(addr, &r, &t));
+    }
+    size_t after = heap_in_use();
+    assert(after <= before + 256 * 1024);  // a thousand lost versions of each would be about 30 MB
+
+    // and the page read back is still the one that was marked
+    assert(t.pageDirty.count == 1);
+    assert(comparePageNums(r.header.pageNum, pn(7)) == 0);
+    assert(r.header.numRecords == 1 && r.header.numEntries == 2);
+    assert(strcmp((char*)r.entries[0].data, "hello") == 0 && strcmp((char*)r.entries[1].data, "world") == 0);
+
+    freeSPage(&r);
+    freeSPage(p);
+    free(p);
+    discard(&t);
+    free_test_table(&t);
+    printf("PASS\n");
+}
+
 /*
 Mark 3 pages, then call writeNextPage 3 times. The dirty table has no
 inherent order, so which page drains on which call is unspecified — this
@@ -930,6 +997,7 @@ void test_tableio(void) {
     test_page_write_empty_hashmap();
     test_page_roundtrip();
     test_page_write_drains_all();
+    test_page_remark_and_reread_free_old();
     // writeNextNode / readNode
     test_node_write_empty_hashmap();
     test_node_roundtrip();
