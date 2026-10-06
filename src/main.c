@@ -250,7 +250,10 @@ static void runFile(const char* path) {
     if (queriesProcessed > 0) printTime(&start, &end);
     // cleanup
     free(source);
-    if (exCode) exit(exCode);
+    if (exCode) {
+        closeTableCache();
+        exit(exCode);
+    }
 }
 
 int main(int argc, char** argv) {
@@ -292,5 +295,6 @@ int main(int argc, char** argv) {
     } else {
         printf("Usage: ./main [SQL file] [-d]\n");
     }
+    closeTableCache();
     return 0;
 }

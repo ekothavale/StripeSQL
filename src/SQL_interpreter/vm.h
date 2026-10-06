@@ -27,6 +27,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 #include "../storage_engine/scanner.h"
 
 #define STACK_MAX 256
+#define TABLE_CACHE_SIZE 16 // how many tables can stay open at once
 
 typedef enum {
 	INTERPRET_OK, // successful interpret but query did not request data
@@ -34,6 +35,18 @@ typedef enum {
 	INTERPRET_COMPILE_ERROR,
 	INTERPRET_RUNTIME_ERROR,
 } interpret_result;
+
+typedef struct table_cache_entry {
+	uint32_t tableNameHash;
+	table* tbl; // NULL when the slot is empty
+} table_cache_entry;
+
+// what the VM keeps loaded for the whole session instead of reading it again for every statement
+typedef struct resource_cache {
+	hashtable* schemaCache; // the schema; NULL until first used and after every CREATE/DROP TABLE
+	table_cache_entry resourceCache[TABLE_CACHE_SIZE]; // every open table
+	int tableCachePtr; // the slot whose table is closed next when the cache is full (FIFO)
+} resource_cache;
 
 typedef struct result_buffer {
 	value** rows; // each value carries its own runtime type
@@ -61,6 +74,7 @@ typedef struct VM {
 void initVM(hashtable* schema);
 void freeVM();
 result_buffer interpret(const char* source);
+void closeTableCache(void);
 void push(value value);
 value pop();
 

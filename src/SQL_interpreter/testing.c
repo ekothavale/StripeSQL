@@ -439,6 +439,28 @@ void test_insert_ht_overwrites() {
     freeHashTable(&t);
 }
 
+void test_insert_ht_many_entries() {
+    // the table grows as it fills, and every entry stays reachable however their
+    // hashes collide (probing by the square of the step used to reach only a few
+    // slots, and an insert never returned once those were all taken)
+    hashtable t;
+    initHashTable(&t);
+    char name[16];
+    for (int i = 0; i < 500; i++) {
+        snprintf(name, sizeof(name), "table%d", i);
+        schema s = make_schema(name, 1);
+        insertHT(&s, &t);
+    }
+    assert(t.count == 500);
+    for (int i = 0; i < 500; i++) {
+        snprintf(name, sizeof(name), "table%d", i);
+        schema* found = readHT(hashString(name, (int)strlen(name)), &t);
+        assert(found != NULL && strcmp(found->tablename, name) == 0);
+    }
+    assert(readHT(hashString("missing", 7), &t) == NULL);
+    freeHashTable(&t);
+}
+
 // --- readHT ---
 
 void test_read_ht_finds_existing() {
@@ -525,6 +547,7 @@ void test_hashtable() {
     test_insert_ht_stores_entry();
     test_insert_ht_increments_count();
     test_insert_ht_overwrites();
+    test_insert_ht_many_entries();
     test_read_ht_finds_existing();
     test_read_ht_missing();
     test_read_ht_correct_data();
@@ -1799,6 +1822,75 @@ void test_interpret_filtered_delete(void) {
     remove(schema_path());
 }
 
+/* asserts that table tc<n> holds exactly one row with this id, and that its v is the one given */
+static void check_tc(int n, int id, int64_t v) {
+    char sql[96];
+    snprintf(sql, sizeof(sql), "select v from tc%d where id = %d", n, id);
+    result_buffer r = interpret(sql);
+    assert(r.ir == INTERPRET_OK && r.count == 1 && r.rows[0][0].as.integer == v);
+}
+
+void test_interpret_table_cache(void) {
+    // tables stay open from one statement to the next, in a cache with a fixed
+    // number of slots. Every way a table leaves the cache or comes back to it
+    // must leave the table's contents exactly as the statements made them
+    remove(schema_path());
+    char sql[96];
+    int tables = TABLE_CACHE_SIZE + 4;  // more than the cache holds
+    for (int n = 0; n < tables; n++) {
+        snprintf(sql, sizeof(sql), "create table tc%d (id int primary key, v int)", n);
+        assert(interpret(sql).ir == INTERPRET_OK);
+        snprintf(sql, sizeof(sql), "insert into tc%d values (1, %d)", n, n);
+        assert(interpret(sql).ir == INTERPRET_OK);
+    }
+    // going round every table closes each one to make room and opens it again
+    for (int round = 1; round <= 2; round++) {
+        for (int n = 0; n < tables; n++) {
+            check_tc(n, 1, n + 1000 * (round - 1));
+            snprintf(sql, sizeof(sql), "update tc%d set v = %d where id = 1", n, n + 1000 * round);
+            assert(interpret(sql).ir == INTERPRET_OK);
+        }
+    }
+    // closing every table leaves the files as they were
+    closeTableCache();
+    for (int n = 0; n < tables; n++) check_tc(n, 1, n + 2000);
+
+    // a table that is dropped and created again is a new, empty table
+    check_tc(0, 1, 2000);  // tc0 is open
+    assert(interpret("drop table tc0").ir == INTERPRET_OK);
+    assert(interpret("create table tc0 (id int primary key, v int)").ir == INTERPRET_OK);
+    result_buffer empty = interpret("select id from tc0");
+    assert(empty.ir == INTERPRET_OK && empty.count == 0);
+    assert(interpret("insert into tc0 values (1, 7)").ir == INTERPRET_OK);
+    check_tc(0, 1, 7);
+
+    // a transaction holds an already-open table's changes until COMMIT, and DISCARD drops them
+    check_tc(1, 1, 2001);  // tc1 is open
+    assert(interpret("begin transaction").ir == INTERPRET_OK);
+    assert(interpret("insert into tc1 values (2, 2)").ir == INTERPRET_OK);
+    assert(interpret("discard").ir == INTERPRET_OK);
+    result_buffer gone = interpret("select v from tc1 where id = 2");
+    assert(gone.ir == INTERPRET_OK && gone.count == 0);
+    assert(interpret("begin transaction").ir == INTERPRET_OK);
+    assert(interpret("insert into tc1 values (3, 3)").ir == INTERPRET_OK);
+    assert(interpret("commit").ir == INTERPRET_OK);
+    check_tc(1, 3, 3);
+    check_tc(1, 1, 2001);
+
+    // a statement that fails leaves the table usable
+    assert(interpret("insert into tc1 values (3, 99)").ir == INTERPRET_RUNTIME_ERROR);  // duplicate key
+    check_tc(1, 3, 3);
+    assert(interpret("insert into tc1 values (4, 4)").ir == INTERPRET_OK);
+    check_tc(1, 4, 4);
+
+    for (int n = 0; n < tables; n++) {
+        snprintf(sql, sizeof(sql), "drop table tc%d", n);
+        assert(interpret(sql).ir == INTERPRET_OK);
+    }
+    closeTableCache();
+    remove(schema_path());
+}
+
 // --- master ---
 
 void test_vm(void) {
@@ -1814,6 +1906,7 @@ void test_vm(void) {
     test_interpret_block_comments();
     test_interpret_ordering_comparisons();
     test_interpret_filtered_delete();
+    test_interpret_table_cache();
     printf("All VM tests passed.\n");
 }
 

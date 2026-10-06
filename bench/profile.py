@@ -5,7 +5,8 @@ Profiles StripeSQL on the workloads behind the README benchmarks (macOS only).
 
 For each workload it attaches macOS `sample` to a running StripeSQL for the whole run (one sample
 per millisecond) and prints, for every function above 1%, the share of samples spent inside it,
-including everything it calls. It also reports the run's peak memory.
+including everything it calls. It also reports the run's peak resident memory, which is
+less than its footprint whenever macOS compresses memory (`/usr/bin/time -l` reports the footprint).
 
   lookup      20,000 primary-key lookups on a 10k-row table
   scan        20 full scans of a 10k-row table
@@ -129,7 +130,7 @@ def profile(name):
     _, _, usage = os.wait4(proc.pid, 0)
     inclusive = inclusive_times("sample.txt")
     total = max(inclusive.values())
-    print(f"### {name}: {total:,} samples (about {total / 1000:.1f} s), peak memory {usage.ru_maxrss / 1e6:,.0f} MB\n")
+    print(f"### {name}: {total:,} samples (about {total / 1000:.1f} s), peak resident memory {usage.ru_maxrss / 1e6:,.0f} MB\n")
     print("| Time | Samples | Function |")
     print("|-----:|--------:|----------|")
     for function, count in sorted(inclusive.items(), key=lambda kv: -kv[1]):

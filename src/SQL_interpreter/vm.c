@@ -25,17 +25,18 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 #include "schema.h"
 #include "vm.h"
 
-VM vm;
-static hashtable* schemaCache = NULL;
+static VM vm;
+static resource_cache cache = {0};
 
 /*
 Session-scoped transaction state. Deliberately kept outside the VM struct:
 initVM()/freeVM() run once per statement (every interpret() call), but a
 transaction spans multiple statements/interpret() calls, so its state must
-survive across them. Tables touched during an active transaction stay open
+survive across them. Tables touched during an active transaction are held
 here (dirty writes accumulating in their dirty hashmaps, see tableIO.c)
-instead of being committed and closed at the end of each statement; COMMIT
-or DISCARD is what finally closes them out.
+instead of being committed at the end of each statement; COMMIT or DISCARD
+is what finally settles them. The tables themselves belong to the table
+cache below, which keeps them open between statements either way.
 */
 #define MAX_TXN_TABLES MAX_SCANNERS
 
@@ -63,10 +64,12 @@ static table* findTxnTable(uint32_t tableHash) {
 }
 
 static void statementError(const char* format, ...);
+static bool tableInUse(table* t);
+static void evictTableCache(uint32_t tableNameHash);
 
 /*
-registers a freshly opened table handle with the active transaction so later
-statements in the same transaction reuse it instead of reloading from disk
+registers a table with the active transaction, so its changes stay uncommitted
+until COMMIT or DISCARD and later statements in the transaction find it here
 */
 static bool registerTxnTable(uint32_t tableHash, table* t) {
 	if (transaction.count >= MAX_TXN_TABLES) {
@@ -127,11 +130,11 @@ void initVM(hashtable* schema) {
 void freeVM() {
 	for (int i = 0; i < MAX_SCANNERS; i++) {
 		if (vm.scanners[i].open) {
-			commit(vm.scanners[i].tbl);
-			fclose(vm.scanners[i].tbl->source);
-			freeTable(vm.scanners[i].tbl);
+			table* t = vm.scanners[i].tbl;
+			bool committed = commit(t);
 			vm.scanners[i].tbl = NULL;
 			vm.scanners[i].open = false;
+			if (!committed && !tableInUse(t)) evictTableCache(vm.scanners[i].tblHash); // see closeScanner()
 		}
 	}
 	if (vm.results.rows) {
@@ -146,10 +149,10 @@ void freeVM() {
 reset the schema cache
 */
 static void invalidateSchema() {
-	if (!schemaCache) return;
-	freeHashTable(schemaCache);
-	free(schemaCache);
-	schemaCache = NULL;
+	if (!cache.schemaCache) return;
+	freeHashTable(cache.schemaCache);
+	free(cache.schemaCache);
+	cache.schemaCache = NULL;
 }
 
 static bool tableAlreadyExists(const char* tablename) {
@@ -226,6 +229,110 @@ static bool loadFirstValidPage(scanner* s) {
 	}
 }
 
+// ##########################################################################################################################################
+// ##########################################################################################################################################
+// TABLE CACHE
+
+/*
+Tables stay open from one statement to the next. The cache owns every open table: a statement's
+scanners and the active transaction only borrow them. A table in the cache that nothing is using
+has no pending changes and matches its file, so it can be handed to the next statement as it is.
+A table that can't promise that (its changes were discarded, or its file is being removed) is
+closed instead, and the next statement to use it loads it again.
+*/
+
+/*
+closes a table's file and frees the table
+*/
+static void closeTable(table* t) {
+	if (t->source) fclose(t->source);
+	freeTable(t);
+}
+
+/*
+returns whether an open scanner or the active transaction is using a table
+*/
+static bool tableInUse(table* t) {
+	for (int i = 0; i < MAX_SCANNERS; i++) {
+		if (vm.scanners[i].open && vm.scanners[i].tbl == t) return true;
+	}
+	if (!transaction.active) return false;
+	for (int i = 0; i < transaction.count; i++) {
+		if (transaction.tables[i].tbl == t) return true;
+	}
+	return false;
+}
+
+/*
+returns the open table with this name hash, or NULL if the cache doesn't hold it
+*/
+static table* searchTableCache(uint32_t tableNameHash) {
+	for (int i = 0; i < TABLE_CACHE_SIZE; i++) {
+		table_cache_entry* e = &cache.resourceCache[i];
+		if (e->tbl && e->tableNameHash == tableNameHash) return e->tbl;
+	}
+	return NULL;
+}
+
+/*
+puts a newly loaded table into the cache, which owns it from then on
+when the cache is full, tables are closed in turn (FIFO) to make room, skipping any that are in use
+@return false if every table in the cache is in use
+*/
+static bool insertTableCache(uint32_t tableNameHash, table* t) {
+	table_cache_entry* slot = NULL;
+	for (int i = 0; i < TABLE_CACHE_SIZE && !slot; i++) {
+		if (!cache.resourceCache[i].tbl) slot = &cache.resourceCache[i];
+	}
+	for (int i = 0; i < TABLE_CACHE_SIZE && !slot; i++) {
+		table_cache_entry* e = &cache.resourceCache[cache.tableCachePtr];
+		cache.tableCachePtr = (cache.tableCachePtr + 1) % TABLE_CACHE_SIZE;
+		if (tableInUse(e->tbl)) continue;
+		closeTable(e->tbl);
+		slot = e;
+	}
+	if (!slot) return false;
+	slot->tableNameHash = tableNameHash;
+	slot->tbl = t;
+	return true;
+}
+
+/*
+closes a table and takes it out of the cache, if it's there, so that its next use loads it from its file
+for a table that can't be reused: discarding changes leaves the table's header fields as the changes set
+them, and a table that is dropped or created has a different file from the one that's open
+the caller makes sure nothing is using the table
+*/
+static void evictTableCache(uint32_t tableNameHash) {
+	for (int i = 0; i < TABLE_CACHE_SIZE; i++) {
+		table_cache_entry* e = &cache.resourceCache[i];
+		if (!e->tbl || e->tableNameHash != tableNameHash) continue;
+		closeTable(e->tbl);
+		e->tbl = NULL;
+		e->tableNameHash = 0;
+	}
+}
+
+/*
+closes every open table, for the end of a session
+a transaction that was never committed loses its changes, as it does when the process exits
+*/
+void closeTableCache(void) {
+	if (transaction.active) {
+		for (int i = 0; i < transaction.count; i++) discard(transaction.tables[i].tbl);
+	}
+	transaction.active = false;
+	transaction.count = 0;
+	for (int i = 0; i < TABLE_CACHE_SIZE; i++) {
+		table_cache_entry* e = &cache.resourceCache[i];
+		if (!e->tbl) continue;
+		closeTable(e->tbl);
+		e->tbl = NULL;
+		e->tableNameHash = 0;
+	}
+	cache.tableCachePtr = 0;
+}
+
 /*
 opens a new scanner
 */
@@ -237,17 +344,23 @@ void openScanner(uint32_t tableNameHash, uint8_t pkIdx) {
 	}
 	table* t = findTxnTable(tableNameHash);
 	if (!t) {
-		t = malloc(sizeof(table));
-		if (!loadTable((char*)tablename, t)) { // loadTable() reports why
-			free(t);
-			vm.failed = true;
-			return;
+		// only the first statement to use a table loads it; after that it's already open in the cache
+		t = searchTableCache(tableNameHash);
+		if (!t) {
+			t = malloc(sizeof(table));
+			if (!loadTable((char*)tablename, t)) { // loadTable() reports why
+				free(t);
+				vm.failed = true;
+				return;
+			}
+			if (!insertTableCache(tableNameHash, t)) {
+				closeTable(t);
+				statementError("Error: too many tables are in use at once\n");
+				return;
+			}
 		}
-		if (transaction.active && !registerTxnTable(tableNameHash, t)) {
-			fclose(t->source);
-			freeTable(t);
-			return;
-		}
+		// a transaction holds each table it touches uncommitted until COMMIT or DISCARD
+		if (transaction.active && !registerTxnTable(tableNameHash, t)) return;
 	}
 	beginStatement(t); // so the table can be rolled back if this statement fails
 	int idx = vm.numScanners++;
@@ -272,13 +385,11 @@ returns false if that commit failed to reach disk
 bool closeScanner(scanner* s) {
 	if (!s->open) return true;
 	bool committed = true;
-	endStatement(s->tbl); // the statement is done with this table, so its changes are kept
-	// tables owned by an active transaction stay open until COMMIT/DISCARD
-	if (!findTxnTable(s->tblHash)) {
-		committed = commit(s->tbl);
-		fclose(s->tbl->source);
-		freeTable(s->tbl);
-	}
+	table* t = s->tbl;
+	uint32_t tblHash = s->tblHash;
+	endStatement(t); // the statement is done with this table, so its changes are kept
+	// a table in an active transaction stays uncommitted until COMMIT/DISCARD
+	if (!findTxnTable(tblHash)) committed = commit(t);
 	freeSPage(&s->page);
 	s->page = (slotted_page){0};
 	s->leafNode = (node){0};
@@ -288,6 +399,9 @@ bool closeScanner(scanner* s) {
 	s->started = false;
 	s->atEnd   = false;
 	vm.numScanners--;
+	// the table stays open in the cache for the next statement, unless its commit failed: that
+	// discarded its changes, so it has to be loaded again
+	if (!committed && !tableInUse(t)) evictTableCache(tblHash);
 	return committed;
 }
 
@@ -831,6 +945,8 @@ static interpret_result run() {
 					statementError("Error: table %s already exists\n", s->tablename);
 					break;
 				}
+				// a table still open under this name belongs to a file that is gone
+				evictTableCache(hash);
 				page_num firstKey = { .type = getPkOrderingType(s) };
 				if (vm.failed) {
 					break;
@@ -867,6 +983,8 @@ static interpret_result run() {
 					statementError("Error: table '%s' not found\n", name);
 					break;
 				}
+				// the table's file is about to be removed, so it can't stay open in the cache
+				evictTableCache(hash);
 				// the schema entry and the table's file are removed together
 				deleteHT(hash, vm.schema);
 				size_t len;
@@ -904,9 +1022,10 @@ static interpret_result run() {
 				table* tables[MAX_TXN_TABLES];
 				for (int i = 0; i < transaction.count; i++) tables[i] = transaction.tables[i].tbl;
 				bool committed = commitTables(tables, transaction.count, NULL, 0);
-				for (int i = 0; i < transaction.count; i++) {
-					fclose(tables[i]->source);
-					freeTable(tables[i]);
+				// the tables stay open in the cache, unless the commit failed: that discarded their
+				// changes, so they have to be loaded again
+				if (!committed) {
+					for (int i = 0; i < transaction.count; i++) evictTableCache(transaction.tables[i].tableHash);
 				}
 				transaction.active = false;
 				transaction.count = 0;
@@ -918,11 +1037,11 @@ static interpret_result run() {
 					statementError("Error: no transaction in progress to discard\n");
 					break;
 				}
+				// discarding leaves each table's header fields as the transaction set them, so the
+				// tables are closed and loaded again the next time they're used
 				for (int i = 0; i < transaction.count; i++) {
-					table* t = transaction.tables[i].tbl;
-					discard(t);
-					fclose(t->source);
-					freeTable(t);
+					discard(transaction.tables[i].tbl);
+					evictTableCache(transaction.tables[i].tableHash);
 				}
 				transaction.active = false;
 				transaction.count = 0;
@@ -948,14 +1067,15 @@ it had before the statement, so a transaction carries on as if the statement nev
 transaction also drops them (none of the statement was committed) and is closed
 */
 static void abortStatement(void) {
+	uint32_t closing[MAX_SCANNERS];
+	int closingCount = 0;
 	for (int i = vm.numScanners - 1; i >= 0; i--) {
 		scanner* s = &vm.scanners[i];
 		if (!s->open) continue;
 		rollbackStatement(s->tbl);
 		if (!findTxnTable(s->tblHash)) {
 			discard(s->tbl);
-			fclose(s->tbl->source);
-			freeTable(s->tbl);
+			closing[closingCount++] = s->tblHash;
 		}
 		freeSPage(&s->page);
 		s->page = (slotted_page){0};
@@ -963,19 +1083,21 @@ static void abortStatement(void) {
 		s->open = false;
 	}
 	vm.numScanners = 0;
+	// closed only once every scanner has let go, since two scanners can share a table
+	for (int i = 0; i < closingCount; i++) evictTableCache(closing[i]);
 }
 
 result_buffer interpret(const char* source) {
 	// load up database schema and initialize bytecode chunk
 	chunk c;
-	if (!schemaCache) {
-		schemaCache = loadSchema();
+	if (!cache.schemaCache) {
+		cache.schemaCache = loadSchema();
 	}
-	if (!schemaCache) {
+	if (!cache.schemaCache) {
 		vm.results.ir = INTERPRET_LOAD_ERROR;
 		return vm.results;
 	}
-	initVM(schemaCache);
+	initVM(cache.schemaCache);
 	initChunk(&c);
 	// lex the query
 	tokenized t = lexQuery(source);

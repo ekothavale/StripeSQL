@@ -68,7 +68,7 @@ A SQL query moves through five stages before touching the disk:
 
 **Generator** (`src/SQL_interpreter/generator.c`) — walks the AST and emits a bytecode `chunk` against the schema. Detects primary-key equality in `WHERE` clauses and emits `OP_KEY_SEARCH` instead of a scan loop.
 
-**VM** (`src/SQL_interpreter/vm.c`) — stack-based interpreter that executes the bytecode chunk. Maintains up to four concurrent scanners, each holding a cursor into a B+ tree (`src/storage_engine/scanner.h`). A session-scoped transaction registry, kept outside the per-statement VM state, lets `BEGIN TRANSACTION` hold a table open — dirty writes uncommitted — across multiple statements until `COMMIT` or `DISCARD`. The schema is loaded once per session and kept in memory; it's reloaded from disk after every `CREATE TABLE` or `DROP TABLE`, whether or not the statement succeeded.
+**VM** (`src/SQL_interpreter/vm.c`) — stack-based interpreter that executes the bytecode chunk. Maintains up to four concurrent scanners, each holding a cursor into a B+ tree (`src/storage_engine/scanner.h`). A session-scoped transaction registry, kept outside the per-statement VM state, lets `BEGIN TRANSACTION` hold a table open — dirty writes uncommitted — across multiple statements until `COMMIT` or `DISCARD`. The schema is loaded once per session and kept in memory; it's reloaded from disk after every `CREATE TABLE` or `DROP TABLE`, whether or not the statement succeeded. Table files stay open between statements too, in a cache of 16: a table is closed and loaded again only when it's dropped, when changes to it are discarded, or when the cache needs its slot.
 
 **B+ tree** (`src/storage_engine/bplus.c`) — the index structure that maps page numbers to disk addresses. Leaf nodes link bidirectionally for sequential scans.
 
@@ -287,7 +287,7 @@ make profile                      # where the time goes, function by function (m
 make profile PROFILE=--io         # file calls per statement (macOS only)
 ```
 
-`make bench` builds `main` and runs `bench/bench.py`, which generates every workload, runs each trial against a fresh database in a temporary directory, and prints each table below as markdown. `make profile` runs `bench/profile.py`, which attaches macOS's `sample` to StripeSQL on five workloads (lookups, scans, autocommit inserts, a 100,000-row transaction, and `DELETE FROM`) and reports each function's share of the time, including what it calls, along with peak memory. With `--io` it instead counts the file calls a lookup, a scanned row, and an autocommit insert make, using `bench/iocount.c`. Both use the binary in `STRIPESQL_BIN` instead of `./main` when it's set.
+`make bench` builds `main` and runs `bench/bench.py`, which generates every workload, runs each trial against a fresh database in a temporary directory, and prints each table below as markdown. `make profile` runs `bench/profile.py`, which attaches macOS's `sample` to StripeSQL on five workloads (lookups, scans, autocommit inserts, a 100,000-row transaction, and `DELETE FROM`) and reports each function's share of the time, including what it calls, along with peak resident memory. With `--io` it instead counts the file calls a lookup, a scanned row, and an autocommit insert make, using `bench/iocount.c`. Both use the binary in `STRIPESQL_BIN` instead of `./main` when it's set.
 
 All figures below were measured on an Apple M2 with an `-O3` build (the Makefile's flags, no sanitizers; default `FULL_FSYNC 0`, so every commit goes through the write-ahead log with plain `fsync`) and a warm OS page cache. Each is the median of 5 trials, taken after one discarded warm-up run. They will vary with page fill factor, tree depth, `M_GLOBAL`, and disk speed.
 
@@ -297,36 +297,36 @@ A table `(id int PRIMARY KEY, v int)` is loaded with N rows where `v = id`, so b
 
 | Rows | PK lookup | Full scan | Speedup |
 |-----:|----------:|----------:|--------:|
-| 1,000 | 0.025 ms | 1.03 ms | 42× |
-| 10,000 | 0.027 ms | 12.4 ms | 466× |
-| 100,000 | 0.028 ms | 147 ms | ~5,200× |
+| 1,000 | 5.2 µs | 1.07 ms | 204× |
+| 10,000 | 6.5 µs | 12.8 ms | 1,988× |
+| 100,000 | 7.8 µs | 152 ms | ~19,300× |
 
-- **Lookup latency is nearly flat.** It grows about 10% across a 100× increase in rows, while scan time grows roughly linearly — the O(log n) vs. O(n) difference the index exists for. Lookups are read-only, so they never touch the log or sync.
+- **Lookup latency grows slowly.** It rises about 50% across a 100× increase in rows, as the tree gets deeper, while scan time grows roughly linearly — the O(log n) vs. O(n) difference the index exists for. A lookup is read-only, so it never touches the log or syncs, and with the schema and the table already open it opens no files: at 10,000 rows it is four reads, three nodes and the page (`make profile PROFILE=--io`).
 - **The scan side is inflated by storage footprint.** The table file takes about 5.4 KB per row (536 MB at 100,000 rows), so a full scan reads far more data than the rows themselves contain. Each page and node comes off disk in one read of its fixed on-disk size and is decoded in memory; a denser page layout would shrink scan times, and the speedup with them.
 
 ### Transaction batching
 
-10,000 sequential `INSERT`s are run twice: once in autocommit mode, where every statement opens the table file, writes its changes back, and closes it; and once wrapped in a single `BEGIN TRANSACTION` / `COMMIT`, where dirty pages and nodes stay buffered until the commit. These scripts contain only the `CREATE TABLE` and the inserts, timed with the built-in timer.
+10,000 sequential `INSERT`s are run twice: once in autocommit mode, where every statement commits its own changes; and once wrapped in a single `BEGIN TRANSACTION` / `COMMIT`, where dirty pages and nodes stay buffered until the commit. These scripts contain only the `CREATE TABLE` and the inserts, timed with the built-in timer.
 
 | Primary key | Autocommit | Single transaction | Speedup | Inserts/sec (transaction) |
 |-------------|-----------:|-------------------:|--------:|--------------------------:|
-| `int` | 3.01 s | 0.299 s | 10.1× | ~33,500 |
-| `text` | 3.08 s | 0.298 s | 10.4× | ~33,600 |
+| `int` | 2.68 s | 0.263 s | 10.2× | ~38,000 |
+| `text` | 2.68 s | 0.275 s | 9.7× | ~36,300 |
 
-Every commit writes each changed object twice — once to the write-ahead log as a 4.4 KB entry, once to the table file — and syncs four times: twice for the log, once per table file, and once to truncate the log. Autocommit pays that 10,000 times where the transaction pays it once. Each statement also copies the prior version of every already-pending page or node it changes, so a failed statement can be rolled back; that's what makes the transaction runs a few percent slower than the commit count alone would suggest. On macOS a plain `fsync` is cheap (tens of microseconds here), but with four per commit, syncing is about 60% of the autocommit time (`make profile PROFILE=insert`); most of the rest is writing the log entries and the table file, and opening files. With `FULL_FSYNC` set, each sync costs about 3 ms on this machine, so syncs would take nearly all of the autocommit time instead.
+Every commit writes each changed object twice — once to the write-ahead log as a 4.4 KB entry, once to the table file — and syncs four times: twice for the log, once per table file, and once to truncate the log. Autocommit pays that 10,000 times where the transaction pays it once. Each statement also copies the prior version of every already-pending page or node it changes, so a failed statement can be rolled back; that's what makes the transaction runs a few percent slower than the commit count alone would suggest. On macOS a plain `fsync` is cheap (tens of microseconds here), but with four per commit, syncing is about 60% of the autocommit time (`make profile PROFILE=insert`); most of the rest is writing the log entries and the table file, and opening the log. With `FULL_FSYNC` set, each sync costs about 3 ms on this machine, so syncs would take nearly all of the autocommit time instead.
 
 ### Inserts at 100,000 rows
 
-The same one-column table, sequential integer keys, and built-in timer (including `COMMIT`), in two scenarios: building a 100,000-row table from empty, and adding keys 100,001–110,000 to a table that already holds 100,000 rows (restored from a snapshot before each trial). Each figure is the median of 5 trials, except the autocommit build (3 trials of about 31 s each); no warm-up run was discarded.
+The same one-column table, sequential integer keys, and built-in timer (including `COMMIT`), in two scenarios: building a 100,000-row table from empty, and adding keys 100,001–110,000 to a table that already holds 100,000 rows (restored from a snapshot before each trial). Each figure is the median of 5 trials, except the autocommit build (3 trials of about 27 s each); no warm-up run was discarded.
 
 | Scenario | Autocommit | Single transaction |
 |----------|-----------:|-------------------:|
-| Build a 100,000-row table (keys 1–100,000) | 31.0 s (~3,200 inserts/s) | 4.45 s (~22,500 inserts/s) |
-| Add 10,000 rows to a 100,000-row table | 3.46 s (~2,900 inserts/s) | 0.58 s (~17,300 inserts/s) |
+| Build a 100,000-row table (keys 1–100,000) | 27.0 s (~3,700 inserts/s) | 3.70 s (~27,000 inserts/s) |
+| Add 10,000 rows to a 100,000-row table | 2.79 s (~3,600 inserts/s) | 0.34 s (~29,500 inserts/s) |
 
-- **Throughput falls as the table grows, mostly inside transactions.** Compared with the 10,000-row runs above (~3,300 and ~33,500 inserts/s), autocommit loses about 3%, since each insert is dominated by its own commit, which costs about the same at any table size. The transaction build loses about a third.
-- **The commit takes nearly all of a transaction's time.** In the 100,000-row build, about 93% of the time is the commit — writing every changed page and node to the log, which is about half of the run by itself, then to the table file (`make profile PROFILE=insert-txn`). Running the inserts themselves is most of the rest. The build holds about 1 GB of pending pages and nodes by the time it commits.
-- **Adding to an existing table in one transaction is slower per row than building one** (~17,300 against ~22,500 inserts/s). Each insert reads the nodes on its path from disk until the transaction changes them, and sequential keys are spread across the tree (see Known Issues), so most inserts reach leaves that haven't been read yet. This scenario also varies the most from run to run, since each trial first restores the 536 MB table from a snapshot and then reads from the fresh copy.
+- **Throughput falls as the table grows, but only inside transactions.** Compared with the 10,000-row runs above (~3,700 and ~38,000 inserts/s), autocommit is unchanged, since each insert is dominated by its own commit, which costs about the same at any table size. The transaction build loses a little under a third.
+- **The commit takes nearly all of a transaction's time.** In the 100,000-row build, about 90% of the time is the commit — writing every changed page and node to the log, which is over half of the run by itself, then to the table file (`make profile PROFILE=insert-txn`). Running the inserts themselves is most of the rest. Every pending page and node is held in memory until the commit, and the build's memory footprint peaks at about 3 GB (`/usr/bin/time -l`).
+- **Adding to an existing table in one transaction runs at about the build's rate** (~29,500 against ~27,000 inserts/s). Each insert reads the nodes on its path from disk until the transaction changes them, and sequential keys are spread across the tree (see Known Issues), so most inserts reach leaves that haven't been read yet; since a node comes off disk in a single read, those reads cost little. This is also the figure most sensitive to what else the machine is doing, since each trial first restores the 536 MB table from a snapshot and then reads from the fresh copy.
 
 ### Comparison with SQLite
 
@@ -334,22 +334,22 @@ The same one-column table, sequential integer keys, and built-in timer (includin
 
 | Benchmark | StripeSQL | SQLite | Ratio |
 |-----------|----------:|-------:|------:|
-| `10k.sql` (int PK, no transaction) | 3.32 s | 2.75 s | 1.2× |
-| `10k_txn.sql` (int PK, single transaction) | 0.528 s | 0.019 s | 28× |
-| `10k_str.sql` (text PK, no transaction) | 3.30 s | 2.89 s | 1.1× |
-| `10k_str_txn.sql` (text PK, single transaction) | 0.556 s | 0.023 s | 24× |
+| `10k.sql` (int PK, no transaction) | 2.98 s | 2.69 s | 1.1× |
+| `10k_txn.sql` (int PK, single transaction) | 0.513 s | 0.019 s | 27× |
+| `10k_str.sql` (text PK, no transaction) | 2.97 s | 2.69 s | 1.1× |
+| `10k_str_txn.sql` (text PK, single transaction) | 0.517 s | 0.020 s | 26× |
 
 ```mermaid
 xychart-beta
     title "StripeSQL vs SQLite — median seconds over 5 trials (lower is better)"
     x-axis ["10k", "10k_txn", "10k_str", "10k_str_txn"]
     y-axis "Seconds" 0 --> 4
-    bar "StripeSQL" [3.32, 0.528, 3.30, 0.556]
-    bar "SQLite" [2.75, 0.019, 2.89, 0.023]
+    bar "StripeSQL" [2.98, 0.513, 2.97, 0.517]
+    bar "SQLite" [2.69, 0.019, 2.69, 0.020]
 ```
 
 - **Both engines give the same guarantee.** Each bare `INSERT` is its own transaction on both, and every commit — including `CREATE TABLE` and `DROP TABLE` — is durable and atomic across crashes: SQLite journals the original pages before overwriting them (rollback journal, `synchronous=FULL`), StripeSQL logs the new ones (a redo log), and neither returns until the commit is synced. Neither uses `F_FULLFSYNC` by default.
-- **In the transaction runs, the closing `DELETE FROM` is nearly half of StripeSQL's time.** It takes about 0.24 s of the ~0.53 s total, because every emptied page is removed from the B+ tree individually, with borrow/merge rebalancing along the way; SQLite erases a table's contents wholesale when `DELETE` has no `WHERE` clause. The inserts themselves take about 0.3 s (see Transaction batching). The B+ tree's linear search within nodes, and node structs allocated at the full configured order (`M_GLOBAL`, see `const.h`) regardless of fill, are other identified costs relative to SQLite's B-tree.
+- **In the transaction runs, the closing `DELETE FROM` is nearly half of StripeSQL's time.** It takes about 0.24 s of the ~0.51 s total, because every emptied page is removed from the B+ tree individually, with borrow/merge rebalancing along the way; SQLite erases a table's contents wholesale when `DELETE` has no `WHERE` clause. The inserts themselves take about 0.26 s (see Transaction batching). The B+ tree's linear search within nodes, and node structs allocated at the full configured order (`M_GLOBAL`, see `const.h`) regardless of fill, are other identified costs relative to SQLite's B-tree.
 - Text and integer primary keys track each other closely on both engines, so StripeSQL's key-dispersion scheme (see Known Issues) isn't adding meaningful overhead of its own.
 
 ---
@@ -370,7 +370,7 @@ make coverage-full   # coverage report for both test suites (macOS only, under a
 | Suite | Source | Covers |
 |-------|--------|--------|
 | Storage engine | `src/storage_engine/testing.c` | Slotted pages; table files, headers, and dirty hashmaps; creating, loading, and deleting tables; B+ tree search, splits, deletion, borrowing, and merging, with the whole tree's structure checked while pages are deleted in order, from the middle, and at random from a three-level tree; the process lock; the write-ahead log and crash recovery, including a forked process whose commit fails after the commit point |
-| SQL interpreter | `src/SQL_interpreter/testing.c` | Bytecode chunks, values, the lexer, the parser, the schema hashtable and file, the bytecode generator, the VM, and whole statements run through `interpret()`: result types, comparison operators, deletes with a `WHERE` clause, statement rollback, and errors halting statements |
+| SQL interpreter | `src/SQL_interpreter/testing.c` | Bytecode chunks, values, the lexer, the parser, the schema hashtable and file, the bytecode generator, the VM, and whole statements run through `interpret()`: result types, comparison operators, comments, deletes with a `WHERE` clause, the cache of open tables, statement rollback, and errors halting statements |
 | Crash recovery | `crashtest/` | The built binary end to end, killed just before every file write and `fsync` of a commit (see *Crash-recovery test* under Usage) |
 
 ### Coverage
@@ -379,9 +379,9 @@ Measured with clang's source-based coverage (`-fprofile-instr-generate -fcoverag
 
 | Tests | Lines | Functions | Branches |
 |-------|------:|----------:|---------:|
-| Unit tests (`make coverage`) | 78.3% | 89.7% | 68.7% |
-| Crash-recovery test alone | 55.8% | 75.6% | 45.4% |
-| Both (`make coverage-full`) | **77.7%** | **89.7%** | **68.1%** |
+| Unit tests (`make coverage`) | 78.8% | 89.9% | 68.8% |
+| Crash-recovery test alone | 55.9% | 75.7% | 45.3% |
+| Both (`make coverage-full`) | **78.2%** | **89.8%** | **68.2%** |
 
 The unit-test row covers every file except `main.c`, which the unit tests don't link; the other two rows include it. `debug.c`, the bytecode disassembler and execution tracer used only in debug builds, never runs. Without it, both suites together cover 82% of lines and 95% of functions.
 
@@ -394,15 +394,15 @@ The unit-test row covers every file except `main.c`, which the unit tests don't 
 | `SQL_interpreter/generator.c` | 76.9% | 100.0% | 68.4% |
 | `SQL_interpreter/lexer.c` | 86.0% | 100.0% | 81.1% |
 | `SQL_interpreter/parser.c` | 77.4% | 97.7% | 73.2% |
-| `SQL_interpreter/schema.c` | 92.8% | 100.0% | 83.3% |
-| `SQL_interpreter/vm.c` | 75.8% | 96.3% | 63.0% |
+| `SQL_interpreter/schema.c` | 98.9% | 100.0% | 93.8% |
+| `SQL_interpreter/vm.c` | 76.6% | 97.0% | 62.5% |
 | `storage_engine/bplus.c` | 88.6% | 86.8% | 79.4% |
 | `storage_engine/file.c` | 94.3% | 100.0% | 75.0% |
 | `storage_engine/ordering.c` | 64.1% | 88.9% | 55.2% |
 | `storage_engine/page.c` | 86.4% | 100.0% | 78.6% |
-| `storage_engine/tableIO.c` | 88.2% | 94.7% | 75.7% |
+| `storage_engine/tableIO.c` | 88.9% | 94.7% | 76.5% |
 | `storage_engine/wal.c` | 97.1% | 100.0% | 69.6% |
-| `main.c` | 50.0% | 85.7% | 43.1% |
+| `main.c` | 50.9% | 85.7% | 43.1% |
 | `memory.c` | 75.0% | 100.0% | 75.0% |
 | `value.c` | 76.9% | 66.7% | 100.0% |
 | `debug.c` | 0.0% | 0.0% | 0.0% |

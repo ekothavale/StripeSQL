@@ -63,7 +63,7 @@ def table(header, rows):
 
 
 def ms(seconds):
-    return f"{seconds * 1000:,.3f} ms" if seconds < 0.0001 else f"{seconds * 1000:,.2f} ms" if seconds < 0.01 else f"{seconds * 1000:,.1f} ms" if seconds < 1 else f"{seconds * 1000:,.0f} ms"
+    return f"{seconds * 1e6:,.1f} µs" if seconds < 0.0001 else f"{seconds * 1000:,.2f} ms" if seconds < 0.01 else f"{seconds * 1000:,.1f} ms" if seconds < 1 else f"{seconds * 1000:,.0f} ms"
 
 
 def inserts(lo, hi, text=False, table_name="s"):

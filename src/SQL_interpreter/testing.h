@@ -67,6 +67,7 @@ void test_read_ht_missing();
 void test_read_ht_correct_data();
 void test_delete_ht_removes_entry();
 void test_delete_ht_zeroes_fields();
+void test_insert_ht_many_entries();
 void test_delete_ht_nonexistent();
 
 /* Value tests */
@@ -122,6 +123,7 @@ void test_interpret_errors_halt_statements();
 void test_interpret_block_comments();
 void test_interpret_ordering_comparisons();
 void test_interpret_filtered_delete();
+void test_interpret_table_cache();
 
 /* Generator tests */
 void test_generator();
