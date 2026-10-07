@@ -16,12 +16,7 @@ DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
 
-// heap_in_use() needs the allocator's statistics on macOS. The header also defines a PAGE_SIZE of its
-// own, so it comes first and gives the name back for const.h to define
-#ifdef __APPLE__
-#include <malloc/malloc.h>
-#undef PAGE_SIZE
-#endif
+#include "test_heap.h" // must come first; see the header
 #include "testing.h"
 #include "wal.h"
 #include "file.h"
@@ -744,27 +739,6 @@ void test_page_roundtrip(void) {
     free_io_page(p);
     free_test_table(&t);
     printf("PASS\n");
-}
-
-// AddressSanitizer holds freed memory back instead of reusing it, so under it the heap grows without a leak
-#if defined(__has_feature)
-#if __has_feature(address_sanitizer)
-#define HEAP_HELD_BACK
-#endif
-#endif
-
-/*
-Bytes the program has allocated right now. Only macOS can report it, and not under AddressSanitizer;
-otherwise this returns 0, so a test that compares two readings still runs but can't fail on them.
-*/
-static size_t heap_in_use(void) {
-#if defined(__APPLE__) && !defined(HEAP_HELD_BACK)
-    malloc_statistics_t stats;
-    malloc_zone_statistics(NULL, &stats);
-    return stats.size_in_use;
-#else
-    return 0;
-#endif
 }
 
 /*

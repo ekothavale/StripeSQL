@@ -121,6 +121,8 @@ void test_interpret_select_projection_types();
 void test_interpret_failed_statement_rolls_back();
 void test_interpret_errors_halt_statements();
 void test_interpret_block_comments();
+void test_interpret_text_results();
+void test_interpret_text_operands_released();
 void test_interpret_ordering_comparisons();
 void test_interpret_filtered_delete();
 void test_interpret_table_cache();

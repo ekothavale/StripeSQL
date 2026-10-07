@@ -66,6 +66,7 @@ static table* findTxnTable(uint32_t tableHash) {
 static void statementError(const char* format, ...);
 static bool tableInUse(table* t);
 static void evictTableCache(uint32_t tableNameHash);
+static void scratchFree(scanner* s);
 
 /*
 registers a table with the active transaction, so its changes stay uncommitted
@@ -132,16 +133,25 @@ void freeVM() {
 		if (vm.scanners[i].open) {
 			table* t = vm.scanners[i].tbl;
 			bool committed = commit(t);
+			scratchFree(&vm.scanners[i]);
 			vm.scanners[i].tbl = NULL;
 			vm.scanners[i].open = false;
 			if (!committed && !tableInUse(t)) evictTableCache(vm.scanners[i].tblHash); // see closeScanner()
 		}
 	}
+	// the result buffer owns its rows and every string in them (see OP_EMIT_ROW)
 	if (vm.results.rows) {
-		for (int i = 0; i < vm.results.count; i++) free(vm.results.rows[i]);
+		for (int i = 0; i < vm.results.count; i++) {
+			for (int j = 0; j < vm.results.cols; j++) {
+				if (vm.results.rows[i][j].type == VAL_TEXT) free(vm.results.rows[i][j].as.text);
+			}
+			free(vm.results.rows[i]);
+		}
 		free(vm.results.rows);
-		vm.results.rows  = NULL;
-		vm.results.count = 0;
+		vm.results.rows     = NULL;
+		vm.results.count    = 0;
+		vm.results.capacity = 0;
+		vm.results.cols     = 0;
 	}
 }
 
@@ -207,6 +217,40 @@ static void printPK(value pk) {
 		case VAL_U32: printf("%u", pk.as.u32); break;
 		default: printf("%llx", pk.as.integer); break;
 	}
+}
+
+/*
+allocates a string that lasts for as long as the scanner stays on its current row
+OP_COLUMN reads a column's text into one of these. No instruction that pops the value has to free it: the
+scanner frees them all when it moves to another row or closes (scratchReset()). Anything that keeps a
+string for longer than that, such as a result row, takes a copy of its own
+*/
+static char* scratchAlloc(scanner* s, size_t size) {
+	if (s->scratchCount == s->scratchCap) {
+		s->scratchCap = s->scratchCap < 8 ? 8 : s->scratchCap * 2;
+		s->scratch = realloc(s->scratch, s->scratchCap * sizeof(char*));
+	}
+	char* str = malloc(size);
+	s->scratch[s->scratchCount++] = str;
+	return str;
+}
+
+/*
+frees every string handed out for the scanner's current row, as the scanner leaves it
+*/
+static void scratchReset(scanner* s) {
+	for (int i = 0; i < s->scratchCount; i++) free(s->scratch[i]);
+	s->scratchCount = 0;
+}
+
+/*
+frees the scanner's strings and the list that tracks them, as the scanner closes
+*/
+static void scratchFree(scanner* s) {
+	scratchReset(s);
+	free(s->scratch);
+	s->scratch    = NULL;
+	s->scratchCap = 0;
 }
 
 static bool loadFirstValidPage(scanner* s) {
@@ -376,6 +420,9 @@ void openScanner(uint32_t tableNameHash, uint8_t pkIdx) {
 	vm.scanners[idx].pageAddr = 0;
 	vm.scanners[idx].slotIdx  = 0;
 	vm.scanners[idx].pkIdx    = pkIdx;
+	vm.scanners[idx].scratch      = NULL;
+	vm.scanners[idx].scratchCount = 0;
+	vm.scanners[idx].scratchCap   = 0;
 }
 
 /*
@@ -391,6 +438,7 @@ bool closeScanner(scanner* s) {
 	// a table in an active transaction stays uncommitted until COMMIT/DISCARD
 	if (!findTxnTable(tblHash)) committed = commit(t);
 	freeSPage(&s->page);
+	scratchFree(s);
 	s->page = (slotted_page){0};
 	s->leafNode = (node){0};
 	s->tbl     = NULL;
@@ -411,6 +459,7 @@ On the first call (started == false), walks from root to the first row.
 Returns true if a valid row is now current, false if the table is exhausted.
 */
 bool advanceScanner(scanner* s) {
+	scratchReset(s); // the scanner is leaving its row, and the row's strings go with it
 	if (s->atEnd) return false;
 	table* t = s->tbl;
 
@@ -449,6 +498,7 @@ bool advanceScanner(scanner* s) {
 searches for and loads a record into the given scanner by primary key lookup
 */
 bool scannerKeySearch(scanner* s, ordering_key key) {
+	scratchReset(s); // the scanner is leaving its row, and the row's strings go with it
 	address addr = findPage(key.pageNum, s->tbl);
 	if (!addr) return false;
 	s->pageAddr = addr;
@@ -812,7 +862,8 @@ static interpret_result run() {
 					case T_STRING:
 					case T_DATE:
 					case T_TIME: {
-						char* str = malloc(e.size + 1);
+						// the copy belongs to the scanner, which frees it when it leaves this row
+						char* str = scratchAlloc(s, e.size + 1);
 						memcpy(str, e.data, e.size);
 						str[e.size] = '\0';
 						v.type = VAL_TEXT;
@@ -828,6 +879,12 @@ static interpret_result run() {
 				// pop in reverse so row[0] is the leftmost column
 				value* row = malloc(count * sizeof(value));
 				for (int i = count - 1; i >= 0; i--) row[i] = pop();
+				// the result buffer outlives the statement, so it owns every string in its rows. A string
+				// on the stack belongs to a scanner's current row or, for a literal, to the chunk, and
+				// neither lasts that long, so the row takes a copy
+				for (int i = 0; i < count; i++) {
+					if (row[i].type == VAL_TEXT) row[i].as.text = strdup(row[i].as.text);
+				}
 				#ifdef DEBUG_TRACE_EXECUTION
 				for (int i = 0; i < count; i++) {
 					if (i > 0) printf(" | ");
@@ -844,7 +901,7 @@ static interpret_result run() {
 					vm.results.capacity *= 2;
 					vm.results.rows = realloc(vm.results.rows, vm.results.capacity * sizeof(value*));
 				}
-				// transfer ownership of the row array (including any VAL_TEXT pointers) to vm.results
+				// transfer ownership of the row array and its strings to vm.results; freeVM() releases them
 				vm.results.rows[vm.results.count++] = row;
 				break;
 			}
@@ -1078,6 +1135,7 @@ static void abortStatement(void) {
 			closing[closingCount++] = s->tblHash;
 		}
 		freeSPage(&s->page);
+		scratchFree(s);
 		s->page = (slotted_page){0};
 		s->tbl  = NULL;
 		s->open = false;

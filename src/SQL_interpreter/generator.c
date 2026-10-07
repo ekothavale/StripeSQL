@@ -762,11 +762,15 @@ static bool munchStmt(ast_node* node, chunk* c, hashtable* ht) {
 					// continue through linked list
 					cdList = cdList->children[1];
 				}
+				// insertHT() doesn't release an entry it overwrites, and one is already there when the
+				// table exists (the VM rejects the statement, but only once it runs)
+				if (readHT(s->hash, ht)) deleteHT(s->hash, ht);
 				insertHT(s, ht);
 
 				uint8_t schemaIdx = (uint8_t)addConstant(c, UINT_VAL(s->hash));
 				writeChunk(c, OP_CREATE_TABLE, 0);
 				writeChunk(c, schemaIdx, 0);
+				free(s); // the table copied s's fields and owns what they point to; only the struct is left
 			} else {
 				printf("Error: CREATE INDEX and CREATE VIEW are not yet supported\n");
 			}
@@ -786,7 +790,9 @@ static bool munchStmt(ast_node* node, chunk* c, hashtable* ht) {
 				char tname[MAX_IDENT_LEN];
 				tokenToStr(node->children[0]->tok, tname);
 
-				uint8_t nameIdx = (uint8_t)addConstant(c, TEXT_VAL(strdup(tname)));
+				value name = TEXT_VAL(strdup(tname));
+				uint8_t nameIdx = (uint8_t)addConstant(c, name);
+				addDynamic(c, name); // so freeChunk() frees the copy
 				writeChunk(c, OP_DROP_TABLE, 0);
 				writeChunk(c, nameIdx, 0);
 			} else {

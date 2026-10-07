@@ -261,7 +261,7 @@ If new VM behaviour is needed, extend the `opcode` enum. Single-byte opcodes wit
 Extend `munchStmt` (or `munchExpr`) to handle the new AST node and emit the corresponding opcodes.
 
 **6. Implement the opcode** (`src/SQL_interpreter/vm.c`)
-Add a `case` to the dispatch loop in `run()`. Operations that touch the disk go through the scanner and the B+ tree API in `bplus.c`.
+Add a `case` to the dispatch loop in `run()`. Operations that touch the disk go through the scanner and the B+ tree API in `bplus.c`. A string popped off the stack never has to be freed: it belongs either to the scanner whose row it was read from, which frees it when it moves to another row, or to the statement's bytecode. An opcode that keeps a string for longer than the current row must take a copy, as `OP_EMIT_ROW` does for result rows.
 
 **7. Update the schema if needed** (`src/SQL_interpreter/schema.c`)
 If the feature introduces a new per-table or per-column attribute, extend the `schema` struct and update the binary serialisation in `schema.c`.
@@ -370,7 +370,7 @@ make coverage-full   # coverage report for both test suites (macOS only, under a
 | Suite | Source | Covers |
 |-------|--------|--------|
 | Storage engine | `src/storage_engine/testing.c` | Slotted pages; table files, headers, and dirty hashmaps; creating, loading, and deleting tables; B+ tree search, splits, deletion, borrowing, and merging, with the whole tree's structure checked while pages are deleted in order, from the middle, and at random from a three-level tree; the process lock; the write-ahead log and crash recovery, including a forked process whose commit fails after the commit point |
-| SQL interpreter | `src/SQL_interpreter/testing.c` | Bytecode chunks, values, the lexer, the parser, the schema hashtable and file, the bytecode generator, the VM, and whole statements run through `interpret()`: result types, comparison operators, comments, deletes with a `WHERE` clause, the cache of open tables, statement rollback, and errors halting statements |
+| SQL interpreter | `src/SQL_interpreter/testing.c` | Bytecode chunks, values, the lexer, the parser, the schema hashtable and file, the bytecode generator, the VM, and whole statements run through `interpret()`: result types, comparison operators and `LIKE`, comments, deletes with a `WHERE` clause, the cache of open tables, who owns the strings in results and expressions, statement rollback, and errors halting statements |
 | Crash recovery | `crashtest/` | The built binary end to end, killed just before every file write and `fsync` of a commit (see *Crash-recovery test* under Usage) |
 
 ### Coverage
@@ -379,11 +379,11 @@ Measured with clang's source-based coverage (`-fprofile-instr-generate -fcoverag
 
 | Tests | Lines | Functions | Branches |
 |-------|------:|----------:|---------:|
-| Unit tests (`make coverage`) | 78.8% | 89.9% | 68.8% |
-| Crash-recovery test alone | 55.9% | 75.7% | 45.3% |
-| Both (`make coverage-full`) | **78.2%** | **89.8%** | **68.2%** |
+| Unit tests (`make coverage`) | 80.3% | 90.4% | 70.7% |
+| Crash-recovery test alone | 56.3% | 76.0% | 45.7% |
+| Both (`make coverage-full`) | **79.7%** | **90.3%** | **70.0%** |
 
-The unit-test row covers every file except `main.c`, which the unit tests don't link; the other two rows include it. `debug.c`, the bytecode disassembler and execution tracer used only in debug builds, never runs. Without it, both suites together cover 82% of lines and 95% of functions.
+The unit-test row covers every file except `main.c`, which the unit tests don't link; the other two rows include it. `debug.c`, the bytecode disassembler and execution tracer used only in debug builds, never runs. Without it, both suites together cover 84% of lines and 95% of functions.
 
 <details>
 <summary>Per-file coverage (both suites)</summary>
@@ -391,12 +391,12 @@ The unit-test row covers every file except `main.c`, which the unit tests don't 
 | File | Lines | Functions | Branches |
 |------|------:|----------:|---------:|
 | `SQL_interpreter/chunk.c` | 100.0% | 100.0% | 100.0% |
-| `SQL_interpreter/generator.c` | 76.9% | 100.0% | 68.4% |
-| `SQL_interpreter/lexer.c` | 86.0% | 100.0% | 81.1% |
-| `SQL_interpreter/parser.c` | 77.4% | 97.7% | 73.2% |
+| `SQL_interpreter/generator.c` | 81.0% | 100.0% | 71.5% |
+| `SQL_interpreter/lexer.c` | 87.0% | 100.0% | 82.4% |
+| `SQL_interpreter/parser.c` | 79.4% | 97.7% | 76.2% |
 | `SQL_interpreter/schema.c` | 98.9% | 100.0% | 93.8% |
-| `SQL_interpreter/vm.c` | 76.6% | 97.0% | 62.5% |
-| `storage_engine/bplus.c` | 88.6% | 86.8% | 79.4% |
+| `SQL_interpreter/vm.c` | 81.3% | 100.0% | 68.5% |
+| `storage_engine/bplus.c` | 88.7% | 86.8% | 79.4% |
 | `storage_engine/file.c` | 94.3% | 100.0% | 75.0% |
 | `storage_engine/ordering.c` | 64.1% | 88.9% | 55.2% |
 | `storage_engine/page.c` | 86.4% | 100.0% | 78.6% |
@@ -410,7 +410,6 @@ The unit-test row covers every file except `main.c`, which the unit tests don't 
 </details>
 
 The main gaps:
-- **`LIKE`.** `likeMatch` never runs; the other comparison operators are tested on key and non-key columns.
 - **The REPL** (`repl()` in `main.c`).
 - **Floating-point primary keys** (`doubleToBits` in `ordering.c`).
 - **Code with no callers**, which no test can reach: `readRecord`, `updateRecord`, and `searchRecord` in `bplus.c`, `loadPrev`/`loadNext` and the garbage-collection stubs `moveNode`/`movePage` in `tableIO.c`, plus `getSQLType`/`encodeSQLType` in `value.c`.

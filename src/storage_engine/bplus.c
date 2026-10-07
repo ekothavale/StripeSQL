@@ -74,6 +74,7 @@ static node* newRoot(node* child, address childAddr, table* t) {
 
 /*
 creates a blank leaf or interior node
+callocs a node
 */
 static node* newNode(bool isLeaf, address parent) {
 	node* n = calloc(1, sizeof(node));
@@ -315,8 +316,10 @@ static void splitUpdateParent(node* parent, node* child, address childAddr, page
 	return;
 }
 
-// splits a node, making sure the new node is properly connected to the b+tree
-// assumes the parent node is not full
+/*
+splits a node, making sure the new node is properly connected to the b+tree
+assumes the parent node is not full
+*/
 static node* splitNode(node* n, address addr, address* newAddrOut, table* t) {
 	//if (isNodeFull(n->parent)) printf("Error: tried to split a node with a full parent");
 	node* new = newNode(n->isLeaf, n->parent);
@@ -405,13 +408,13 @@ static node* balanceTreeAdd(node* n, address addr, address* newAddrOut, table* t
 		return NULL;
 	}
 	if (isRoot(n)) {
-		newRoot(n, addr, t);
+		free(newRoot(n, addr, t)); // markNode() kept its own copy of the new root
 	} else {
 		node parent;
 		readNode(n->parent, &parent, t);
 		if (isNodeFull(&parent)) {
 			address dummy;
-			balanceTreeAdd(&parent, n->parent, &dummy, t);
+			free(balanceTreeAdd(&parent, n->parent, &dummy, t)); // the parent's new sibling isn't needed here
 			readNode(addr, n, t);
 		}
 	}
@@ -432,8 +435,10 @@ static void addPage(node* n, address nodeAddr, slotted_page* p, address pageAddr
 				root.maxKey = p->header.pageNum;
 				markNode(t->root, &root, t);
 			}
+			free(new);
 			return;
 		}
+		free(new);
 	}
 	insertPageIntoChildren(n, nodeAddr, p, pageAddr, t);
 }

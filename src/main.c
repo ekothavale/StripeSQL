@@ -92,6 +92,7 @@ static void repl() {
         clock_gettime(CLOCK_MONOTONIC, &end); // end timer
 
         if (result.print) printResult(result);
+        freeVM(); // the result has been printed, so its rows and their strings can go
         printTime(&start, &end);
     }
 }
@@ -245,6 +246,7 @@ static void runFile(const char* path) {
         }
         if (result.print) printResult(result);
         queriesProcessed++;
+        freeVM(); // the result has been printed, so its rows and their strings can go
     }
     clock_gettime(CLOCK_MONOTONIC, &end); // end timer
     if (queriesProcessed > 0) printTime(&start, &end);

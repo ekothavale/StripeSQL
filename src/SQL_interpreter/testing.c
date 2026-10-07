@@ -16,6 +16,7 @@ DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
 
+#include "test_heap.h" // must come first; see the header
 #include "testing.h"
 
 // ##########################################################################################################################################
@@ -1724,6 +1725,102 @@ void test_interpret_block_comments(void) {
     remove(schema_path());
 }
 
+void test_interpret_text_results(void) {
+    // a result's strings belong to the result. They stay readable after the
+    // statement's bytecode has been freed, whether they came from a column or
+    // from a string literal in the query (a literal used to be left pointing
+    // into the freed bytecode), and freeVM() releases them along with the rows
+    remove(schema_path());
+    remove(TABLE_DIRECTORY "tr.tbl");
+    assert(interpret("create table tr (id int primary key, name text)").ir == INTERPRET_OK);
+    assert(interpret("insert into tr values (1, 'alice')").ir == INTERPRET_OK);
+    assert(interpret("insert into tr values (2, 'bob')").ir == INTERPRET_OK);
+
+    result_buffer r = interpret("select name, 'a literal', id from tr where id = 1");
+    assert(r.ir == INTERPRET_OK && r.count == 1 && r.cols == 3);
+    assert(r.rows[0][0].type == VAL_TEXT && strcmp(r.rows[0][0].as.text, "alice") == 0);
+    assert(r.rows[0][1].type == VAL_TEXT && strcmp(r.rows[0][1].as.text, "a literal") == 0);
+    assert(r.rows[0][2].type == VAL_INT  && r.rows[0][2].as.integer == 1);
+    freeVM();
+
+    // a column's string is copied out of the scanner's row, which is gone once the scan moves on
+    r = interpret("select name from tr");
+    assert(r.ir == INTERPRET_OK && r.count == 2);
+    assert((strcmp(r.rows[0][0].as.text, "alice") == 0 && strcmp(r.rows[1][0].as.text, "bob") == 0) ||
+           (strcmp(r.rows[0][0].as.text, "bob") == 0 && strcmp(r.rows[1][0].as.text, "alice") == 0));
+    freeVM();
+
+    // every row has a copy of its own, so each can be freed
+    r = interpret("select 'same', 'same' from tr");
+    assert(r.ir == INTERPRET_OK && r.count == 2 && r.cols == 2);
+    for (int i = 0; i < r.count; i++) {
+        assert(strcmp(r.rows[i][0].as.text, "same") == 0 && strcmp(r.rows[i][1].as.text, "same") == 0);
+        assert(r.rows[i][0].as.text != r.rows[i][1].as.text);
+    }
+    assert(r.rows[0][0].as.text != r.rows[1][0].as.text);
+    freeVM();
+    freeVM();  // nothing is left to free, and that's fine
+
+    // a literal that is only compared against, not selected, still belongs to the statement
+    r = interpret("select id from tr where name = 'bob'");
+    assert(r.ir == INTERPRET_OK && r.count == 1 && r.rows[0][0].as.integer == 2);
+    freeVM();
+
+    assert(interpret("drop table tr").ir == INTERPRET_OK);
+    remove(schema_path());
+}
+
+void test_interpret_text_operands_released(void) {
+    // a string read from a column is a copy, and the instruction that consumes it
+    // has to free it: comparing, matching, testing for null, assigning, or dropping
+    // it when the statement fails. None of them used to, so a statement that
+    // filtered on a text column lost a string for every row it looked at
+    remove(schema_path());
+    remove(TABLE_DIRECTORY "tx.tbl");
+    assert(interpret("create table tx (id int primary key, name text, other text)").ir == INTERPRET_OK);
+    char sql[128];
+    assert(interpret("begin transaction").ir == INTERPRET_OK);
+    for (int i = 1; i <= 100; i++) {
+        snprintf(sql, sizeof(sql), "insert into tx values (%d, 'name %d', 'name %d')", i, i, i % 2 ? i : 0);
+        assert(interpret(sql).ir == INTERPRET_OK);
+    }
+    assert(interpret("commit").ir == INTERPRET_OK);
+
+    struct { const char* sql; int rows; } stmts[] = {
+        {"select id from tx where name = 'name 7'", 1},
+        {"select id from tx where name = other", 50},
+        {"select id from tx where name != other", 50},
+        {"select id from tx where name like 'name 1%'", 12},
+        {"select id from tx where other is not null and not name = 'name 1'", 99},
+        {"select name, other from tx where other = 'name 0'", 50},
+        {"update tx set other = other where id > 90", 0},  // assigns a column's copy; changes nothing
+        {"delete from tx where name = 'nobody'", 0},
+    };
+    int count = (int)(sizeof(stmts) / sizeof(stmts[0]));
+    size_t before = 0;
+    for (int round = 0; round <= 20; round++) {
+        // the first round opens the table and grows the VM's own buffers; the rest are measured
+        if (round == 1) before = heap_in_use();
+        for (int i = 0; i < count; i++) {
+            result_buffer r = interpret(stmts[i].sql);
+            assert(r.ir == INTERPRET_OK && r.count == stmts[i].rows);
+            freeVM();
+        }
+    }
+    // twenty rounds used to lose about 400 KB
+    assert(heap_in_use() <= before + 32 * 1024);
+
+    // a statement that fails with strings still on the stack drops them too
+    assert(interpret("select id from tx where name < other").ir == INTERPRET_RUNTIME_ERROR);
+    freeVM();
+    result_buffer after = interpret("select id from tx where name = 'name 7'");
+    assert(after.ir == INTERPRET_OK && after.count == 1);
+    freeVM();
+
+    assert(interpret("drop table tx").ir == INTERPRET_OK);
+    remove(schema_path());
+}
+
 void test_interpret_ordering_comparisons(void) {
     // <, <=, > and >= compare their left operand against their right one,
     // whichever side the column is on (they once ran with the two swapped,
@@ -1904,6 +2001,8 @@ void test_vm(void) {
     test_interpret_failed_statement_rolls_back();
     test_interpret_errors_halt_statements();
     test_interpret_block_comments();
+    test_interpret_text_results();
+    test_interpret_text_operands_released();
     test_interpret_ordering_comparisons();
     test_interpret_filtered_delete();
     test_interpret_table_cache();
