@@ -23,7 +23,7 @@ Layout of a table file:
 
  MAGIC | Metadata Length | Num page rows | Num node rows | Page rows per node row |
  Pages per row | Nodes per row | Page size | Node size | Pointer to free space | Root pointer |
- M |
+ M | Key type |
 
 Addressing:
 
@@ -74,17 +74,19 @@ _Static_assert(PAGE_HEADER_DISK_SIZE + PAGE_ARR_CAP <= PAGE_SIZE, "a full page d
 _Static_assert(NODE_DISK_SIZE <= PAGE_SIZE, "a node doesn't fit in a log entry");
 
 /*
-Serializes an ordering key into exactly ORDERING_KEY_DISK_SIZE bytes at buf.
-Layout: [type(1B)][data(TEXT_KEY_MAX_LEN B)], where data is a big-endian u64 or the string's bytes, and
-zeros after that. The bytes written depend only on the key's value, never on what else is in the struct
+Serializes an ordering key into exactly ORDERING_KEY_DISK_SIZE bytes at buf: a big-endian u64 or the
+string's bytes, and zeros after that. The bytes written depend only on the key's value, never on what
+else is in the struct
+@param type - the type of the table's keys (table.keyType). It decides how the key is written and isn't
+              written itself: the table's header holds it once for every key in the file. A zeroed key,
+              which stands in where there is no key yet, comes out as zeros whatever the type
 */
-static void writeOrderingKeyBytewise(char* buf, ordering_key k) {
-	buf[0] = (char)k.type;
-	memset(buf + 1, 0, ORDERING_KEY_DISK_SIZE - 1);
-	if (k.type == ORDERING_STRING) {
-		memcpy(buf + 1, k.as.string, strnlen(k.as.string, TEXT_KEY_MAX_LEN));
+static void writeOrderingKeyBytewise(char* buf, ordering_key k, ordering_type type) {
+	memset(buf, 0, ORDERING_KEY_DISK_SIZE);
+	if (type == ORDERING_STRING) {
+		memcpy(buf, k.as.string, strnlen(k.as.string, TEXT_KEY_MAX_LEN));
 	} else {
-		writeULongBytewise(buf + 1, k.as.u64);
+		writeULongBytewise(buf, k.as.u64);
 	}
 }
 
@@ -108,14 +110,15 @@ static uint64_t readULong(ubyte* a) {
 /*
 Reads an ordering key from the ORDERING_KEY_DISK_SIZE bytes at buf (see writeOrderingKeyBytewise())
 Does not check the bytes for correctness
+@param type - the type of the table's keys (table.keyType), which the key is given
 */
-static ordering_key readOrderingKey(ubyte* buf) {
+static ordering_key readOrderingKey(ubyte* buf, ordering_type type) {
 	ordering_key out = {0};
-	out.type = (ordering_type)buf[0];
-	if (out.type == ORDERING_STRING) {
-		memcpy(out.as.string, buf + 1, TEXT_KEY_MAX_LEN); // the array has one more byte, left 0, as the terminator
+	out.type = type;
+	if (type == ORDERING_STRING) {
+		memcpy(out.as.string, buf, TEXT_KEY_MAX_LEN); // the array has one more byte, left 0, as the terminator
 	} else {
-		out.as.u64 = readULong(buf + 1);
+		out.as.u64 = readULong(buf);
 	}
 	return out;
 }
@@ -217,6 +220,8 @@ static bool loadMeta(FILE* file, char* fname, table* table) {
 	table->nodeFree = ((uint64_t) (uint32_t) buf[11] << 32) | (uint32_t) buf[12];
 	table->root    = ((uint64_t) (uint32_t) buf[13] << 32) | (uint32_t) buf[14];
 	table->M = buf[15];
+	if (buf[16] != ORDERING_ULONG && buf[16] != ORDERING_STRING && buf[16] != ORDERING_DOUBLE) return false;
+	table->keyType = (ordering_type) buf[16];
 	return true;
 }
 
@@ -240,7 +245,8 @@ static void fillMeta(table* t, uint32_t* buf) {
 		(uint32_t) (t->nodeFree & 0xFFFFFFFF),
 		(uint32_t) (t->root >> 32),
 		(uint32_t) (t->root & 0xFFFFFFFF),
-		t->M
+		t->M,
+		t->keyType
 	};
 	memcpy(buf, meta, sizeof(meta));
 }
@@ -440,6 +446,7 @@ static table* initTable(char* tablename) {
 	t->pageSize      = PAGE_SIZE;
 	t->nodeSize      = NODE_DISK_SIZE;
 	t->M             = M_GLOBAL;
+	t->keyType       = ORDERING_ULONG; // newTree() sets it to the type of the table's primary key
 	// layout is [node stripe][pageNodeRatio page stripes][node stripe][pageNodeRatio page stripes]...
 	// stripe 1 starts immediately after the header, page stripe 1 right after that
 	t->nodeFree      = t->metalen;
@@ -583,13 +590,13 @@ bool readPage(address addr, slotted_page* p, table* t) {
 		return false;
 	}
 	// header
-	// page header layout: 0(1B) | minKey(25B) | maxKey(25B) | usedData(4B) | numRecords(4B) |
+	// page header layout: 0(1B) | minKey(24B) | maxKey(24B) | usedData(4B) | numRecords(4B) |
 	//                     numEntries(4B) | arrCap(4B) | maxEntries(4B) | maxSlots(4B)  = PAGE_HEADER_DISK_SIZE
 	// it's decoded and checked before p is touched, so a page that can't be read leaves p as it was
 	header h;
 	ubyte* fields = raw + 1 + 2 * ORDERING_KEY_DISK_SIZE; // the fixed-size fields that follow the two keys
-	h.minKey     = readOrderingKey(raw+1);
-	h.maxKey     = readOrderingKey(raw+1 + ORDERING_KEY_DISK_SIZE);
+	h.minKey     = readOrderingKey(raw+1, t->keyType);
+	h.maxKey     = readOrderingKey(raw+1 + ORDERING_KEY_DISK_SIZE, t->keyType);
 	h.usedData   = readUInt(fields);
 	h.numRecords = readUInt(fields+4);
 	h.numEntries = readUInt(fields+8);
@@ -609,10 +616,10 @@ bool readPage(address addr, slotted_page* p, table* t) {
 	p->header  = h;
 	p->slots   = calloc(h.maxSlots, sizeof(sp_slot));
 	p->entries = calloc(h.maxEntries, sizeof(entry));
-	// slots (each slot on disk: ID(25B) | len(4B) | size(4B) | ptr(4B) = SP_SLOT_DISK_SIZE)
+	// slots (each slot on disk: ID(24B) | len(4B) | size(4B) | ptr(4B) = SP_SLOT_DISK_SIZE)
 	int offset = PAGE_HEADER_DISK_SIZE;
 	for (int i = 0; i < p->header.numRecords; i++) {
-		p->slots[i].ID   = readOrderingKey(raw+offset);
+		p->slots[i].ID   = readOrderingKey(raw+offset, t->keyType);
 		p->slots[i].len  = readUInt(raw+offset + ORDERING_KEY_DISK_SIZE);
 		p->slots[i].size = readUInt(raw+offset + ORDERING_KEY_DISK_SIZE + 4);
 		p->slots[i].ptr  = readUInt(raw+offset + ORDERING_KEY_DISK_SIZE + 8);
@@ -675,8 +682,8 @@ bool readNode(address addr, node* n, table* t) {
 	}
 
 	// read metadata
-	// node layout: 1(1B) | parent(8B) | prev(8B) | next(8B) | childCount(4B) | maxKey(25B) | isLeaf(1B) |
-	//              children(8B each) | keys(25B each)
+	// node layout: 1(1B) | parent(8B) | prev(8B) | next(8B) | childCount(4B) | maxKey(24B) | isLeaf(1B) |
+	//              children(8B each) | keys(24B each)
 	n->parent = readULong(raw+1);
 	n->prev = readULong(raw+9);
 	n->next = readULong(raw+17);
@@ -684,7 +691,7 @@ bool readNode(address addr, node* n, table* t) {
 	if (n->childCount > M_GLOBAL) {
 		return false;
 	}
-	n->maxKey = readOrderingKey(raw+29);
+	n->maxKey = readOrderingKey(raw+29, t->keyType);
 	n->isLeaf = raw[NODE_HEADER_DISK_SIZE - 1];
 
 	// check node size to prevent out of bounds accesses
@@ -704,7 +711,7 @@ bool readNode(address addr, node* n, table* t) {
 	}
 	// read keys
 	for (int i = 0; i < keylim; i++) {
-		n->keys[i] = readOrderingKey(raw+offset);
+		n->keys[i] = readOrderingKey(raw+offset, t->keyType);
 		offset += ORDERING_KEY_DISK_SIZE;
 	}
 
@@ -725,22 +732,22 @@ please feel free to change the design of this system because I feel unclean usin
 static char* serializePage(slotted_page* p, table* t) {
 	char* buffer = calloc(t->pageSize, 1);
 	// write header
-	// page header layout: 0(1B) | minKey(25B) | maxKey(25B) | usedData(4B) | numRecords(4B) |
+	// page header layout: 0(1B) | minKey(24B) | maxKey(24B) | usedData(4B) | numRecords(4B) |
 	//                     numEntries(4B) | arrCap(4B) | maxEntries(4B) | maxSlots(4B)  = PAGE_HEADER_DISK_SIZE
 	header h = p->header;
 	char* fields = buffer + 1 + 2 * ORDERING_KEY_DISK_SIZE; // the fixed-size fields that follow the two keys
-	writeOrderingKeyBytewise(buffer+1, h.minKey);
-	writeOrderingKeyBytewise(buffer+1 + ORDERING_KEY_DISK_SIZE, h.maxKey);
+	writeOrderingKeyBytewise(buffer+1, h.minKey, t->keyType);
+	writeOrderingKeyBytewise(buffer+1 + ORDERING_KEY_DISK_SIZE, h.maxKey, t->keyType);
 	writeUIntBytewise(fields,    h.usedData);
 	writeUIntBytewise(fields+4,  h.numRecords);
 	writeUIntBytewise(fields+8,  h.numEntries);
 	writeUIntBytewise(fields+12, h.arrCap);
 	writeUIntBytewise(fields+16, h.maxEntries);
 	writeUIntBytewise(fields+20, h.maxSlots);
-	// write slots (each slot on disk: ID(25B) | len(4B) | size(4B) | ptr(4B) = SP_SLOT_DISK_SIZE)
+	// write slots (each slot on disk: ID(24B) | len(4B) | size(4B) | ptr(4B) = SP_SLOT_DISK_SIZE)
 	int offset = PAGE_HEADER_DISK_SIZE;
 	for (int i = 0; i < h.numRecords; i++) {
-		writeOrderingKeyBytewise(buffer+offset, p->slots[i].ID);
+		writeOrderingKeyBytewise(buffer+offset, p->slots[i].ID, t->keyType);
 		writeUIntBytewise(buffer+offset + ORDERING_KEY_DISK_SIZE,     p->slots[i].len);
 		writeUIntBytewise(buffer+offset + ORDERING_KEY_DISK_SIZE + 4, p->slots[i].size);
 		writeUIntBytewise(buffer+offset + ORDERING_KEY_DISK_SIZE + 8, p->slots[i].ptr);
@@ -805,14 +812,14 @@ serializes the given node into a newly allocated buffer of exactly t->nodeSize b
 static char* serializeNode(node* n, table* t) {
 	char* buffer = calloc(t->nodeSize, 1);
 	// write metadata
-	// node layout: 1(1B) | parent(8B) | prev(8B) | next(8B) | childCount(4B) | maxKey(25B) | isLeaf(1B) |
-	//              children(8B each) | keys(25B each)
+	// node layout: 1(1B) | parent(8B) | prev(8B) | next(8B) | childCount(4B) | maxKey(24B) | isLeaf(1B) |
+	//              children(8B each) | keys(24B each)
 	buffer[0] = 1;
 	writeULongBytewise(buffer+1,  n->parent);
 	writeULongBytewise(buffer+9,  n->prev);
 	writeULongBytewise(buffer+17, n->next);
 	writeUIntBytewise(buffer+25,  n->childCount);
-	writeOrderingKeyBytewise(buffer+29, n->maxKey);
+	writeOrderingKeyBytewise(buffer+29, n->maxKey, t->keyType);
 	buffer[NODE_HEADER_DISK_SIZE - 1] = n->isLeaf;
 	// write children
 	int offset = NODE_HEADER_DISK_SIZE;
@@ -824,7 +831,7 @@ static char* serializeNode(node* n, table* t) {
 	int keylim = n->childCount;
 	if (!n->isLeaf) keylim--;
 	for (int i = 0; i < keylim; i++) {
-		writeOrderingKeyBytewise(buffer+offset, n->keys[i]);
+		writeOrderingKeyBytewise(buffer+offset, n->keys[i], t->keyType);
 		offset += ORDERING_KEY_DISK_SIZE;
 	}
 	return buffer;

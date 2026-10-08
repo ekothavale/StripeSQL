@@ -641,6 +641,34 @@ void test_meta_bad_magic(void) {
     printf("PASS\n");
 }
 
+/*
+A header whose key type isn't one of the ordering types is rejected: nothing in the file's keys says what
+type they are, so they couldn't be read.
+*/
+void test_meta_bad_key_type(void) {
+    printf("  test_meta_bad_key_type ... ");
+    table* t = createTable("_mt_badkt");
+    assert(t != NULL);
+    close_table_keep_file(t);
+    table* ok = calloc(1, sizeof(table));
+    assert(loadTable("_mt_badkt", ok));  // as written, it loads
+    close_table_keep_file(ok);
+
+    // the key type is the header's last word (see fillMeta() in tableIO.c)
+    FILE* f = fopen("tables/_mt_badkt.tbl", "rb+");
+    assert(f != NULL);
+    uint32_t unknown = 7;
+    fseek(f, (METALEN - 1) * 4, SEEK_SET);
+    assert(fwrite(&unknown, 4, 1, f) == 1);
+    fclose(f);
+
+    table* t2 = calloc(1, sizeof(table));
+    assert(!loadTable("_mt_badkt", t2));
+    free(t2);
+    remove("tables/_mt_badkt.tbl");
+    printf("PASS\n");
+}
+
 // --- markPage ---
 
 /*
@@ -1187,6 +1215,7 @@ void test_page_roundtrip_records(void) {
     for (int which = 0; which < 2; which++) {
         ordering_key* keys = sets[which];
         table t = make_test_table();
+        t.keyType = keys[0].type;  // a key is read back with the type its table has
         slotted_page* p = make_small_page(4);
         char buf[16];
         for (int i = 3; i >= 0; i--) {  // inserted largest first
@@ -1295,6 +1324,76 @@ void test_page_read_damaged_header(void) {
     printf("PASS\n");
 }
 
+/* Reads the page-sized or node-sized object at addr straight from the table's file. The caller frees it. */
+static unsigned char* raw_object(table* t, address addr, int size) {
+    unsigned char* raw = malloc(size);
+    fseek(t->source, (long)addr, SEEK_SET);
+    assert(fread(raw, 1, size, t->source) == (size_t)size);
+    return raw;
+}
+
+/*
+A key on disk is its value and nothing else, ORDERING_KEY_DISK_SIZE bytes of it: the bytes of a string key,
+or a number most significant byte first, with zeros after. Its type isn't there. It's the table's keyType,
+so the same bytes read through a table with another key type are a key of that type.
+*/
+void test_key_type_not_stored_with_keys(void) {
+    printf("  test_key_type_not_stored_with_keys ... ");
+    assert(ORDERING_KEY_DISK_SIZE == TEXT_KEY_MAX_LEN);
+    unsigned char apple[ORDERING_KEY_DISK_SIZE] = "apple", pear[ORDERING_KEY_DISK_SIZE] = "pear";
+    unsigned char number[ORDERING_KEY_DISK_SIZE] = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+
+    // a page of string keys: the two bounds, then each slot's key
+    table t = make_test_table();
+    t.keyType = ORDERING_STRING;
+    slotted_page* p = make_small_page(4);
+    insert_text(p, okey_text("pear"), "row 1");
+    insert_text(p, okey_text("apple"), "row 0");
+    address addr = write_page(p, &t);
+    unsigned char* raw = raw_object(&t, addr, TEST_PAGE_SIZE);
+    assert(raw[0] == 0);
+    assert(memcmp(raw + 1, apple, ORDERING_KEY_DISK_SIZE) == 0);
+    assert(memcmp(raw + 1 + ORDERING_KEY_DISK_SIZE, pear, ORDERING_KEY_DISK_SIZE) == 0);
+    assert(memcmp(raw + PAGE_HEADER_DISK_SIZE, apple, ORDERING_KEY_DISK_SIZE) == 0);
+    assert(memcmp(raw + PAGE_HEADER_DISK_SIZE + SP_SLOT_DISK_SIZE, pear, ORDERING_KEY_DISK_SIZE) == 0);
+    free(raw);
+    freeSPage(p);
+    free(p);
+
+    // a node of numeric keys: maxKey in the header, then the keys after the children
+    t.keyType = ORDERING_ULONG;
+    node n = {0};
+    n.isLeaf = true;
+    n.childCount = 2;
+    n.children[0] = 1000; n.children[1] = 1001;
+    n.keys[0] = okey(5);
+    n.keys[1] = n.maxKey = okey(0x0102030405060708ULL);
+    address nodeAddr = allocNode(&t);
+    markNode(nodeAddr, &n, &t);
+    writeNextNode(&t);
+    raw = raw_object(&t, nodeAddr, TEST_NODE_SIZE);
+    assert(raw[0] == 1);
+    assert(memcmp(raw + 29, number, ORDERING_KEY_DISK_SIZE) == 0);
+    assert(memcmp(raw + NODE_HEADER_DISK_SIZE + 2 * 8 + ORDERING_KEY_DISK_SIZE, number, ORDERING_KEY_DISK_SIZE) == 0);
+    free(raw);
+
+    // read as numbers, and then, through a table of string keys, as strings
+    node r = {0};
+    assert(readNode(nodeAddr, &r, &t));
+    assert(r.maxKey.type == ORDERING_ULONG && r.keys[1].as.u64 == 0x0102030405060708ULL && r.keys[0].as.u64 == 5);
+    t.keyType = ORDERING_STRING;
+    assert(readNode(nodeAddr, &r, &t));
+    assert(r.maxKey.type == ORDERING_STRING && r.keys[1].type == ORDERING_STRING);
+    assert(strcmp(r.keys[1].as.string, "\x01\x02\x03\x04\x05\x06\x07\x08") == 0);
+    slotted_page asText = {0};
+    assert(readPage(addr, &asText, &t));
+    assert(asText.slots[0].ID.type == ORDERING_STRING && strcmp(asText.slots[0].ID.as.string, "apple") == 0);
+    freeSPage(&asText);
+
+    free_test_table(&t);
+    printf("PASS\n");
+}
+
 /*
 A node's keys and maxKey survive the disk as whole keys: numeric keys beyond what the old 19-byte page
 number held, and string keys up to the maximum length.
@@ -1311,6 +1410,7 @@ void test_node_roundtrip_full_keys(void) {
     for (int which = 0; which < 2; which++) {
         ordering_key* keys = sets[which];
         table t = make_test_table();
+        t.keyType = keys[0].type;
         node n = {0};
         n.isLeaf = true;
         n.childCount = 3;
@@ -1357,6 +1457,7 @@ void test_tableio(void) {
     test_meta_roundtrip();
     test_meta_large_addr();
     test_meta_bad_magic();
+    test_meta_bad_key_type();
     // markPage
     test_mark_page_dedup();
     test_mark_page_snapshot();
@@ -1387,6 +1488,7 @@ void test_tableio(void) {
     test_node_write_empty_hashmap();
     test_node_roundtrip();
     test_node_roundtrip_full_keys();
+    test_key_type_not_stored_with_keys();
     test_node_write_drains_all();
     printf("=== All tableIO tests passed ===\n");
 }
@@ -1423,6 +1525,7 @@ void test_create_table_fields(void) {
     assert(t->M         == M_GLOBAL);
     assert(t->root      == 0);
     assert(t->metalen   == METALEN * 4);
+    assert(t->keyType   == ORDERING_ULONG);  // until newTree() gives it the type of the table's primary key
     // layout is [node stripe][pageNodeRatio page stripes] per unit — node
     // stripe 1 starts immediately after the header, page stripe 1 right
     // after that
@@ -1559,7 +1662,7 @@ createTree must return a non-NULL, properly initialised table.
 */
 void test_create_tree_not_null(void) {
     printf("  test_create_tree_not_null ... ");
-    table* t = createTree("mgmt_t1", okey(0));
+    table* t = createTree("mgmt_t1", ORDERING_ULONG);
     assert(t != NULL);
     assert(t->root != 0);
     deleteTree(t);
@@ -1567,15 +1670,22 @@ void test_create_tree_not_null(void) {
 }
 
 /*
-The root node written by createTree must be a leaf with one page, filed under the key createTree was given
-(the smallest key of the table's key type), which is also the node's maxKey.
+The root node written by createTree must be a leaf with one page, filed under the smallest key of the key
+type createTree was given, which is also the node's maxKey. The table keeps that type, and so does its
+file: the table loaded back has it, and gives it to the keys it reads.
 */
 void test_create_tree_root_node(void) {
     printf("  test_create_tree_root_node ... ");
-    ordering_key first[] = { okey(0), okey_text("") };
-    for (int i = 0; i < 2; i++) {
-        table* t = createTree("mgmt_t2", first[i]);
+    ordering_key first[] = { okey(0), okey_text(""), { .type = ORDERING_DOUBLE } };
+    for (int i = 0; i < 3; i++) {
+        table* t = createTree("mgmt_t2", first[i].type);
         assert(t != NULL);
+        assert(t->keyType == first[i].type);
+        close_table_keep_file(t);
+
+        t = calloc(1, sizeof(table));
+        assert(loadTable("mgmt_t2", t));
+        assert(t->keyType == first[i].type);
 
         node n = {0};
         bool ok = readNode(t->root, &n, t);
@@ -1596,7 +1706,7 @@ The initial page pointed to by the root must be readable and empty, with no keys
 */
 void test_create_tree_initial_page(void) {
     printf("  test_create_tree_initial_page ... ");
-    table* t = createTree("mgmt_t3", okey(0));
+    table* t = createTree("mgmt_t3", ORDERING_ULONG);
     assert(t != NULL);
 
     node n = {0};
@@ -1673,7 +1783,7 @@ static void free_page_contents(slotted_page* p) {
 
 /* An empty tree whose keys are unsigned integers. */
 static table* create_test_tree(char* name) {
-    table* t = createTree(name, okey(0));
+    table* t = createTree(name, ORDERING_ULONG);
     assert(t != NULL);
     return t;
 }
@@ -2271,7 +2381,7 @@ void test_btree_key_of_another_type(void) {
     }
 
     // and the other way round: a numeric key in a tree of string keys
-    table* t = createTree("bt_koat2", okey_text(""));
+    table* t = createTree("bt_koat2", ORDERING_STRING);
     entry e = make_btree_entry("stray");
     sp_record r = make_btree_record(&e, 1);
     assert(insertRecord(&r, okey(7), t) == 2);
@@ -2280,6 +2390,39 @@ void test_btree_key_of_another_type(void) {
     assert(insertRecord(&r, okey(7), t) == 2);
     assert(searchRecord(okey_text("pear"), t) && !searchRecord(okey(7), t));
     deleteTree(t);
+    printf("PASS\n");
+}
+
+/*
+A new tree's first page is filed under a key of the table's type from the moment newTree() builds it, while
+the table is still only in memory, so the first keys inserted are compared with a key of their own type.
+Those rows are found before the table's first commit and after it, from the file.
+*/
+void test_btree_new_tree_before_commit(void) {
+    printf("  test_btree_new_tree_before_commit ... ");
+    table* t = newTree("bt_ntbc", ORDERING_STRING);
+    assert(t != NULL && t->keyType == ORDERING_STRING && !tbl_file_exists("bt_ntbc"));
+    node root = {0};
+    assert(readNode(t->root, &root, t));  // from the pending changes: there is no file yet
+    assert(root.keys[0].type == ORDERING_STRING && root.maxKey.type == ORDERING_STRING);
+
+    const char* names[] = { "pear", "apple", "fig" };
+    for (int i = 0; i < 3; i++) {
+        entry e = make_btree_entry(names[i]);
+        sp_record r = make_btree_record(&e, 1);
+        assert(insertRecord(&r, okey_text(names[i]), t) == 0);
+    }
+    for (int i = 0; i < 3; i++) assert(searchRecord(okey_text(names[i]), t));
+    assert(readNode(t->root, &root, t));
+    assert(compareOrderingKeys(root.keys[0], okey_text("pear")) == 0);  // the page's bound followed its largest key
+
+    assert(commit(t));
+    close_table_keep_file(t);
+    table* t2 = calloc(1, sizeof(table));
+    assert(loadTable("bt_ntbc", t2));
+    for (int i = 0; i < 3; i++) assert(searchRecord(okey_text(names[i]), t2));
+    assert(!searchRecord(okey_text("plum"), t2));
+    deleteTree(t2);
     printf("PASS\n");
 }
 
@@ -2771,6 +2914,7 @@ void test_btree(void) {
     test_btree_update_grows_row();
     test_btree_smallest_key();
     test_btree_key_of_another_type();
+    test_btree_new_tree_before_commit();
     // the whole tree, as rows come and go
     test_btree_small_rows_in_random_order();
     test_btree_node_split();
@@ -2866,7 +3010,7 @@ static void read_tbl_bytes(const char* name, address addr, char* out, size_t len
 
 /* Create a table and return an address in its unused space, for logging raw writes to. */
 static address make_wal_table(char* name) {
-    table* t = createTree(name, okey(0));
+    table* t = createTree(name, ORDERING_ULONG);
     assert(t != NULL);
     address addr = t->pageFree;
     close_table_keep_file(t);

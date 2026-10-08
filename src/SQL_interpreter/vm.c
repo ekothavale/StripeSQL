@@ -191,9 +191,8 @@ static ordering_type sqlTypeToOrdering(SQL_type t) {
 }
 
 /*
-finds the ordering type of a table's primary key column, so the placeholder
-page created at CREATE TABLE time can be tagged with the correct type instead
-of defaulting to ORDERING_ULONG (see createTree() below)
+finds the ordering type of a table's primary key column, which the table
+created at CREATE TABLE time is given as the type of its keys (see newTree())
 */
 static ordering_type getPkOrderingType(schema* s) {
 	for (int i = 0; i < s->count; i++) {
@@ -1062,13 +1061,13 @@ static interpret_result run() {
 				}
 				// a table still open under this name belongs to a file that is gone
 				evictTableCache(hash);
-				ordering_key firstKey = { .type = getPkOrderingType(s) }; // the smallest key of that type
+				ordering_type keyType = getPkOrderingType(s); // kept in the table: every key in it has this type
 				if (vm.failed) {
 					break;
 				}
 				// the new table's file and its schema entry are committed together, so a crash can't
 				// leave one without the other
-				table* t = newTree(s->tablename, firstKey);
+				table* t = newTree(s->tablename, keyType);
 				size_t len;
 				char* bytes = serializeSchema(vm.schema, &len);
 				bool committed = false;

@@ -32,6 +32,8 @@ which is implemented in another file.
 
 /* Keys:
  - Every record is found by one ordering key, built from its primary key (see ordering.c -> pkToOk())
+ - Every key in a table has the same type, the table's keyType, which is stored once in the file's header
+   and not with each key
  - A page holds the records for one run of consecutive keys, sorted by key, and splits in two when it fills,
    so which keys share a page depends on what has been inserted
  - A leaf node files each of its pages under a key that is an upper bound for that page's keys: every key in
@@ -90,14 +92,16 @@ static node* newNode(bool isLeaf, address parent) {
 /*
 builds a new table's b+ tree in memory, with one empty node and one empty page, both dirty
 nothing touches the disk until the table is committed, which also creates its file (see newTable())
-@param firstKey - the smallest key of the table's key type. The first page is filed under it until a record
-                  is inserted, and it gives the tree's keys their type
+@param keyType - the type of the table's keys, which is kept in the table. The first page is filed under the
+                 smallest key of that type until a record is inserted
 @return - table struct containing the necessary data to use the table
 mallocs new memory (table)
 */
-table* newTree(char* tablename, ordering_key firstKey) {
+table* newTree(char* tablename, ordering_type keyType) {
 	// create structs
 	table* t = newTable(tablename);
+	t->keyType = keyType;
+	ordering_key firstKey = { .type = keyType };
 	node* root = calloc(1, sizeof(node));
 	address rootAddr = allocNode(t);
 	slotted_page* page = makeSPage(PAGE_NUM_SLOTS, PAGE_NUM_ENTRIES, PAGE_ARR_CAP);
@@ -123,12 +127,12 @@ table* newTree(char* tablename, ordering_key firstKey) {
 
 /*
 creates a new table with an empty b+ tree and commits it, which creates its file
-@param firstKey - the smallest key of the table's key type (see newTree())
+@param keyType - the type of the table's keys (see newTree())
 @return - table struct containing the necessary data to use the table, or NULL if the commit failed
 mallocs new memory (table)
 */
-table* createTree(char* tablename, ordering_key firstKey) {
-	table* t = newTree(tablename, firstKey);
+table* createTree(char* tablename, ordering_type keyType) {
+	table* t = newTree(tablename, keyType);
 	if (!commit(t)) {
 		freeTable(t);
 		return NULL;
@@ -828,14 +832,14 @@ static bool deletePage(node* n, address* nAddr, address pageAddr, table* t)  {
 walks from the root to the leaf node whose pages cover key, and reads that node into leaf
 a key above every key in the tree leads to the last leaf
 @return the leaf's address, or 0 if a node on the way couldn't be read, or if key isn't of the type this
-        tree's keys are: keys of different types can't be compared, so such a key is in no page
+        table's keys are: keys of different types can't be compared, so such a key is in no page
 */
 static address findLeaf(ordering_key key, table* t, node* leaf) {
+	if (key.type != t->keyType) return 0;
 	address addr = t->root;
 	if (!readNode(addr, leaf, t)) return 0;
 	while (!leaf->isLeaf) {
 		if (leaf->childCount == 0) return 0;
-		if (leaf->childCount > 1 && key.type != leaf->keys[0].type) return 0;
 		// a child's key is an upper bound for every key under it, so key belongs under the first child
 		// whose key isn't below it, or under the last child if it's above them all
 		uint32_t i = 0;
@@ -843,7 +847,6 @@ static address findLeaf(ordering_key key, table* t, node* leaf) {
 		addr = leaf->children[i];
 		if (!readNode(addr, leaf, t)) return 0;
 	}
-	if (leaf->childCount > 0 && key.type != leaf->keys[0].type) return 0;
 	return addr;
 }
 

@@ -25,15 +25,15 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 #include "node.h"
 
 /*
-identifies a table file and the layout of what's in it. Change it whenever the on-disk layout of a page
-or node changes, so that files written with the old layout are rejected instead of misread
-(eventually move type byte to table header for efficiency and typed tables)
+identifies a table file and the layout of what's in it. Change it whenever the on-disk layout of the
+header, a page or a node changes, so that files written with the old layout are rejected instead of misread
 previous magics:
  - 0xFACE3419 pagenum, offset split
  - 0xFACE341A full ordering keys, bit-reversed (ints) or padded and byte-reversed (text)
+ - 0xFACE341B keys in primary-key order, each stored with a byte for its type
 */
-#define MAGIC 0xFACE341B
-#define METALEN 16 // number of 4-byte words needed to represent a table's metadata
+#define MAGIC 0xFACE341C
+#define METALEN 17 // number of 4-byte words needed to represent a table's metadata
 
 // On-disk layouts (written by serializePage() and serializeNode() in tableIO.c)
 // page header: 0(1B) | minKey | maxKey | usedData(4B) | numRecords(4B) | numEntries(4B) | arrCap(4B) |
@@ -88,6 +88,7 @@ typedef struct table {
 	int pageSize; // size of page in bytes
 	int nodeSize; // size of node in bytes
 	int M; // maximum number of children each node can have
+	ordering_type keyType; // the type of every key in the table: stored once, in the file's header, not with each key
 }table;
 
 /*
