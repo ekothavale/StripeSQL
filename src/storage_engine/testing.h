@@ -52,6 +52,7 @@ void test_btree_update_grows_row(void);
 void test_btree_smallest_key(void);
 void test_btree_key_of_another_type(void);
 void test_btree_new_tree_before_commit(void);
+void test_btree_rows_per_page_follow_key_size(void);
 void test_btree_small_rows_in_random_order(void);
 void test_btree_node_split(void);
 void test_btree_delete_from_the_end(void);

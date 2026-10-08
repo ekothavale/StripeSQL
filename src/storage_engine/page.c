@@ -31,19 +31,20 @@ would need to be overwritten.
 // HELPER FUNCTIONS
 
 /*
-the bytes a record takes up in a page on disk: its slot, its entries' data (size bytes in all), and the
-6 bytes holding the size and type that are written before each entry
+the bytes a record takes up in this page on disk: its slot, which is as large as the keys of the page's
+table need (header.keySize), its entries' data (size bytes in all), and the 6 bytes holding the size and
+type that are written before each entry
 see the code in tableIO.c -> serializePage() to adjust if needed
 */
-uint32_t SPRecordBytes(uint32_t size, uint32_t numEntries) {
-	return SP_SLOT_DISK_SIZE + 6 * numEntries + size;
+uint32_t SPRecordBytes(slotted_page* p, uint32_t size, uint32_t numEntries) {
+	return SP_SLOT_DISK_SIZE(p->header.keySize) + 6 * numEntries + size;
 }
 
 /*
 the bytes all of a page's records take up on disk
 */
 uint32_t SPUsedBytes(slotted_page* p) {
-	return p->header.numRecords * SP_SLOT_DISK_SIZE + 6 * p->header.numEntries + p->header.usedData;
+	return p->header.numRecords * SP_SLOT_DISK_SIZE(p->header.keySize) + 6 * p->header.numEntries + p->header.usedData;
 }
 
 /*
@@ -58,7 +59,7 @@ bool SPFits(slotted_page* p) {
 checks if adding a record to a page would exceed the size limit of the page on disk (causing a write overflow)
 */
 bool SPHasRoom(slotted_page* p, uint32_t size, uint32_t numEntries) {
-	return SPUsedBytes(p) + SPRecordBytes(size, numEntries) <= p->header.arrCap;
+	return SPUsedBytes(p) + SPRecordBytes(p, size, numEntries) <= p->header.arrCap;
 }
 
 /*
@@ -123,11 +124,13 @@ makes an empty page. It has no keys of its own until a record is inserted (see h
 @param - numSlots - maximum number of slots for the page to hold
 @param - numEntries - maximum number of entries for the page to hold
 @param - capacity - maximum capacity of the slot array (including both entries and slots)
+@param - keySize - bytes each record's key will take on disk: what the keys of the page's table need
 Callocs new memory
 */
-slotted_page* makeSPage(uint32_t numSlots, uint32_t numEntries, uint32_t capacity) {
+slotted_page* makeSPage(uint32_t numSlots, uint32_t numEntries, uint32_t capacity, uint32_t keySize) {
 	slotted_page* out = calloc(1, sizeof(slotted_page));
 	out->header.arrCap = capacity;
+	out->header.keySize = keySize;
 	out->header.maxSlots = numSlots;
 	out->header.maxEntries = numEntries;
 	out->slots = calloc(numSlots, sizeof(sp_slot));

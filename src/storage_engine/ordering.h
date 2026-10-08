@@ -24,9 +24,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 
 #define TEXT_KEY_MAX_LEN 24 // maximum size in bytes of a string ordering key
 
-// On-disk size of an ordering key, the same for every key type: TEXT_KEY_MAX_LEN bytes of data. A key's
-// type isn't stored with it: every key in a table has the same type, kept once in the table's header
-#define ORDERING_KEY_DISK_SIZE TEXT_KEY_MAX_LEN
+#define NUMERIC_KEY_DISK_SIZE 8 // size in bytes of an integer or floating-point ordering key on disk
+
+// On-disk size of the largest ordering key there is. How much room a key takes depends on its type (see
+// orderingKeyDiskSize()), and every key in a table has the same type, kept once in the table's header and
+// not with each key, so a table's slots and nodes are sized for the keys that table holds
+#define ORDERING_KEY_MAX_DISK_SIZE TEXT_KEY_MAX_LEN
 
 // a table's header stores one of these as the type of its keys, so their values can't change
 typedef enum {
@@ -44,6 +47,7 @@ typedef struct {
 } ordering_key;
 
 ordering_key pkToOk(value pk);
+uint32_t orderingKeyDiskSize(ordering_type type);
 int compareOrderingKeys(ordering_key a, ordering_key b);
 
 #endif // ORDERING_H

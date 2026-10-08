@@ -31,18 +31,22 @@ previous magics:
  - 0xFACE3419 pagenum, offset split
  - 0xFACE341A full ordering keys, bit-reversed (ints) or padded and byte-reversed (text)
  - 0xFACE341B keys in primary-key order, each stored with a byte for its type
+ - 0xFACE341C every key stored in 24 bytes, whatever the type of the table's keys
 */
-#define MAGIC 0xFACE341C
+#define MAGIC 0xFACE341D
 #define METALEN 17 // number of 4-byte words needed to represent a table's metadata
 
 // On-disk layouts (written by serializePage() and serializeNode() in tableIO.c)
+// Their sizes depend on keySize, the bytes a key of the table's key type takes on disk (see keyDiskSize()),
+// so they differ from table to table: a table of integer keys has smaller slots, page headers and nodes
+// than a table of text keys
 // page header: 0(1B) | minKey | maxKey | usedData(4B) | numRecords(4B) | numEntries(4B) | arrCap(4B) |
 //              maxEntries(4B) | maxSlots(4B)
-#define PAGE_HEADER_DISK_SIZE (1 + 2 * ORDERING_KEY_DISK_SIZE + 24)
+#define PAGE_HEADER_DISK_SIZE(keySize) (1 + 2 * (keySize) + 24)
 // node header: 1(1B) | parent(8B) | prev(8B) | next(8B) | childCount(4B) | maxKey | isLeaf(1B)
-#define NODE_HEADER_DISK_SIZE (30 + ORDERING_KEY_DISK_SIZE)
+#define NODE_HEADER_DISK_SIZE(keySize) (30 + (keySize))
 // a whole node: its header, then room for M_GLOBAL children (8B each) and M_GLOBAL keys
-#define NODE_DISK_SIZE (NODE_HEADER_DISK_SIZE + M_GLOBAL * (8 + ORDERING_KEY_DISK_SIZE))
+#define NODE_DISK_SIZE(keySize) (NODE_HEADER_DISK_SIZE(keySize) + M_GLOBAL * (8 + (keySize)))
 
 typedef struct addr_entry {
 	address key;   // 0 = empty slot (address 0 is never a valid page/node address)
@@ -86,7 +90,7 @@ typedef struct table {
 	int nodeStripeLen; // number of nodes per stripe
 	int pageNodeRatio; // how many page stripes there are per node stripe
 	int pageSize; // size of page in bytes
-	int nodeSize; // size of node in bytes
+	int nodeSize; // size of node in bytes: NODE_DISK_SIZE() for the table's keys
 	int M; // maximum number of children each node can have
 	ordering_type keyType; // the type of every key in the table: stored once, in the file's header, not with each key
 }table;
@@ -112,8 +116,10 @@ bool removeAddrTable(address key, addr_table* at, void** valueOut); // valueOut 
 // manage table struct
 void freeTable(table* t);
 // manage database tables
-table* createTable(char* tablename); // creates the file immediately, bypassing the log
-table* newTable(char* tablename); // in memory only; the file is created by its first commit
+table* createTable(char* tablename, ordering_type keyType); // creates the file immediately, bypassing the log
+table* newTable(char* tablename, ordering_type keyType); // in memory only; the file is created by its first commit
+uint32_t keyDiskSize(table* t); // bytes each of the table's keys takes on disk
+uint32_t pageCapacity(table* t); // bytes of records, slots and data together, that one of the table's pages holds
 bool loadTable(char* tablename, table* t);
 bool deleteTable(table* t);
 // loading pages and nodes into caller-provided structs

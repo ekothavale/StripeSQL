@@ -90,21 +90,30 @@ static node* newNode(bool isLeaf, address parent) {
 }
 
 /*
+makes an empty page for a table: as much room for records as the table's pages have, and slots sized for
+its keys
+Callocs new memory (see makeSPage())
+*/
+static slotted_page* newPage(table* t) {
+	return makeSPage(PAGE_NUM_SLOTS, PAGE_NUM_ENTRIES, pageCapacity(t), keyDiskSize(t));
+}
+
+/*
 builds a new table's b+ tree in memory, with one empty node and one empty page, both dirty
 nothing touches the disk until the table is committed, which also creates its file (see newTable())
-@param keyType - the type of the table's keys, which is kept in the table. The first page is filed under the
-                 smallest key of that type until a record is inserted
+@param keyType - the type of the table's keys, which is kept in the table and decides how large its slots
+                 and nodes are. The first page is filed under the smallest key of that type until a record
+                 is inserted
 @return - table struct containing the necessary data to use the table
 mallocs new memory (table)
 */
 table* newTree(char* tablename, ordering_type keyType) {
 	// create structs
-	table* t = newTable(tablename);
-	t->keyType = keyType;
+	table* t = newTable(tablename, keyType);
 	ordering_key firstKey = { .type = keyType };
 	node* root = calloc(1, sizeof(node));
 	address rootAddr = allocNode(t);
-	slotted_page* page = makeSPage(PAGE_NUM_SLOTS, PAGE_NUM_ENTRIES, PAGE_ARR_CAP);
+	slotted_page* page = newPage(t);
 	address pageAddr = allocPage(t);
 
 	// initialize struct members (root and page already 0ed out)
@@ -925,7 +934,7 @@ static bool chooseSplit(slotted_page* p, bool hasRecord, uint32_t pos, uint32_t 
 				found = true;
 			}
 		}
-		if (keep < p->header.numRecords) below += SPRecordBytes(p->slots[keep].size, p->slots[keep].len);
+		if (keep < p->header.numRecords) below += SPRecordBytes(p, p->slots[keep].size, p->slots[keep].len);
 	}
 	return found;
 }
@@ -970,7 +979,7 @@ bool storePage(slotted_page* p, address pageAddr, table* t, bool* splitOut) {
 	}
 	// a record too large for a page even alone fails here, before the tree is changed
 	for (uint32_t i = 0; i < p->header.numRecords; i++) {
-		if (SPRecordBytes(p->slots[i].size, p->slots[i].len) > PAGE_ARR_CAP) return false;
+		if (SPRecordBytes(p, p->slots[i].size, p->slots[i].len) > pageCapacity(t)) return false;
 	}
 	*splitOut = true;
 	slotted_page* current = p;      // the page still being cut down to size
@@ -984,7 +993,7 @@ bool storePage(slotted_page* p, address pageAddr, table* t, bool* splitOut) {
 			// no even split fits, so the page keeps as many of its records as it has room for
 			uint32_t room = 0;
 			for (keep = 0; keep < current->header.numRecords; keep++) {
-				room += SPRecordBytes(current->slots[keep].size, current->slots[keep].len);
+				room += SPRecordBytes(current, current->slots[keep].size, current->slots[keep].len);
 				if (room > current->header.arrCap) break;
 			}
 			if (keep == 0) { // the first record doesn't fit in a page even alone
@@ -992,7 +1001,7 @@ bool storePage(slotted_page* p, address pageAddr, table* t, bool* splitOut) {
 				break;
 			}
 		}
-		slotted_page* upper = makeSPage(PAGE_NUM_SLOTS, PAGE_NUM_ENTRIES, PAGE_ARR_CAP);
+		slotted_page* upper = newPage(t);
 		address upperAddr = allocPage(t);
 		SPSplit(current, upper, keep);
 		markPage(currentAddr, current, t);
@@ -1022,8 +1031,6 @@ record, splitting the page if it's full
 0 = inserted, 1 = key already exists, 2 = failed, 3 = the record is too large to fit in a page
 */
 int insertRecord(sp_record* record, ordering_key key, table* t) {
-	uint32_t needed = SPRecordBytes(record->size, record->len);
-	if (needed > PAGE_ARR_CAP) return 3;
 	// a page whose records can't be divided into two pages that fit, along with the new one, is first split
 	// where the new record belongs. The second time round, the record is at one end of its page
 	for (int attempt = 0; attempt < 3; attempt++) {
@@ -1037,6 +1044,9 @@ int insertRecord(sp_record* record, ordering_key key, table* t) {
 		address pageAddr = leaf.children[i];
 		slotted_page p = {0};
 		if (!readPage(pageAddr, &p, t)) return 2;
+		// the room the record takes in one of this table's pages: too much, if it's more than a whole page has
+		uint32_t needed = SPRecordBytes(&p, record->size, record->len);
+		if (needed > pageCapacity(t)) { freeSPage(&p); return 3; }
 		// if record already exists, reject insertion
 		if (SPSearch(&p, key) >= 0) { freeSPage(&p); return 1; }
 
@@ -1056,7 +1066,7 @@ int insertRecord(sp_record* record, ordering_key key, table* t) {
 		if (p.header.numRecords == 0) { freeSPage(&p); return 3; } // an empty page that still has no room for it
 
 		// the page is full
-		slotted_page* upper = makeSPage(PAGE_NUM_SLOTS, PAGE_NUM_ENTRIES, PAGE_ARR_CAP);
+		slotted_page* upper = newPage(t);
 		address upperAddr = allocPage(t);
 		uint32_t pos = SPPosition(&p, key);
 		uint32_t keep;
@@ -1129,7 +1139,7 @@ bool updateRecord(sp_record* record, ordering_key key, table* t) {
 		uint32_t size = slot.size;
 		for (uint32_t i = 0; i < record->len; i++) size += record->entries[i].size - p.entries[slot.ptr + i].size;
 		bool split;
-		out = SPRecordBytes(size, slot.len) <= PAGE_ARR_CAP && SPUpdate(&p, key, *record) && storePage(&p, addr, t, &split);
+		out = SPRecordBytes(&p, size, slot.len) <= pageCapacity(t) && SPUpdate(&p, key, *record) && storePage(&p, addr, t, &split);
 	}
 	freeSPage(&p);
 	return out;

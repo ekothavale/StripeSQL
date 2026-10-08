@@ -28,8 +28,8 @@ This representation is not the same used to store pages on disk; the translation
 #include "ordering.h"
 
 #define SLOTTED_PAGE_SLOT_GROWTH_RATE 1.5
-// On-disk size of one sp_slot: ID (ORDERING_KEY_DISK_SIZE) + ptr(4) + len(4) + size(4)
-#define SP_SLOT_DISK_SIZE (ORDERING_KEY_DISK_SIZE + 12)
+// On-disk size of one sp_slot in a table whose keys take keySize bytes on disk: ID (keySize) + ptr(4) + len(4) + size(4)
+#define SP_SLOT_DISK_SIZE(keySize) ((keySize) + 12)
 
 typedef enum datatype {
 	T_INT,
@@ -62,6 +62,10 @@ typedef struct header {
 	uint32_t arrCap; // total size in bytes of slot array including both slots and records
 	uint32_t maxEntries; // max number of entries in the page
 	uint32_t maxSlots; // max number of slots in the page
+	// the number of bytes each record's key takes on disk, which depends on the type of the table's keys
+	// (see orderingKeyDiskSize()). It's the same for every page of a table, so it isn't stored in the page on
+	// disk: makeSPage() and readPage() set it here, and the page uses it to work out how full it is
+	uint32_t keySize;
 }header;
 
 typedef struct entry {
@@ -96,7 +100,7 @@ typedef struct slotted_page {
 	sp_slot* slots;
 }slotted_page;
 
-slotted_page* makeSPage(uint32_t numSlots, uint32_t numEntries, uint32_t capacity);
+slotted_page* makeSPage(uint32_t numSlots, uint32_t numEntries, uint32_t capacity, uint32_t keySize);
 void freeSPage(slotted_page* p);
 
 bool SPInsert(slotted_page* p, ordering_key key, sp_record r);
@@ -106,7 +110,7 @@ int SPSearch(slotted_page* p, ordering_key key);
 sp_record SPRead(slotted_page* p, ordering_key key);
 
 // how full a page is, measured in the bytes its records take up on disk (it is full at header.arrCap)
-uint32_t SPRecordBytes(uint32_t size, uint32_t numEntries);
+uint32_t SPRecordBytes(slotted_page* p, uint32_t size, uint32_t numEntries);
 uint32_t SPUsedBytes(slotted_page* p);
 bool SPFits(slotted_page* p);
 bool SPHasRoom(slotted_page* p, uint32_t size, uint32_t numEntries);

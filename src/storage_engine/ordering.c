@@ -84,6 +84,14 @@ ordering_key pkToOk(value pk) {
 }
 
 /*
+the number of bytes a key of this type takes on disk: room for the longest string key, or a number's eight
+bytes. Every key in a table has the table's key type, so this is the same for all of a table's keys
+*/
+uint32_t orderingKeyDiskSize(ordering_type type) {
+	return type == ORDERING_STRING ? TEXT_KEY_MAX_LEN : NUMERIC_KEY_DISK_SIZE;
+}
+
+/*
 compares two string keys byte by byte, as unsigned bytes, so that a string sorts after its own prefixes
 and text in UTF-8 sorts by code point
 */

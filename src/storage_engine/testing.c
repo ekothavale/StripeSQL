@@ -27,6 +27,13 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 // ##########################################################################################################################################
 // SHARED TEST HELPERS
 
+// how many bytes a key takes on disk depends on its type, and with it the size of a slot, a page header and a
+// node. The tests' pages and tables hold numeric keys unless they say otherwise
+#define NUM_KEY NUMERIC_KEY_DISK_SIZE
+#define TEXT_KEY TEXT_KEY_MAX_LEN
+// the room for records in a page of a real table (PAGE_SIZE bytes on disk) whose keys take keySize bytes
+#define PAGE_CAP(keySize) (PAGE_SIZE - PAGE_HEADER_DISK_SIZE(keySize))
+
 /* A numeric ordering key, so tests can write okey(42) instead of a compound literal. */
 static ordering_key okey(uint64_t v) {
     return (ordering_key){ .type = ORDERING_ULONG, .as.u64 = v };
@@ -170,6 +177,7 @@ static slotted_page* make_test_page(void) {
     p->header.numRecords = 0;
     p->header.numEntries = 0;
     p->header.arrCap     = 8192;
+    p->header.keySize    = NUM_KEY;
     p->header.maxSlots   = 64;
     p->header.maxEntries = 256;
     p->slots   = calloc(64,  sizeof(sp_slot));
@@ -418,7 +426,8 @@ every insert and delete, whichever end the change is at, and are zeroed whenever
 */
 void test_page_key_bounds(void) {
     printf("  test_page_key_bounds ... ");
-    slotted_page* made = makeSPage(PAGE_NUM_SLOTS, PAGE_NUM_ENTRIES, PAGE_ARR_CAP);
+    slotted_page* made = makeSPage(PAGE_NUM_SLOTS, PAGE_NUM_ENTRIES, PAGE_CAP(NUM_KEY), NUM_KEY);
+    assert(made->header.arrCap == PAGE_CAP(NUM_KEY) && made->header.keySize == NUM_KEY);
     check_empty(made);  // a new page has no keys
     freeSPage(made);
     free(made);
@@ -486,14 +495,15 @@ void test_page(void) {
 bool writeMeta(FILE* file, table* t);
 
 #define TEST_PAGE_SIZE 512
-#define TEST_NODE_SIZE NODE_DISK_SIZE
+#define TEST_NODE_SIZE NODE_DISK_SIZE(NUM_KEY)
 
-/* Create an in-memory table backed by a fresh tmpfile. */
-static table make_test_table(void) {
+/* Create an in-memory table backed by a fresh tmpfile, with keys of the given type and nodes sized for them. */
+static table make_test_table_of(ordering_type keyType) {
     table t;
     memset(&t, 0, sizeof(t));
     t.source = tmpfile();
     t.cursor = 0;
+    t.keyType = keyType;
     t.metalen = METALEN * 4;
     t.pageStripes = 1;
     t.nodeStripes = 1;
@@ -501,7 +511,7 @@ static table make_test_table(void) {
     t.nodeStripeLen = 4;
     t.pageNodeRatio = 2;
     t.pageSize = TEST_PAGE_SIZE;
-    t.nodeSize = TEST_NODE_SIZE;
+    t.nodeSize = NODE_DISK_SIZE(orderingKeyDiskSize(keyType));
     // layout is [node stripe][pageNodeRatio page stripes] per unit — node
     // stripe 1 starts immediately after the header, page stripe 1 right
     // after that (matches createTable(); see currentPageStripeStart/
@@ -516,6 +526,11 @@ static table make_test_table(void) {
     initAddrTable(&t.delete);
     writeMeta(t.source, &t);
     return t;
+}
+
+/* The same, with numeric keys. */
+static table make_test_table(void) {
+    return make_test_table_of(ORDERING_ULONG);
 }
 
 /* Free dirty-table heap copies and close the backing file. */
@@ -539,6 +554,7 @@ static slotted_page* make_io_page(ordering_key key) {
     p->header.numRecords = 3;
     p->header.numEntries = 0;
     p->header.arrCap     = 200;
+    p->header.keySize    = NUM_KEY;
     p->header.maxEntries = 10;
     p->header.maxSlots   = 5;
     p->slots   = calloc(10, sizeof(sp_slot));
@@ -560,7 +576,7 @@ verifying every field survives the round-trip through writeMeta / loadMeta.
 */
 void test_meta_roundtrip(void) {
     printf("  test_meta_roundtrip ... ");
-    table* t = createTable("_mt_rt");
+    table* t = createTable("_mt_rt", ORDERING_ULONG);
     assert(t != NULL);
     t->pageStripes    = 3;
     t->nodeStripes    = 2;
@@ -596,7 +612,7 @@ writeMeta / loadMeta round-trip (tests the high/low 32-bit split logic).
 */
 void test_meta_large_addr(void) {
     printf("  test_meta_large_addr ... ");
-    table* t = createTable("_mt_la");
+    table* t = createTable("_mt_la", ORDERING_ULONG);
     assert(t != NULL);
     t->pageFree = 0x0000000100000000ULL;
     t->nodeFree = 0x00000001ABCDEF12ULL;
@@ -622,7 +638,7 @@ loadTable must reject any .tbl file whose first four bytes are not MAGIC.
 void test_meta_bad_magic(void) {
     printf("  test_meta_bad_magic ... ");
     // Use createTable to guarantee the tables/ directory exists, then remove it
-    table* dir = createTable("_mt_dir");
+    table* dir = createTable("_mt_dir", ORDERING_ULONG);
     if (dir) deleteTable(dir);
 
     FILE* f = fopen("tables/_mt_badmag.tbl", "wb");
@@ -647,7 +663,7 @@ type they are, so they couldn't be read.
 */
 void test_meta_bad_key_type(void) {
     printf("  test_meta_bad_key_type ... ");
-    table* t = createTable("_mt_badkt");
+    table* t = createTable("_mt_badkt", ORDERING_ULONG);
     assert(t != NULL);
     close_table_keep_file(t);
     table* ok = calloc(1, sizeof(table));
@@ -666,6 +682,31 @@ void test_meta_bad_key_type(void) {
     assert(!loadTable("_mt_badkt", t2));
     free(t2);
     remove("tables/_mt_badkt.tbl");
+    printf("PASS\n");
+}
+
+/*
+A table's nodes are sized for its keys, so a header whose node size is too small for the key type it gives
+is rejected: here, a table of numeric keys whose header is changed to say its keys are strings.
+*/
+void test_meta_node_size_too_small_for_keys(void) {
+    printf("  test_meta_node_size_too_small_for_keys ... ");
+    table* t = createTable("_mt_small", ORDERING_ULONG);
+    assert(t != NULL && t->nodeSize == NODE_DISK_SIZE(NUM_KEY));
+    close_table_keep_file(t);
+
+    // the key type is the header's last word (see fillMeta() in tableIO.c)
+    FILE* f = fopen("tables/_mt_small.tbl", "rb+");
+    assert(f != NULL);
+    uint32_t strings = ORDERING_STRING;
+    fseek(f, (METALEN - 1) * 4, SEEK_SET);
+    assert(fwrite(&strings, 4, 1, f) == 1);
+    fclose(f);
+
+    table* t2 = calloc(1, sizeof(table));
+    assert(!loadTable("_mt_small", t2));
+    free(t2);
+    remove("tables/_mt_small.tbl");
     printf("PASS\n");
 }
 
@@ -982,7 +1023,7 @@ Both once did, which lost about 15 KB for every row inserted and every pending p
 void test_page_remark_and_reread_free_old(void) {
     printf("  test_page_remark_and_reread_free_old ... ");
     table t = make_test_table();
-    slotted_page* p = makeSPage(PAGE_NUM_SLOTS, PAGE_NUM_ENTRIES, PAGE_ARR_CAP);
+    slotted_page* p = makeSPage(PAGE_NUM_SLOTS, PAGE_NUM_ENTRIES, PAGE_CAP(NUM_KEY), NUM_KEY);
     entry e[2] = { make_entry("hello", T_STRING), make_entry("world", T_STRING) };
     sp_record rec = make_sp_record(e, 2);
     rec.size = e[0].size + e[1].size;
@@ -1176,9 +1217,15 @@ void test_addr_table_remove(void) {
     printf("PASS\n");
 }
 
-/* A page that fits in a test table's small pages, with room for numSlots slots. */
+/* A page that fits in the small pages of a test table whose keys are of keyType, with room for numSlots slots. */
+static slotted_page* make_small_page_of(uint32_t numSlots, ordering_type keyType) {
+    uint32_t keySize = orderingKeyDiskSize(keyType);
+    return makeSPage(numSlots, 16, TEST_PAGE_SIZE - PAGE_HEADER_DISK_SIZE(keySize), keySize);
+}
+
+/* The same, for numeric keys. */
 static slotted_page* make_small_page(uint32_t numSlots) {
-    return makeSPage(numSlots, 16, TEST_PAGE_SIZE - PAGE_HEADER_DISK_SIZE);
+    return make_small_page_of(numSlots, ORDERING_ULONG);
 }
 
 /* Inserts a one-entry record holding text into p under key. */
@@ -1214,9 +1261,8 @@ void test_page_roundtrip_records(void) {
 
     for (int which = 0; which < 2; which++) {
         ordering_key* keys = sets[which];
-        table t = make_test_table();
-        t.keyType = keys[0].type;  // a key is read back with the type its table has
-        slotted_page* p = make_small_page(4);
+        table t = make_test_table_of(keys[0].type);  // a key is read back with the type its table has
+        slotted_page* p = make_small_page_of(4, keys[0].type);
         char buf[16];
         for (int i = 3; i >= 0; i--) {  // inserted largest first
             snprintf(buf, sizeof(buf), "row %d", i);
@@ -1307,7 +1353,7 @@ void test_page_read_damaged_header(void) {
 
     // overwrite the damaged page's maxEntries (the fifth 4-byte field after the two keys) with a huge value
     unsigned char huge[4] = { 0xFF, 0xFF, 0xFF, 0xF0 };
-    fseek(t.source, (long)(b + 1 + 2 * ORDERING_KEY_DISK_SIZE + 16), SEEK_SET);
+    fseek(t.source, (long)(b + 1 + 2 * NUM_KEY + 16), SEEK_SET);
     assert(fwrite(huge, 1, 4, t.source) == 4);
     fflush(t.source);
 
@@ -1333,64 +1379,89 @@ static unsigned char* raw_object(table* t, address addr, int size) {
 }
 
 /*
-A key on disk is its value and nothing else, ORDERING_KEY_DISK_SIZE bytes of it: the bytes of a string key,
-or a number most significant byte first, with zeros after. Its type isn't there. It's the table's keyType,
-so the same bytes read through a table with another key type are a key of that type.
+A key on disk is its value and nothing else, and takes as many bytes as the type of the table's keys needs:
+24 for a string key, its bytes with zeros after them, and 8 for a number, most significant byte first. Its
+type isn't there (it's the table's keyType), and slots, page headers and nodes are as large as those keys
+make them, so a table of numeric keys has smaller ones than a table of string keys.
 */
-void test_key_type_not_stored_with_keys(void) {
-    printf("  test_key_type_not_stored_with_keys ... ");
-    assert(ORDERING_KEY_DISK_SIZE == TEXT_KEY_MAX_LEN);
-    unsigned char apple[ORDERING_KEY_DISK_SIZE] = "apple", pear[ORDERING_KEY_DISK_SIZE] = "pear";
-    unsigned char number[ORDERING_KEY_DISK_SIZE] = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+void test_key_bytes_on_disk(void) {
+    printf("  test_key_bytes_on_disk ... ");
+    assert(orderingKeyDiskSize(ORDERING_STRING) == 24);
+    assert(orderingKeyDiskSize(ORDERING_ULONG) == 8 && orderingKeyDiskSize(ORDERING_DOUBLE) == 8);
+    assert(SP_SLOT_DISK_SIZE(NUM_KEY) == 20 && SP_SLOT_DISK_SIZE(TEXT_KEY) == 36);
+    assert(PAGE_HEADER_DISK_SIZE(NUM_KEY) == 41 && PAGE_HEADER_DISK_SIZE(TEXT_KEY) == 73);
+    assert(NODE_DISK_SIZE(NUM_KEY) == 38 + M_GLOBAL * 16 && NODE_DISK_SIZE(TEXT_KEY) == 54 + M_GLOBAL * 32);
+    unsigned char apple[TEXT_KEY] = "apple", pear[TEXT_KEY] = "pear";
+    unsigned char five[NUM_KEY] = { 0, 0, 0, 0, 0, 0, 0, 5 };
+    unsigned char number[NUM_KEY] = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+    unsigned char two[4] = { 0, 0, 0, 2 };
 
-    // a page of string keys: the two bounds, then each slot's key
-    table t = make_test_table();
-    t.keyType = ORDERING_STRING;
-    slotted_page* p = make_small_page(4);
+    // a page of string keys: the two bounds, then each slot's key, 24 bytes apiece
+    table text = make_test_table_of(ORDERING_STRING);
+    slotted_page* p = make_small_page_of(4, ORDERING_STRING);
     insert_text(p, okey_text("pear"), "row 1");
     insert_text(p, okey_text("apple"), "row 0");
-    address addr = write_page(p, &t);
-    unsigned char* raw = raw_object(&t, addr, TEST_PAGE_SIZE);
+    address addr = write_page(p, &text);
+    unsigned char* raw = raw_object(&text, addr, TEST_PAGE_SIZE);
     assert(raw[0] == 0);
-    assert(memcmp(raw + 1, apple, ORDERING_KEY_DISK_SIZE) == 0);
-    assert(memcmp(raw + 1 + ORDERING_KEY_DISK_SIZE, pear, ORDERING_KEY_DISK_SIZE) == 0);
-    assert(memcmp(raw + PAGE_HEADER_DISK_SIZE, apple, ORDERING_KEY_DISK_SIZE) == 0);
-    assert(memcmp(raw + PAGE_HEADER_DISK_SIZE + SP_SLOT_DISK_SIZE, pear, ORDERING_KEY_DISK_SIZE) == 0);
+    assert(memcmp(raw + 1, apple, 24) == 0 && memcmp(raw + 25, pear, 24) == 0);
+    assert(memcmp(raw + 49 + 4, two, 4) == 0);  // numRecords, the second field after the two keys
+    assert(memcmp(raw + 73, apple, 24) == 0 && memcmp(raw + 73 + 36, pear, 24) == 0);
     free(raw);
     freeSPage(p);
     free(p);
 
-    // a node of numeric keys: maxKey in the header, then the keys after the children
-    t.keyType = ORDERING_ULONG;
+    // the same page with numeric keys: 8 bytes apiece, so everything after them sits earlier
+    table numeric = make_test_table();
+    p = make_small_page(4);
+    insert_text(p, okey(0x0102030405060708ULL), "row 1");
+    insert_text(p, okey(5), "row 0");
+    addr = write_page(p, &numeric);
+    raw = raw_object(&numeric, addr, TEST_PAGE_SIZE);
+    assert(raw[0] == 0);
+    assert(memcmp(raw + 1, five, 8) == 0 && memcmp(raw + 9, number, 8) == 0);
+    assert(memcmp(raw + 17 + 4, two, 4) == 0);
+    assert(memcmp(raw + 41, five, 8) == 0 && memcmp(raw + 41 + 20, number, 8) == 0);
+    free(raw);
+    slotted_page back = {0};
+    assert(readPage(addr, &back, &numeric));
+    assert(back.header.keySize == NUM_KEY && back.header.numRecords == 2);
+    assert(back.slots[1].ID.type == ORDERING_ULONG && back.slots[1].ID.as.u64 == 0x0102030405060708ULL);
+    assert(SPUsedBytes(&back) == SPUsedBytes(p));  // the page read back knows how full it is
+    freeSPage(&back);
+    freeSPage(p);
+    free(p);
+
+    // a node: maxKey in the header, isLeaf after it, then the children, then the keys
     node n = {0};
     n.isLeaf = true;
     n.childCount = 2;
     n.children[0] = 1000; n.children[1] = 1001;
     n.keys[0] = okey(5);
     n.keys[1] = n.maxKey = okey(0x0102030405060708ULL);
-    address nodeAddr = allocNode(&t);
-    markNode(nodeAddr, &n, &t);
-    writeNextNode(&t);
-    raw = raw_object(&t, nodeAddr, TEST_NODE_SIZE);
+    address nodeAddr = allocNode(&numeric);
+    markNode(nodeAddr, &n, &numeric);
+    writeNextNode(&numeric);
+    assert(numeric.nodeSize == NODE_DISK_SIZE(NUM_KEY));
+    raw = raw_object(&numeric, nodeAddr, numeric.nodeSize);
     assert(raw[0] == 1);
-    assert(memcmp(raw + 29, number, ORDERING_KEY_DISK_SIZE) == 0);
-    assert(memcmp(raw + NODE_HEADER_DISK_SIZE + 2 * 8 + ORDERING_KEY_DISK_SIZE, number, ORDERING_KEY_DISK_SIZE) == 0);
+    assert(memcmp(raw + 29, number, 8) == 0 && raw[37] == 1);
+    assert(memcmp(raw + 38 + 2 * 8, five, 8) == 0 && memcmp(raw + 38 + 2 * 8 + 8, number, 8) == 0);
     free(raw);
 
-    // read as numbers, and then, through a table of string keys, as strings
-    node r = {0};
-    assert(readNode(nodeAddr, &r, &t));
-    assert(r.maxKey.type == ORDERING_ULONG && r.keys[1].as.u64 == 0x0102030405060708ULL && r.keys[0].as.u64 == 5);
-    t.keyType = ORDERING_STRING;
-    assert(readNode(nodeAddr, &r, &t));
-    assert(r.maxKey.type == ORDERING_STRING && r.keys[1].type == ORDERING_STRING);
-    assert(strcmp(r.keys[1].as.string, "\x01\x02\x03\x04\x05\x06\x07\x08") == 0);
-    slotted_page asText = {0};
-    assert(readPage(addr, &asText, &t));
-    assert(asText.slots[0].ID.type == ORDERING_STRING && strcmp(asText.slots[0].ID.as.string, "apple") == 0);
-    freeSPage(&asText);
+    n.keys[0] = okey_text("apple");
+    n.keys[1] = n.maxKey = okey_text("pear");
+    nodeAddr = allocNode(&text);
+    markNode(nodeAddr, &n, &text);
+    writeNextNode(&text);
+    assert(text.nodeSize == NODE_DISK_SIZE(TEXT_KEY) && text.nodeSize > numeric.nodeSize);
+    raw = raw_object(&text, nodeAddr, text.nodeSize);
+    assert(memcmp(raw + 29, pear, 24) == 0 && raw[53] == 1);
+    assert(memcmp(raw + 54 + 2 * 8, apple, 24) == 0 && memcmp(raw + 54 + 2 * 8 + 24, pear, 24) == 0);
+    free(raw);
 
-    free_test_table(&t);
+    free_test_table(&text);
+    free_test_table(&numeric);
     printf("PASS\n");
 }
 
@@ -1409,8 +1480,7 @@ void test_node_roundtrip_full_keys(void) {
 
     for (int which = 0; which < 2; which++) {
         ordering_key* keys = sets[which];
-        table t = make_test_table();
-        t.keyType = keys[0].type;
+        table t = make_test_table_of(keys[0].type);
         node n = {0};
         n.isLeaf = true;
         n.childCount = 3;
@@ -1432,22 +1502,41 @@ void test_node_roundtrip_full_keys(void) {
         free_test_table(&t);
     }
 
-    // a full node fits in the size tables are created with
-    table t = make_test_table();
-    node full = {0};
-    full.isLeaf = true;
-    full.childCount = M_GLOBAL;
-    for (int i = 0; i < M_GLOBAL; i++) { full.children[i] = 5000 + i; full.keys[i] = okey((uint64_t)i << 32); }
-    full.maxKey = full.keys[M_GLOBAL - 1];
-    address addr = allocNode(&t);
-    markNode(addr, &full, &t);
-    writeNextNode(&t);
-    node r = {0};
-    assert(readNode(addr, &r, &t));
-    assert(r.childCount == M_GLOBAL);
-    for (int i = 0; i < M_GLOBAL; i++)
-        assert(r.children[i] == (address)(5000 + i) && compareOrderingKeys(r.keys[i], okey((uint64_t)i << 32)) == 0);
-    free_test_table(&t);
+    // a full node fits in the size its table's nodes have, which depends on the type of the table's keys
+    for (int which = 0; which < 2; which++) {
+        table t = make_test_table_of(which == 0 ? ORDERING_ULONG : ORDERING_STRING);
+        assert(t.nodeSize == (which == 0 ? NODE_DISK_SIZE(NUM_KEY) : NODE_DISK_SIZE(TEXT_KEY)));
+        node full = {0};
+        full.isLeaf = true;
+        full.childCount = M_GLOBAL;
+        char name[TEXT_KEY_MAX_LEN + 1];
+        for (int i = 0; i < M_GLOBAL; i++) {
+            full.children[i] = 5000 + i;
+            snprintf(name, sizeof(name), "key%021d", i);  // 24 characters: the longest a string key can be
+            full.keys[i] = which == 0 ? okey((uint64_t)i << 32) : okey_text(name);
+        }
+        full.maxKey = full.keys[M_GLOBAL - 1];
+        address before = allocNode(&t), addr = allocNode(&t), after = allocNode(&t);
+        assert(addr - before == (address)t.nodeSize && after - addr == (address)t.nodeSize);
+        node neighbour = {0};
+        neighbour.isLeaf = true;
+        neighbour.childCount = 1;
+        neighbour.children[0] = 77;
+        neighbour.keys[0] = neighbour.maxKey = full.keys[0];
+        markNode(before, &neighbour, &t);
+        markNode(after, &neighbour, &t);
+        markNode(addr, &full, &t);
+        while (t.nodeDirty.count > 0) writeNextNode(&t);
+        node r = {0};
+        assert(readNode(addr, &r, &t));
+        assert(r.childCount == M_GLOBAL);
+        for (int i = 0; i < M_GLOBAL; i++)
+            assert(r.children[i] == (address)(5000 + i) && compareOrderingKeys(r.keys[i], full.keys[i]) == 0);
+        // and it didn't run into the nodes on either side of it
+        assert(readNode(before, &r, &t) && r.childCount == 1 && r.children[0] == 77);
+        assert(readNode(after, &r, &t) && r.childCount == 1 && r.children[0] == 77);
+        free_test_table(&t);
+    }
     printf("PASS\n");
 }
 
@@ -1458,6 +1547,7 @@ void test_tableio(void) {
     test_meta_large_addr();
     test_meta_bad_magic();
     test_meta_bad_key_type();
+    test_meta_node_size_too_small_for_keys();
     // markPage
     test_mark_page_dedup();
     test_mark_page_snapshot();
@@ -1488,7 +1578,7 @@ void test_tableio(void) {
     test_node_write_empty_hashmap();
     test_node_roundtrip();
     test_node_roundtrip_full_keys();
-    test_key_type_not_stored_with_keys();
+    test_key_bytes_on_disk();
     test_node_write_drains_all();
     printf("=== All tableIO tests passed ===\n");
 }
@@ -1504,7 +1594,7 @@ createTable must create the file at tables/<name>.tbl.
 */
 void test_create_table_file_exists(void) {
     printf("  test_create_table_file_exists ... ");
-    table* t = createTable("mgmt_c1");
+    table* t = createTable("mgmt_c1", ORDERING_ULONG);
     assert(t != NULL);
     assert(tbl_file_exists("mgmt_c1"));
     deleteTable(t);
@@ -1516,16 +1606,16 @@ Every field in the returned table struct must be correctly initialised.
 */
 void test_create_table_fields(void) {
     printf("  test_create_table_fields ... ");
-    table* t = createTable("mgmt_c2");
+    table* t = createTable("mgmt_c2", ORDERING_ULONG);
     assert(t != NULL);
     assert(strcmp(t->name, "mgmt_c2") == 0);
     assert(t->source    != NULL);
     assert(t->pageSize  == PAGE_SIZE);
-    assert(t->nodeSize  == NODE_DISK_SIZE);
+    assert(t->nodeSize  == NODE_DISK_SIZE(NUM_KEY));
     assert(t->M         == M_GLOBAL);
     assert(t->root      == 0);
     assert(t->metalen   == METALEN * 4);
-    assert(t->keyType   == ORDERING_ULONG);  // until newTree() gives it the type of the table's primary key
+    assert(t->keyType   == ORDERING_ULONG);
     // layout is [node stripe][pageNodeRatio page stripes] per unit — node
     // stripe 1 starts immediately after the header, page stripe 1 right
     // after that
@@ -1541,7 +1631,7 @@ The file written by createTable must start with the correct magic number.
 */
 void test_create_table_valid_magic(void) {
     printf("  test_create_table_valid_magic ... ");
-    table* t = createTable("mgmt_c3");
+    table* t = createTable("mgmt_c3", ORDERING_ULONG);
     assert(t != NULL);
     rewind(t->source);
     uint32_t magic = 0;
@@ -1559,7 +1649,7 @@ metadata fields.
 */
 void test_load_table_roundtrip(void) {
     printf("  test_load_table_roundtrip ... ");
-    table* t = createTable("mgmt_l1");
+    table* t = createTable("mgmt_l1", ORDERING_ULONG);
     assert(t != NULL);
     close_table_keep_file(t);  // close without deleting
 
@@ -1591,7 +1681,7 @@ loadTable must reject a .tbl file whose first four bytes are not MAGIC.
 void test_load_table_bad_magic(void) {
     printf("  test_load_table_bad_magic ... ");
     // Use createTable to ensure the tables/ directory exists, then remove it
-    table* tmp = createTable("mgmt_tmpdir");
+    table* tmp = createTable("mgmt_tmpdir", ORDERING_ULONG);
     if (tmp) deleteTable(tmp);
 
     char* path = build_tbl_path("mgmt_badmag");
@@ -1619,7 +1709,7 @@ deleteTable must remove the file from disk.
 */
 void test_delete_table_removes_file(void) {
     printf("  test_delete_table_removes_file ... ");
-    table* t = createTable("mgmt_d1");
+    table* t = createTable("mgmt_d1", ORDERING_ULONG);
     assert(t != NULL);
     assert(tbl_file_exists("mgmt_d1"));
     bool ok = deleteTable(t);
@@ -1643,7 +1733,7 @@ After deleteTable, the same table name must no longer be loadable.
 */
 void test_delete_table_not_reloadable(void) {
     printf("  test_delete_table_not_reloadable ... ");
-    table* t = createTable("mgmt_d2");
+    table* t = createTable("mgmt_d2", ORDERING_ULONG);
     assert(t != NULL);
     char* saved = strdup(t->name);
     deleteTable(t);
@@ -1702,6 +1792,45 @@ void test_create_tree_root_node(void) {
 }
 
 /*
+How large a table's nodes are, and how much room its pages have for records, follow the type of its keys.
+A table of numeric keys, which take 8 bytes each on disk, has nodes about half the size of a table of string
+keys, and a little more room in each page. A table loaded back from its file has the same sizes.
+*/
+void test_create_tree_sizes_follow_key_type(void) {
+    printf("  test_create_tree_sizes_follow_key_type ... ");
+    ordering_type types[] = { ORDERING_ULONG, ORDERING_STRING, ORDERING_DOUBLE };
+    int nodeSizes[3];
+    for (int i = 0; i < 3; i++) {
+        uint32_t keySize = types[i] == ORDERING_STRING ? 24 : 8;
+        table* t = createTree("mgmt_t5", types[i]);
+        assert(t != NULL);
+        for (int pass = 0; pass < 2; pass++) {  // as created, then as loaded from its file
+            assert(keyDiskSize(t) == keySize);
+            assert(t->nodeSize == NODE_DISK_SIZE(keySize));
+            assert(t->pageSize == PAGE_SIZE && pageCapacity(t) == PAGE_SIZE - PAGE_HEADER_DISK_SIZE(keySize));
+            // the layout of the file follows the node size: the first pages come after a stripe of nodes
+            assert(t->root == (address)t->metalen);
+            node n = {0};
+            assert(readNode(t->root, &n, t));
+            assert(n.children[0] == (address)t->metalen + (address)t->nodeStripeLen * t->nodeSize);
+            slotted_page p = {0};
+            assert(readPage(n.children[0], &p, t));
+            assert(p.header.keySize == keySize && p.header.arrCap == pageCapacity(t));
+            freeSPage(&p);
+            if (pass == 0) {
+                close_table_keep_file(t);
+                t = calloc(1, sizeof(table));
+                assert(loadTable("mgmt_t5", t));
+            }
+        }
+        nodeSizes[i] = t->nodeSize;
+        deleteTree(t);
+    }
+    assert(nodeSizes[0] == 38 + M_GLOBAL * 16 && nodeSizes[1] == 54 + M_GLOBAL * 32 && nodeSizes[2] == nodeSizes[0]);
+    printf("PASS\n");
+}
+
+/*
 The initial page pointed to by the root must be readable and empty, with no keys of its own yet.
 */
 void test_create_tree_initial_page(void) {
@@ -1718,7 +1847,7 @@ void test_create_tree_initial_page(void) {
     ordering_key none = {0};
     assert(p.header.numRecords == 0 && p.header.numEntries == 0);
     assert(memcmp(&p.header.minKey, &none, sizeof(none)) == 0 && memcmp(&p.header.maxKey, &none, sizeof(none)) == 0);
-    assert(p.header.arrCap == PAGE_ARR_CAP);
+    assert(p.header.arrCap == PAGE_CAP(NUM_KEY) && p.header.keySize == NUM_KEY);
 
     free(p.slots);
     free(p.entries);
@@ -1744,6 +1873,7 @@ void test_table_mgmt(void) {
     // createTree
     test_create_tree_not_null();
     test_create_tree_root_node();
+    test_create_tree_sizes_follow_key_type();
     test_create_tree_initial_page();
     printf("=== All table and tree management tests passed ===\n");
 }
@@ -1792,7 +1922,9 @@ static table* create_test_tree(char* name) {
 #define SMALL_ROW 12
 #define LARGE_ROW 1900
 // how many rows of a size fit in a page
-#define ROWS_PER_PAGE(size) (PAGE_ARR_CAP / (SP_SLOT_DISK_SIZE + 6 + (size)))
+#define ROWS_PER_PAGE(size) (PAGE_CAP(NUM_KEY) / (SP_SLOT_DISK_SIZE(NUM_KEY) + 6 + (size)))
+// and in a page of a table of string keys, whose slots are larger
+#define TEXT_ROWS_PER_PAGE(size) (PAGE_CAP(TEXT_KEY) / (SP_SLOT_DISK_SIZE(TEXT_KEY) + 6 + (size)))
 
 /* A one-entry row for key k: `size` bytes holding the key as text, then zeros. */
 static entry make_row(uint64_t k, uint32_t size) {
@@ -2158,8 +2290,9 @@ void test_btree_insert_too_large(void) {
     printf("  test_btree_insert_too_large ... ");
     table* t = create_test_tree("bt_itl");
     assert(insert_row(t, 1, SMALL_ROW) == 0);
-    assert(insert_row(t, 2, PAGE_ARR_CAP) == 3);
-    assert(insert_row(t, 3, PAGE_ARR_CAP - SP_SLOT_DISK_SIZE - 6) == 0);  // the largest row there is room for
+    assert(insert_row(t, 2, PAGE_CAP(NUM_KEY)) == 3);
+    assert(insert_row(t, 4, PAGE_CAP(NUM_KEY) - SP_SLOT_DISK_SIZE(NUM_KEY) - 6 + 1) == 3);  // one byte too many
+    assert(insert_row(t, 3, PAGE_CAP(NUM_KEY) - SP_SLOT_DISK_SIZE(NUM_KEY) - 6) == 0);  // the largest row there is room for
     node root = {0};
     assert(root_leaf(t, &root) == 2);
     assert(has_row(t, 1) && !has_row(t, 2) && has_row(t, 3));
@@ -2311,7 +2444,7 @@ void test_btree_update_grows_row(void) {
 
     // too large for any page
     uint32_t pagesBefore = root.childCount;
-    entry huge = make_row(1, PAGE_ARR_CAP);
+    entry huge = make_row(1, PAGE_CAP(NUM_KEY));
     sp_record hugeRec = make_btree_record(&huge, 1);
     assert(!updateRecord(&hugeRec, okey(1), t));
     free(huge.data);  // a refused update leaves the entries with the caller
@@ -2426,6 +2559,103 @@ void test_btree_new_tree_before_commit(void) {
     printf("PASS\n");
 }
 
+/* Inserts a one-entry row of the given size under a string key, and returns insertRecord()'s result. */
+static int insert_text_row(table* t, const char* key, uint32_t size) {
+    entry e;
+    e.type = T_STRING;
+    e.size = size;
+    e.data = calloc(size, 1);
+    snprintf(e.data, size, "%s", key);
+    sp_record r = make_btree_record(&e, 1);
+    int result = insertRecord(&r, okey_text(key), t);
+    if (result != 0) free(e.data);
+    return result;
+}
+
+/*
+A table's slots are as large as its keys make them, so how many rows fill a page depends on the type of the
+table's keys: fewer in a table of string keys, whose slots are 16 bytes larger than a numeric table's. Rows
+inserted in key order fill each page of a string-keyed table exactly, the largest row it accepts is the one
+that fills a page by itself, and its pages and nodes, written at their own sizes, read back from the file
+after enough rows to split both.
+*/
+void test_btree_rows_per_page_follow_key_size(void) {
+    printf("  test_btree_rows_per_page_follow_key_size ... ");
+    uint32_t perPage = TEXT_ROWS_PER_PAGE(SMALL_ROW);
+    assert(perPage < ROWS_PER_PAGE(SMALL_ROW));
+
+    table* t = createTree("bt_rpk", ORDERING_STRING);
+    assert(t != NULL && keyDiskSize(t) == TEXT_KEY && pageCapacity(t) == PAGE_CAP(TEXT_KEY));
+    char key[TEXT_KEY_MAX_LEN + 1];
+    node root = {0};
+    for (uint32_t i = 1; i <= perPage; i++) {
+        snprintf(key, sizeof(key), "k%05u", i);
+        assert(insert_text_row(t, key, SMALL_ROW) == 0);
+    }
+    assert(root_leaf(t, &root) == 1);
+    slotted_page p = {0};
+    read_leaf_page(t, &root, 0, &p);
+    assert(p.header.numRecords == perPage && p.header.keySize == TEXT_KEY && p.header.arrCap == PAGE_CAP(TEXT_KEY));
+    assert(SPFits(&p) && !SPHasRoom(&p, SMALL_ROW, 1));  // exactly full
+    freeSPage(&p);
+    snprintf(key, sizeof(key), "k%05u", perPage + 1);
+    assert(insert_text_row(t, key, SMALL_ROW) == 0);  // so the next row starts a second page
+    assert(root_leaf(t, &root) == 2);
+
+    // the largest row is smaller than a numeric table's, by what the larger slot and page header take
+    uint32_t largest = PAGE_CAP(TEXT_KEY) - SP_SLOT_DISK_SIZE(TEXT_KEY) - 6;
+    assert(insert_text_row(t, "zz too large", largest + 1) == 3);
+    assert(insert_text_row(t, "zz fits a numeric table", PAGE_CAP(NUM_KEY) - SP_SLOT_DISK_SIZE(NUM_KEY) - 6) == 3);
+    assert(insert_text_row(t, "zz largest", largest) == 0);
+
+    // enough rows, in a scattered order, to split pages in the middle and the leaf nodes above them
+    uint32_t more = 3 * perPage * M_GLOBAL;
+    for (uint32_t i = 0; i < more; i++) {
+        snprintf(key, sizeof(key), "m%05u", (i * 7919) % more);
+        assert(insert_text_row(t, key, SMALL_ROW) == 0);
+    }
+    assert(readNode(t->root, &root, t) && !root.isLeaf);
+    assert(commit(t));
+    close_table_keep_file(t);
+
+    table* t2 = calloc(1, sizeof(table));
+    assert(loadTable("bt_rpk", t2));
+    assert(t2->nodeSize == NODE_DISK_SIZE(TEXT_KEY));
+    for (uint32_t i = 1; i <= perPage + 1; i++) {
+        snprintf(key, sizeof(key), "k%05u", i);
+        assert(searchRecord(okey_text(key), t2));
+    }
+    for (uint32_t i = 0; i < more; i += 7) {
+        snprintf(key, sizeof(key), "m%05u", i);
+        assert(searchRecord(okey_text(key), t2));
+    }
+    assert(searchRecord(okey_text("zz largest"), t2) && !searchRecord(okey_text("zz too large"), t2));
+
+    // every page along the leaves holds rows, in order, within its capacity
+    node leaf = {0};
+    assert(readNode(t2->root, &leaf, t2));
+    while (!leaf.isLeaf) assert(readNode(leaf.children[0], &leaf, t2));
+    uint32_t rows = 0;
+    ordering_key last = okey_text("");
+    for (;;) {
+        for (uint32_t i = 0; i < leaf.childCount; i++) {
+            slotted_page q = {0};
+            assert(readPage(leaf.children[i], &q, t2));
+            assert(q.header.keySize == TEXT_KEY && q.header.numRecords > 0 && SPFits(&q));
+            assert(compareOrderingKeys(q.header.minKey, last) > 0);
+            assert(compareOrderingKeys(q.header.maxKey, leaf.keys[i]) <= 0);
+            last = q.header.maxKey;
+            rows += q.header.numRecords;
+            freeSPage(&q);
+        }
+        if (!leaf.next) break;
+        assert(readNode(leaf.next, &leaf, t2));
+    }
+    assert(rows == perPage + 1 + 1 + more);
+    deleteTree(t2);
+    printf("PASS\n");
+}
+
 // ── Group 5: the whole tree, as rows come and go ───────────────────────────
 
 /* What check_tree() has found on its way through a tree. */
@@ -2447,6 +2677,7 @@ An empty page is only allowed to be the tree's only page.
 static void check_page(tree_check* c, address pageAddr, ordering_key filedUnder, bool onlyPage) {
     slotted_page p = {0};
     assert(readPage(pageAddr, &p, c->t));
+    assert(p.header.keySize == keyDiskSize(c->t) && p.header.arrCap == pageCapacity(c->t));
     assert(SPFits(&p));
     assert(p.header.numRecords > 0 || onlyPage);
     uint32_t data = 0;
@@ -2796,7 +3027,7 @@ void test_btree_store_page(void) {
     resize_row_in_page(&p, 10, LARGE_ROW);
     resize_row_in_page(&p, perPage / 2, LARGE_ROW);
     resize_row_in_page(&p, perPage - 10, LARGE_ROW);
-    assert(SPUsedBytes(&p) > 2 * PAGE_ARR_CAP);
+    assert(SPUsedBytes(&p) > 2 * PAGE_CAP(NUM_KEY));
     assert(storePage(&p, addr, t, &split) && split);
     assert(count_pages(t) >= 3);
     assert(SPFits(&p) && SPSearch(&p, okey(1)) == 0);  // p is left with the rows that stayed where it was
@@ -2805,7 +3036,7 @@ void test_btree_store_page(void) {
     // a row too large for any page
     uint32_t pages = count_pages(t);
     assert(readPage(addr, &p, t));
-    resize_row_in_page(&p, 1, PAGE_ARR_CAP);
+    resize_row_in_page(&p, 1, PAGE_CAP(NUM_KEY));
     split = true;
     assert(!storePage(&p, addr, t, &split) && !split);
     assert(count_pages(t) == pages);
@@ -2825,7 +3056,7 @@ void test_btree_store_page(void) {
     addr = root.children[0];
     slotted_page q = {0};
     assert(readPage(addr, &q, t));
-    resize_row_in_page(&q, 1, PAGE_ARR_CAP - 100);
+    resize_row_in_page(&q, 1, PAGE_CAP(NUM_KEY) - 100);
     assert(storePage(&q, addr, t, &split) && split);
     assert(q.header.numRecords == 1);
     assert(root_leaf(t, &root) == 2);
@@ -2915,6 +3146,7 @@ void test_btree(void) {
     test_btree_smallest_key();
     test_btree_key_of_another_type();
     test_btree_new_tree_before_commit();
+    test_btree_rows_per_page_follow_key_size();
     // the whole tree, as rows come and go
     test_btree_small_rows_in_random_order();
     test_btree_node_split();

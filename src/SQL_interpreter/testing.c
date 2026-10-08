@@ -2108,8 +2108,8 @@ void test_interpret_row_too_large(void) {
     assert(interpret("insert into tl values (2, 'two')").ir == INTERPRET_OK);
 
     char* sql = malloc(4200);
-    char* tooWide = wide_text(PAGE_ARR_CAP, 'x');
-    char* wide = wide_text(PAGE_ARR_CAP - 200, 'y');
+    char* tooWide = wide_text(PAGE_SIZE, 'x');       // more than any page has room for
+    char* wide = wide_text(PAGE_SIZE - 300, 'y');
 
     snprintf(sql, 4200, "insert into tl values (3, '%s')", tooWide);
     assert(interpret(sql).ir == INTERPRET_RUNTIME_ERROR);

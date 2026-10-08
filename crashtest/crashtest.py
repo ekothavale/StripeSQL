@@ -26,7 +26,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.environ.get("STRIPESQL_BIN", os.path.join(REPO, "main"))  # overridable, e.g. by `make coverage-full`
 SPY_SRC = os.path.join(REPO, "crashtest", "syncspy.c")
 QUERY_TIMEOUT = 10  # seconds; a damaged tree can make a scan loop forever
-IDS = list(range(1, 3500))  # every primary key the scenarios can produce
+IDS = list(range(1, 6300))  # every primary key the scenarios can produce
 SPY = None  # path of the built syncspy.dylib
 
 
@@ -129,12 +129,12 @@ SETUP = ("CREATE TABLE t (id int PRIMARY KEY, v int);\nCREATE TABLE u (id int PR
          "BEGIN TRANSACTION;\n" + "".join(f"INSERT INTO t VALUES ({i}, {i});\n" for i in range(1, 151)) +
          "INSERT INTO u VALUES (1, 1);\nCOMMIT;\n")
 
-# a page holds about 70 of these rows and a leaf node 45 pages. The first scenario's inserts come in a
-# scattered order (keys in order would only ever add to the last page), so they split pages all over the
-# table and then the root
-SCATTERED = sorted(range(151, 3401), key=lambda i: (i * 7919) % 3250)
+# a page holds about 100 of these rows and a leaf node 45 pages, so 6,000 rows need more pages than one
+# leaf holds however full the pages are. The first scenario's inserts come in a scattered order (keys in
+# order would only ever add to the last page), so they split pages all over the table and then the root
+SCATTERED = sorted(range(151, 6151), key=lambda i: (i * 7919) % 6000)
 SCENARIOS = [
-    ("multi-table transaction (3,250 inserts with page and node splits, an update and a delete, 2 tables)",
+    ("multi-table transaction (6,000 inserts with page and node splits, an update and a delete, 2 tables)",
      "BEGIN TRANSACTION;\n" + "".join(f"INSERT INTO t VALUES ({i}, {i});\n" for i in SCATTERED) +
      "UPDATE t SET v = -1 WHERE id = 7;\nDELETE FROM t WHERE id = 20;\nINSERT INTO u VALUES (2, 2);\nCOMMIT;\n"),
     ("autocommit INSERT", "INSERT INTO t VALUES (300, 300);\n"),
