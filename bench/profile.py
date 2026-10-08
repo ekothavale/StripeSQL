@@ -8,11 +8,13 @@ per millisecond) and prints, for every function above 1%, the share of samples s
 including everything it calls. It also reports the run's peak resident memory, which is
 less than its footprint whenever macOS compresses memory (`/usr/bin/time -l` reports the footprint).
 
-  lookup      20,000 primary-key lookups on a 10k-row table
-  scan        20 full scans of a 10k-row table
+  lookup      200,000 primary-key lookups on a 10k-row table
+  scan        1,000 full scans of a 10k-row table
   insert      10,000 autocommit inserts
   insert-txn  100,000 inserts in one transaction
-  delete      DELETE FROM on a 50k-row table
+  delete      DELETE FROM on a 500k-row table
+
+Each workload has to run for a few tenths of a second at least, or it is over before `sample` attaches.
 
 With --io it instead counts the file calls StripeSQL makes per statement (seeks, reads, writes,
 opens, fsyncs and bytes) for a lookup, a scanned row and an autocommit insert, using bench/iocount.c.
@@ -66,14 +68,14 @@ def load_10k():
 def prep_lookup():
     load_10k()
     rng = random.Random(1)
-    write("w.sql", "".join(f"SELECT v FROM p WHERE id = {rng.randint(1, 10000)};\n" for _ in range(20000)))
+    write("w.sql", "".join(f"SELECT v FROM p WHERE id = {rng.randint(1, 10000)};\n" for _ in range(200000)))
     return "w.sql"
 
 
 def prep_scan():
     load_10k()
     rng = random.Random(1)
-    write("w.sql", "".join(f"SELECT v FROM p WHERE v = {rng.randint(1, 10000)};\n" for _ in range(20)))
+    write("w.sql", "".join(f"SELECT v FROM p WHERE v = {rng.randint(1, 10000)};\n" for _ in range(1000)))
     return "w.sql"
 
 
@@ -91,7 +93,7 @@ def prep_insert_txn():
 
 def prep_delete():
     fresh()
-    write("load.sql", "CREATE TABLE d (id int PRIMARY KEY);\nBEGIN TRANSACTION;\n" + inserts("d", 1, 50000) + "COMMIT;\n")
+    write("load.sql", "CREATE TABLE d (id int PRIMARY KEY);\nBEGIN TRANSACTION;\n" + inserts("d", 1, 500000) + "COMMIT;\n")
     run("load.sql")
     write("w.sql", "DELETE FROM d;\n")
     return "w.sql"
@@ -128,7 +130,11 @@ def profile(name):
     proc = subprocess.Popen([BIN, sql], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(["sample", str(proc.pid), "600", "1", "-mayDie", "-file", "sample.txt"], capture_output=True)
     _, _, usage = os.wait4(proc.pid, 0)
-    inclusive = inclusive_times("sample.txt")
+    inclusive = inclusive_times("sample.txt") if os.path.exists("sample.txt") else {}
+    if not inclusive:
+        print(f"### {name}: finished before it could be sampled\n", flush=True)
+        return
+    os.remove("sample.txt")
     total = max(inclusive.values())
     print(f"### {name}: {total:,} samples (about {total / 1000:.1f} s), peak resident memory {usage.ru_maxrss / 1e6:,.0f} MB\n")
     print("| Time | Samples | Function |")

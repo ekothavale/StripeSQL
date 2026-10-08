@@ -205,6 +205,14 @@ static ordering_type getPkOrderingType(schema* s) {
 	return ORDERING_ULONG;
 }
 
+/*
+whether a value is one pkToOk() can convert into an ordering key: text longer than TEXT_KEY_MAX_LEN bytes isn't
+(a value of the wrong type for its table's key does convert, and the B+ tree then refuses the key)
+*/
+static bool fitsInKey(value pk) {
+	return pk.type != VAL_TEXT || strlen(pk.as.text) <= TEXT_KEY_MAX_LEN;
+}
+
 // could potentially be abstracted into a general print value type
 /*
 prints a primary key based on its type. prints illegal pk types as hex
@@ -499,11 +507,35 @@ searches for and loads a record into the given scanner by primary key lookup
 */
 bool scannerKeySearch(scanner* s, ordering_key key) {
 	scratchReset(s); // the scanner is leaving its row, and the row's strings go with it
-	address addr = findPage(key.pageNum, s->tbl);
+	address addr = findPage(key, s->tbl);
 	if (!addr) return false;
 	s->pageAddr = addr;
 	readPage(addr, &s->page, s->tbl);
-	int slotIdx = SPSearch(&s->page, key.offset);
+	int slotIdx = SPSearch(&s->page, key);
+	if (slotIdx < 0) return false;
+	s->slotIdx = slotIdx;
+	return true;
+}
+
+/*
+puts a scanner back on the row with this key, wherever in the tree that row now is: its leaf, its page
+within the leaf, and its slot within the page
+for after a change that can move rows between pages while the scanner is on one of them
+unlike scannerKeySearch(), this keeps the strings read from the row (the row is the same one) and leaves
+the scanner able to carry on scanning from it
+*/
+static bool seekScanner(scanner* s, ordering_key key) {
+	table* t = s->tbl;
+	address leafAddr = 0;
+	address addr = findPageAndLeaf(key, t, &leafAddr);
+	if (!addr || !readNode(leafAddr, &s->leafNode, t)) return false;
+	s->leafAddr = leafAddr;
+	for (s->childIdx = 0; s->childIdx < s->leafNode.childCount; s->childIdx++) {
+		if (s->leafNode.children[s->childIdx] == addr) break;
+	}
+	s->pageAddr = addr;
+	if (!readPage(addr, &s->page, t)) return false;
+	int slotIdx = SPSearch(&s->page, key);
 	if (slotIdx < 0) return false;
 	s->slotIdx = slotIdx;
 	return true;
@@ -829,10 +861,10 @@ static interpret_result run() {
 			// search for a record by primary key. if found, load it into scanner. if not found, jump to target
 			case OP_KEY_SEARCH: {
 				value pk = pop();
-				ordering_key ik = pkToOk(pk);
 				uint16_t offset = READ_TWO_BYTES();
 				scanner* s = &vm.scanners[vm.numScanners-1];
-				if (!scannerKeySearch(s, ik)) {
+				// text too long to be a key is no row's key
+				if (!fitsInKey(pk) || !scannerKeySearch(s, pkToOk(pk))) {
 					vm.ip += (int16_t)offset;
 				}
 				break;
@@ -921,6 +953,12 @@ static interpret_result run() {
 					totalSize += entries[i].size;
 					if (i == s->pkIdx) pk = v; // pkIdx is stored ahead of time in scanner since it's a loop invariant
 				}
+				if (!fitsInKey(pk)) {
+					statementError("Error: a text primary key can be at most %d bytes long\n", TEXT_KEY_MAX_LEN);
+					for (int i = 0; i < count; i++) free(entries[i].data);
+					free(entries);
+					break;
+				}
 				ordering_key ik = pkToOk(pk);
 				sp_record r = { .entries = entries, .len = count, .size = totalSize };
 				int result = insertRecord(&r, ik, t);
@@ -932,7 +970,12 @@ static interpret_result run() {
 				} else if (result == 2) {
 					printf("Error: failed to insert the row with primary key ");
 					printPK(pk);
-					printf(" (page full)\n");
+					printf("\n");
+					vm.failed = true;
+				} else if (result == 3) {
+					printf("Error: the row with primary key ");
+					printPK(pk);
+					printf(" is too large to fit in a page\n");
 					vm.failed = true;
 				}
 				// when insertRecord fails, the data is never freed
@@ -946,17 +989,31 @@ static interpret_result run() {
 				uint8_t col_idx = READ_BYTE();
 				scanner* s = &vm.scanners[vm.numScanners-1];
 				table* t = s->tbl;
-				sp_slot slot = s->page.slots[s->slotIdx];
-				entry* target = &s->page.entries[slot.ptr + col_idx];
+				sp_slot* slot = &s->page.slots[s->slotIdx];
+				entry* target = &s->page.entries[slot->ptr + col_idx];
+				entry replacement = valueToEntry(pop());
+				// the row's size, and its page's count of data in use, follow the entry's
+				slot->size += replacement.size - target->size;
+				s->page.header.usedData += replacement.size - target->size;
 				free(target->data);
-				*target = valueToEntry(pop());
-				markPage(s->pageAddr, &s->page, t);
+				*target = replacement;
+				// a row that grew may no longer fit beside the others in its page, and then the page is
+				// split. The row can end up in either half, so the scanner finds it again by key
+				ordering_key key = slot->ID;
+				bool split;
+				if (!storePage(&s->page, s->pageAddr, t, &split)) {
+					statementError("Error: the updated row is too large to fit in a page\n");
+					break;
+				}
+				if (split && !seekScanner(s, key)) {
+					statementError("Error: failed to update a row\n");
+				}
 				break;
 			}
 			case OP_DELETE_ROW: {
 				scanner* s = &vm.scanners[vm.numScanners-1];
 				table* t = s->tbl;
-				ordering_key ik = { .pageNum = s->page.header.pageNum, .offset = s->page.slots[s->slotIdx].ID };
+				ordering_key ik = s->page.slots[s->slotIdx].ID;
 				freeSPage(&s->page);
 				s->page = (slotted_page){0};
 				address leafAddr = 0;
@@ -966,7 +1023,8 @@ static interpret_result run() {
 					break;
 				}
 				if (s->page.header.numRecords == 0) {
-					// the row's page was removed from the tree. deleteRecord()'s rebalancing
+					// the row was the last in its page, which is removed from the tree unless it's the
+					// tree's only page. deleteRecord()'s rebalancing
 					// (borrow/merge) can shift the pages within the scanner's leaf, or merge
 					// that leaf into another, so neither the scanner's leaf address nor its
 					// index can be trusted. Find the position again by key: in the leaf the
@@ -977,7 +1035,7 @@ static interpret_result run() {
 						break;
 					}
 					uint32_t next = 0;
-					while (next < s->leafNode.childCount && comparePageNums(s->leafNode.keys[next], ik.pageNum) <= 0) next++;
+					while (next < s->leafNode.childCount && compareOrderingKeys(s->leafNode.keys[next], ik) <= 0) next++;
 					s->childIdx = next - 1; // advanceScanner() steps forward from here (-1 wraps to 0)
 				} else {
 					s->slotIdx = (s->slotIdx > 0) ? s->slotIdx - 1 : (uint32_t)(-1);
@@ -1004,7 +1062,7 @@ static interpret_result run() {
 				}
 				// a table still open under this name belongs to a file that is gone
 				evictTableCache(hash);
-				page_num firstKey = { .type = getPkOrderingType(s) };
+				ordering_key firstKey = { .type = getPkOrderingType(s) }; // the smallest key of that type
 				if (vm.failed) {
 					break;
 				}

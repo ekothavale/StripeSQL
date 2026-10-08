@@ -35,20 +35,19 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 
 #define HALF_M (M_GLOBAL / 2)
 
-table* newTree(char* tablename, page_num firstKey); // in memory only, until committed
-table* createTree(char* tablename, page_num firstKey); // newTree() plus a commit that creates its file
+table* newTree(char* tablename, ordering_key firstKey); // in memory only, until committed
+table* createTree(char* tablename, ordering_key firstKey); // newTree() plus a commit that creates its file
 void deleteTree(table* t);
 
 
-address findPage(page_num pageNum, table* t);
-address findPageAndLeaf(page_num pageNum, table* t, address* leafOut);
-address findAndInsert(page_num pageNum, table* t);
-bool findAndDelete(page_num pageNum, table* tree);
+address findPage(ordering_key key, table* t);
+address findPageAndLeaf(ordering_key key, table* t, address* leafOut);
 
 int insertRecord(sp_record* record, ordering_key key, table* t);
 bool updateRecord(sp_record* record, ordering_key key, table* t);
 bool deleteRecord(ordering_key key, table* t, slotted_page* page, address* leafOut);
 bool searchRecord(ordering_key key, table* t);
 sp_record readRecord(ordering_key key, table* t, slotted_page* page);
+bool storePage(slotted_page* p, address pageAddr, table* t, bool* splitOut);
 
 #endif // BPLUS_H

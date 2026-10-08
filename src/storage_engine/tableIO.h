@@ -24,8 +24,25 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 #include "page.h"
 #include "node.h"
 
-#define MAGIC 0xFACE3419
+/*
+identifies a table file and the layout of what's in it. Change it whenever the on-disk layout of a page
+or node changes, so that files written with the old layout are rejected instead of misread
+(eventually move type byte to table header for efficiency and typed tables)
+previous magics:
+ - 0xFACE3419 pagenum, offset split
+ - 0xFACE341A full ordering keys, bit-reversed (ints) or padded and byte-reversed (text)
+*/
+#define MAGIC 0xFACE341B
 #define METALEN 16 // number of 4-byte words needed to represent a table's metadata
+
+// On-disk layouts (written by serializePage() and serializeNode() in tableIO.c)
+// page header: 0(1B) | minKey | maxKey | usedData(4B) | numRecords(4B) | numEntries(4B) | arrCap(4B) |
+//              maxEntries(4B) | maxSlots(4B)
+#define PAGE_HEADER_DISK_SIZE (1 + 2 * ORDERING_KEY_DISK_SIZE + 24)
+// node header: 1(1B) | parent(8B) | prev(8B) | next(8B) | childCount(4B) | maxKey | isLeaf(1B)
+#define NODE_HEADER_DISK_SIZE (30 + ORDERING_KEY_DISK_SIZE)
+// a whole node: its header, then room for M_GLOBAL children (8B each) and M_GLOBAL keys
+#define NODE_DISK_SIZE (NODE_HEADER_DISK_SIZE + M_GLOBAL * (8 + ORDERING_KEY_DISK_SIZE))
 
 typedef struct addr_entry {
 	address key;   // 0 = empty slot (address 0 is never a valid page/node address)

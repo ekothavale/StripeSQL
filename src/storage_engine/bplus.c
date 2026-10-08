@@ -31,13 +31,15 @@ which is implemented in another file.
 //     second for smallest possible nodes
 
 /* Keys:
- - Each key is a 32bit unsigned int
- - Last n bits represent the slot number within a page
- - Remaining bits represent the page number
- - n = number of slots per page
- - How many slots should be in a page?
- - How big are pages?
-*/ 
+ - Every record is found by one ordering key, built from its primary key (see ordering.c -> pkToOk())
+ - A page holds the records for one run of consecutive keys, sorted by key, and splits in two when it fills,
+   so which keys share a page depends on what has been inserted
+ - A leaf node files each of its pages under a key that is an upper bound for that page's keys: every key in
+   the page is at most that, and above the key the page before it is filed under. A page that has just been
+   filled or split is filed under exactly its largest key; deleting a page's largest record leaves it filed
+   under the old one, which is still an upper bound
+ - An internal node's keys bound its children in the same way
+*/
 
 // eventually clamp all the Ms in the shiftArray calls to their proper values
 
@@ -46,7 +48,7 @@ which is implemented in another file.
 
 static node* balanceTreeAdd(node* n, address addr, address* newAddrOut, table* t);
 static address balanceTreeDelete(node* n, address addr, table* t);
-static void propagateMaxKeyUp(address nodeAddr, page_num newMaxKey, table* t);
+static void propagateMaxKeyUp(address nodeAddr, ordering_key newMaxKey, table* t);
 
 // ##########################################################################################################################################
 // ##########################################################################################################################################
@@ -81,23 +83,24 @@ static node* newNode(bool isLeaf, address parent) {
 	n->isLeaf = isLeaf;
 	n->parent = parent;
 	n->childCount = 0;
-	n->maxKey = (page_num){0};
+	n->maxKey = (ordering_key){0};
 	return n;
 }
 
 /*
 builds a new table's b+ tree in memory, with one empty node and one empty page, both dirty
 nothing touches the disk until the table is committed, which also creates its file (see newTable())
-@param firstKey - the page number of the starting page
+@param firstKey - the smallest key of the table's key type. The first page is filed under it until a record
+                  is inserted, and it gives the tree's keys their type
 @return - table struct containing the necessary data to use the table
 mallocs new memory (table)
 */
-table* newTree(char* tablename, page_num firstKey) {
+table* newTree(char* tablename, ordering_key firstKey) {
 	// create structs
 	table* t = newTable(tablename);
 	node* root = calloc(1, sizeof(node));
 	address rootAddr = allocNode(t);
-	slotted_page* page = makeSPage(firstKey, PAGE_NUM_SLOTS, PAGE_NUM_ENTRIES, PAGE_ARR_CAP);
+	slotted_page* page = makeSPage(PAGE_NUM_SLOTS, PAGE_NUM_ENTRIES, PAGE_ARR_CAP);
 	address pageAddr = allocPage(t);
 
 	// initialize struct members (root and page already 0ed out)
@@ -120,11 +123,11 @@ table* newTree(char* tablename, page_num firstKey) {
 
 /*
 creates a new table with an empty b+ tree and commits it, which creates its file
-@param firstKey - the page number of the starting page
+@param firstKey - the smallest key of the table's key type (see newTree())
 @return - table struct containing the necessary data to use the table, or NULL if the commit failed
 mallocs new memory (table)
 */
-table* createTree(char* tablename, page_num firstKey) {
+table* createTree(char* tablename, ordering_key firstKey) {
 	table* t = newTree(tablename, firstKey);
 	if (!commit(t)) {
 		freeTable(t);
@@ -151,15 +154,15 @@ assumes there is a free space in the array
 len is the total length of the array
 start is the free space to be created
 */
-static int shiftPageNumArrayR(page_num* array, int start, int len) {
+static int shiftKeyArrayR(ordering_key* array, int start, int len) {
 	if (start > len-1) {
-		printf("Start index %d beyond length %d of array in shiftPageNumArrayR\n", start, len);
+		printf("Start index %d beyond length %d of array in shiftKeyArrayR\n", start, len);
 		return -1;
 	}
 	for (int i = len-1; i > start; i--) {
 		array[i] = array[i-1];
 	}
-	array[start] = (page_num){0};
+	array[start] = (ordering_key){0};
 	return 0;
 }
 
@@ -168,15 +171,15 @@ shifts the elements of an array left, overwriting target
 @input target - the first spot to be overwritten
 @input len - the total length of the array (or at least the values you care about)
 */
-static int shiftPageNumArrayL(page_num* array, int target, int len) {
+static int shiftKeyArrayL(ordering_key* array, int target, int len) {
 	if (target > len-1) {
-		printf("Start index %d beyond length %d of array in shiftPageNumArrayL\n", target, len);
+		printf("Start index %d beyond length %d of array in shiftKeyArrayL\n", target, len);
 		return -1;
 	}
 	for (int i = target; i < len-1; i++) {
 		array[i] = array[i+1];
 	}
-	array[len-1] = (page_num){0};
+	array[len-1] = (ordering_key){0};
 	return 0;
 }
 
@@ -248,15 +251,15 @@ static address getPrevInternal(node* n, address nAddr, table* t) {
 // INSERTION FUNCTIONS
 
 /*
-puts a page into a parent node's children and keys arrays
+puts a page into a parent node's children and keys arrays, filed under key
 assumes node is not full
 */
-static void insertPageIntoChildren(node* n, address nodeAddr, slotted_page* p, address pageAddr, table* t) {
+static void insertPageIntoChildren(node* n, address nodeAddr, ordering_key key, address pageAddr, table* t) {
 	// check if page should be inserted into the middle of the children
 	for (int i = 0; i < n->childCount; i++) {
-		if (comparePageNums(n->keys[i], p->header.pageNum) > 0) {
-			shiftPageNumArrayR(n->keys, i, M_GLOBAL);
-			n->keys[i] = p->header.pageNum;
+		if (compareOrderingKeys(n->keys[i], key) > 0) {
+			shiftKeyArrayR(n->keys, i, M_GLOBAL);
+			n->keys[i] = key;
 			shiftAddressArrayR(n->children, i, M_GLOBAL);
 			n->children[i] = pageAddr;
 			n->childCount++;
@@ -265,10 +268,10 @@ static void insertPageIntoChildren(node* n, address nodeAddr, slotted_page* p, a
 		}
 	}
 	// otherwise, the correct spot must be at the end
-	n->keys[n->childCount] = p->header.pageNum;
+	n->keys[n->childCount] = key;
 	n->children[n->childCount] = pageAddr;
 	n->childCount++;
-	n->maxKey = p->header.pageNum;
+	n->maxKey = key;
 	markNode(nodeAddr, n, t);
 	// propagate n's new max up if necessary
 	propagateMaxKeyUp(nodeAddr, n->maxKey, t);
@@ -279,12 +282,12 @@ static void insertPageIntoChildren(node* n, address nodeAddr, slotted_page* p, a
 puts a node into a parent node's children and keys arrays
 assumes node is not full
 */
-static void splitUpdateParent(node* parent, node* child, address childAddr, page_num newKey, table* t) {
+static void splitUpdateParent(node* parent, node* child, address childAddr, ordering_key newKey, table* t) {
 	if (isNodeFull(parent)) {
 		address newSiblingAddr;
 		node* newSibling = balanceTreeAdd(parent, child->parent, &newSiblingAddr, t);
 		// determine whether new sibling is the correct node to insert into
-		if (comparePageNums(newKey, parent->maxKey) > 0) {
+		if (compareOrderingKeys(newKey, parent->maxKey) > 0) {
 			child->parent = newSiblingAddr;
 			splitUpdateParent(newSibling, child, childAddr, newKey, t);
 			free(newSibling);
@@ -294,8 +297,8 @@ static void splitUpdateParent(node* parent, node* child, address childAddr, page
 	}
 	// look for correct spot in parent's keys
 	for (int i = 0; i < parent->childCount-1; i++) {
-		if (comparePageNums(parent->keys[i], newKey) > 0) {
-			shiftPageNumArrayR(parent->keys, i, M_GLOBAL);
+		if (compareOrderingKeys(parent->keys[i], newKey) > 0) {
+			shiftKeyArrayR(parent->keys, i, M_GLOBAL);
 			parent->keys[i] = newKey;
 			shiftAddressArrayR(parent->children, i+1, M_GLOBAL);
 			/*parent->children[i+1] = parent->children[i+2];
@@ -329,7 +332,7 @@ static node* splitNode(node* n, address addr, address* newAddrOut, table* t) {
 	int keepCount = n->childCount - middleKid; // number of children remaining (keepCount and middleKid differ when M is odd)
 
 	// save separator key before modifying keys (internal nodes only)
-	page_num separatorKey = n->keys[keepCount - 1];
+	ordering_key separatorKey = n->keys[keepCount - 1];
 
 	// copy children
 	for (int i = 0; i < middleKid; i++) {
@@ -349,14 +352,14 @@ static node* splitNode(node* n, address addr, address* newAddrOut, table* t) {
 	if (n->isLeaf) {
 		for (int i = 0; i < middleKid; i++) {
 			new->keys[i] = n->keys[i + keepCount];
-			n->keys[i + keepCount] = (page_num){0};
+			n->keys[i + keepCount] = (ordering_key){0};
 		}
 	} else {
 		for (int i = 0; i < middleKid - 1; i++) {
 			new->keys[i] = n->keys[i + keepCount];
-			n->keys[i + keepCount] = (page_num){0};
+			n->keys[i + keepCount] = (ordering_key){0};
 		}
-		n->keys[keepCount - 1] = (page_num){0}; // clear promoted separator from n
+		n->keys[keepCount - 1] = (ordering_key){0}; // clear promoted separator from n
 	}
 
 	new->childCount = middleKid;
@@ -390,7 +393,7 @@ static node* splitNode(node* n, address addr, address* newAddrOut, table* t) {
 	}
 
 	// insert new node into parent
-	page_num splitKey = n->isLeaf ? n->maxKey : separatorKey;
+	ordering_key splitKey = n->isLeaf ? n->maxKey : separatorKey;
 	node parent;
 	readNode(n->parent, &parent, t);
 	splitUpdateParent(&parent, new, newAddr, splitKey, t);
@@ -421,18 +424,18 @@ static node* balanceTreeAdd(node* n, address addr, address* newAddrOut, table* t
 	return splitNode(n, addr, newAddrOut, t);
 }
 
-// adds a page to a node and balances the tree recursively
-static void addPage(node* n, address nodeAddr, slotted_page* p, address pageAddr, table* t) {
+// adds a page to a leaf node, filed under key, and balances the tree recursively
+static void addPage(node* n, address nodeAddr, ordering_key key, address pageAddr, table* t) {
 	if (isNodeFull(n)) {
 		address newNodeAddr;
 		node* new = balanceTreeAdd(n, nodeAddr, &newNodeAddr, t);
-		if (comparePageNums(p->header.pageNum, n->maxKey) > 0) {
-			insertPageIntoChildren(new, newNodeAddr, p, pageAddr, t);
+		if (compareOrderingKeys(key, n->maxKey) > 0) {
+			insertPageIntoChildren(new, newNodeAddr, key, pageAddr, t);
 			// Propagate the new max up to the root so findPage stays accurate
 			node root;
 			readNode(t->root, &root, t);
-			if (comparePageNums(p->header.pageNum, root.maxKey) > 0) {
-				root.maxKey = p->header.pageNum;
+			if (compareOrderingKeys(key, root.maxKey) > 0) {
+				root.maxKey = key;
 				markNode(t->root, &root, t);
 			}
 			free(new);
@@ -440,7 +443,7 @@ static void addPage(node* n, address nodeAddr, slotted_page* p, address pageAddr
 		}
 		free(new);
 	}
-	insertPageIntoChildren(n, nodeAddr, p, pageAddr, t);
+	insertPageIntoChildren(n, nodeAddr, key, pageAddr, t);
 }
 
 // ##########################################################################################################################################
@@ -450,7 +453,7 @@ static void addPage(node* n, address nodeAddr, slotted_page* p, address pageAddr
 /*
 Propagates a node's new, larger maxkey up through its ancestors' separator keys.
 */
-static void propagateMaxKeyUp(address nodeAddr, page_num newMaxKey, table* t) {
+static void propagateMaxKeyUp(address nodeAddr, ordering_key newMaxKey, table* t) {
 	node n = {0};
 	if (!readNode(nodeAddr, &n, t) || !n.parent) return;
 	node parent = {0};
@@ -530,7 +533,7 @@ static address mergeNode(node* n, address addr, table* t) {
 		node mergeParent = {0};
 		loadParent(n, &mergeParent, t);
 		// get the key between source and survivor
-		page_num boundaryKey = (page_num){0};
+		ordering_key boundaryKey = (ordering_key){0};
 		for (int i = 0; i < mergeParent.childCount - 1; i++) {
 			if (mergeParent.children[i] == survAddr && mergeParent.children[i+1] == sourceAddr) {
 				boundaryKey = mergeParent.keys[i];
@@ -564,7 +567,7 @@ static address mergeNode(node* n, address addr, table* t) {
 	for (int i = 0; i < parent->childCount; i++) {
 		if (parent->children[i] == sourceAddr) {
 			shiftAddressArrayL(parent->children, i, M_GLOBAL);
-			shiftPageNumArrayL(parent->keys, i == 0 ? 0 : i - 1, M_GLOBAL);
+			shiftKeyArrayL(parent->keys, i == 0 ? 0 : i - 1, M_GLOBAL);
 			break;
 		}
 	}
@@ -608,7 +611,7 @@ static void borrowNext(node* n, address nAddr, node* next, address nextAddr, tab
 	n->maxKey = n->keys[n->childCount-1];
 	next->childCount--;
 	shiftAddressArrayL(next->children, 0, M_GLOBAL);
-	shiftPageNumArrayL(next->keys, 0, M_GLOBAL);
+	shiftKeyArrayL(next->keys, 0, M_GLOBAL);
 	markNode(nAddr, n, t);
 	markNode(nextAddr, next, t);
 	// the borrowed key is n's new largest, so it becomes n's separator in the parent. n is found by
@@ -631,13 +634,13 @@ static void borrowNext(node* n, address nAddr, node* next, address nextAddr, tab
 assumes that prev is a valid target for a borrow
 */
 static void borrowPrev(node* n, address nAddr, node* prev, address prevAddr, table* t) {
-	shiftPageNumArrayR(n->keys, 0, M_GLOBAL);
+	shiftKeyArrayR(n->keys, 0, M_GLOBAL);
 	shiftAddressArrayR(n->children, 0, M_GLOBAL);
 	prev->childCount--;
 	n->keys[0] = prev->keys[prev->childCount];
 	address borrowedAddr = prev->children[prev->childCount];
 	n->children[0] = borrowedAddr;
-	prev->keys[prev->childCount] = (page_num){0};
+	prev->keys[prev->childCount] = (ordering_key){0};
 	prev->children[prev->childCount] = 0;
 	// prev just lost its highest child, so its own maxKey must shrink
 	prev->maxKey = prev->keys[prev->childCount-1];
@@ -677,11 +680,11 @@ static void borrowNextThroughParent(node* n, address nAddr, node* next, address 
 			// the borrowed child's parent pointer must be updated to n
 			borrowed.parent = nAddr;
 			markNode(borrowedAddr, &borrowed, t);
-			shiftPageNumArrayL(next->keys, 0, M_GLOBAL-1);
+			shiftKeyArrayL(next->keys, 0, M_GLOBAL-1);
 			shiftAddressArrayL(next->children, 0, M_GLOBAL);
 			next->childCount--;
 			next->children[next->childCount] = 0;
-			next->keys[next->childCount-1] = (page_num){0};
+			next->keys[next->childCount-1] = (ordering_key){0};
 			markNode(nAddr, n, t);
 			markNode(nextAddr, next, t);
 			markNode(n->parent, &parent, t);
@@ -695,7 +698,7 @@ static void borrowPrevThroughParent(node* n, address nAddr, node* prev, address 
 	loadParent(n, &parent, t);
 	for (int i = 1; i < parent.childCount; i++) {
 		if (parent.children[i] == nAddr) {
-			shiftPageNumArrayR(n->keys, 0, M_GLOBAL);
+			shiftKeyArrayR(n->keys, 0, M_GLOBAL);
 			shiftAddressArrayR(n->children, 0, M_GLOBAL);
 			n->keys[0] = parent.keys[i-1];
 			prev->childCount--;
@@ -706,7 +709,7 @@ static void borrowPrevThroughParent(node* n, address nAddr, node* prev, address 
 			// prev just lost its highest child, so its own maxKey must shrink
 			prev->maxKey = prev->keys[prev->childCount-1];
 			prev->children[prev->childCount] = 0;
-			prev->keys[prev->childCount-1] = (page_num){0};
+			prev->keys[prev->childCount-1] = (ordering_key){0};
 			// the borrowed child's parent pointer must be updated to n
 			node borrowed = {0};
 			if (readNode(borrowedAddr, &borrowed, t)) {
@@ -784,12 +787,13 @@ static address balanceTreeDelete(node* n, address addr, table* t) {
 
 
 /*
-Deletes a page from a node
+Deletes a page from a leaf node
+the page is found by its address: the key it's filed under is an upper bound, not something to look it up by
 @param nAddr - the node's address. Rebalancing can merge the node into a sibling first, so on return
                this holds the address of the leaf the page was removed from, and n holds that leaf
 @return - whether the page was successfully deleted or not
 */
-static bool deletePage(node* n, address* nAddr, page_num pageNum, table* t)  {
+static bool deletePage(node* n, address* nAddr, address pageAddr, table* t)  {
 	if (!n->isLeaf) {
 		printf("Error: Tried to delete page in inner node\n");
 		return false;
@@ -800,9 +804,9 @@ static bool deletePage(node* n, address* nAddr, page_num pageNum, table* t)  {
 	}
 	// search for page in node's children
 	for (int i = 0; i < n->childCount; i++) {
-		if (comparePageNums(n->keys[i], pageNum) == 0) {
+		if (n->children[i] == pageAddr) {
 			markDelete(n->children[i], t);
-			shiftPageNumArrayL(n->keys, i, M_GLOBAL);
+			shiftKeyArrayL(n->keys, i, M_GLOBAL);
 			shiftAddressArrayL(n->children, i, M_GLOBAL);
 			n->childCount--;
 			if (i == n->childCount && n->childCount > 0) n->maxKey = n->keys[n->childCount-1];
@@ -818,175 +822,264 @@ static bool deletePage(node* n, address* nAddr, page_num pageNum, table* t)  {
 
 // ##########################################################################################################################################
 // ##########################################################################################################################################
+// FINDING A KEY'S PAGE
+
+/*
+walks from the root to the leaf node whose pages cover key, and reads that node into leaf
+a key above every key in the tree leads to the last leaf
+@return the leaf's address, or 0 if a node on the way couldn't be read, or if key isn't of the type this
+        tree's keys are: keys of different types can't be compared, so such a key is in no page
+*/
+static address findLeaf(ordering_key key, table* t, node* leaf) {
+	address addr = t->root;
+	if (!readNode(addr, leaf, t)) return 0;
+	while (!leaf->isLeaf) {
+		if (leaf->childCount == 0) return 0;
+		if (leaf->childCount > 1 && key.type != leaf->keys[0].type) return 0;
+		// a child's key is an upper bound for every key under it, so key belongs under the first child
+		// whose key isn't below it, or under the last child if it's above them all
+		uint32_t i = 0;
+		while (i < leaf->childCount - 1 && compareOrderingKeys(key, leaf->keys[i]) > 0) i++;
+		addr = leaf->children[i];
+		if (!readNode(addr, leaf, t)) return 0;
+	}
+	if (leaf->childCount > 0 && key.type != leaf->keys[0].type) return 0;
+	return addr;
+}
+
+/*
+finds the page in a leaf node that covers key, by binary search: the first page filed under a key that
+isn't below it. The pages are in key order and each is filed under an upper bound for its own keys, so
+no other page can hold key
+@return the page's index among the leaf's children, or leaf->childCount if key is above every page's key
+*/
+static uint32_t findPageInLeaf(node* leaf, ordering_key key) {
+	uint32_t lo = 0;
+	uint32_t hi = leaf->childCount;
+	while (lo < hi) {
+		uint32_t mid = lo + (hi - lo) / 2;
+		if (compareOrderingKeys(leaf->keys[mid], key) < 0) lo = mid + 1;
+		else hi = mid;
+	}
+	return lo;
+}
+
+/*
+finds the page that covers key (the only page a record with that key can be in) and returns its address,
+along with the address of the leaf node it belongs to (via leafOut)
+returns 0 (leafOut left untouched) if key is above every key in the tree, or the tree couldn't be read
+*/
+address findPageAndLeaf(ordering_key key, table* t, address* leafOut) {
+	node leaf = {0};
+	address leafAddr = findLeaf(key, t, &leaf);
+	if (!leafAddr) return 0;
+	uint32_t i = findPageInLeaf(&leaf, key);
+	if (i == leaf.childCount) return 0;
+	*leafOut = leafAddr;
+	return leaf.children[i];
+}
+
+// finds the page that covers key and returns its address
+// returns null if key is above every key in the tree
+address findPage(ordering_key key, table* t) {
+	address leafAddr;
+	return findPageAndLeaf(key, t, &leafAddr);
+}
+
+// ##########################################################################################################################################
+// ##########################################################################################################################################
+// SPLITTING A PAGE
+
+/*
+picks where to split a page so that both halves fit in a page: the first *keepOut records stay, and the
+rest move to a new page
+if a record is about to be inserted, hasRecord is set, pos is the index it would be inserted at, and needed
+is the room it takes (SPRecordBytes()); it then goes to whichever page its key belongs in, and
+*recordInUpperOut says which. Of the splits that leave both pages within their capacity and neither one
+empty, this picks the one that leaves them most evenly filled
+@return false if no such split exists, which takes records larger than half a page
+*/
+static bool chooseSplit(slotted_page* p, bool hasRecord, uint32_t pos, uint32_t needed, uint32_t* keepOut, bool* recordInUpperOut) {
+	uint32_t capacity = p->header.arrCap;
+	uint32_t total = SPUsedBytes(p);
+	uint32_t below = 0; // the room taken by the first `keep` records
+	uint32_t best = UINT32_MAX;
+	bool found = false;
+	for (uint32_t keep = 0; keep <= p->header.numRecords; keep++) {
+		for (int inUpper = 0; inUpper <= 1; inUpper++) {
+			if (!hasRecord && inUpper) continue;
+			// the new record has to stay on the same side as the records its key sorts beside
+			if (hasRecord && (inUpper ? pos < keep : pos > keep)) continue;
+			uint32_t extra = hasRecord ? needed : 0;
+			uint32_t lower = below + (inUpper ? 0 : extra);
+			uint32_t upper = total - below + (inUpper ? extra : 0);
+			if (lower == 0 || upper == 0 || lower > capacity || upper > capacity) continue;
+			uint32_t difference = lower > upper ? lower - upper : upper - lower;
+			if (difference < best) {
+				best = difference;
+				*keepOut = keep;
+				*recordInUpperOut = inUpper;
+				found = true;
+			}
+		}
+		if (keep < p->header.numRecords) below += SPRecordBytes(p->slots[keep].size, p->slots[keep].len);
+	}
+	return found;
+}
+
+/*
+files a newly made page in the tree, directly after the page at pageAddr
+the page at pageAddr keeps the lower keys: lowerKey is the largest one left in it, and it is filed under
+that from now on. The new page takes over the key the old one was filed under, or its own largest key
+(newKey) if that is higher, which happens when a record is added past the end of the tree
+*/
+static bool addPageAfter(address pageAddr, ordering_key lowerKey, address newAddr, ordering_key newKey, table* t) {
+	node leaf = {0};
+	address leafAddr = findLeaf(lowerKey, t, &leaf);
+	if (!leafAddr) return false;
+	uint32_t i = findPageInLeaf(&leaf, lowerKey);
+	if (i == leaf.childCount || leaf.children[i] != pageAddr) {
+		printf("Error: Tried to split a page that isn't where its keys lead\n");
+		return false;
+	}
+	ordering_key bound = leaf.keys[i];
+	leaf.keys[i] = lowerKey;
+	markNode(leafAddr, &leaf, t);
+	addPage(&leaf, leafAddr, compareOrderingKeys(newKey, bound) > 0 ? newKey : bound, newAddr, t);
+	return true;
+}
+
+/*
+stores a page whose records have been changed in memory
+if they still fit in a page, this is markPage(). If a record was made larger and they don't, the page is
+split, into two pages as evenly filled as they can be or, if no two pages can hold its records, into as
+many as it takes
+@param p - the page; if it's split, it is left holding only the records that stay at pageAddr
+@param splitOut - set to whether the page was split, which moves records to other pages
+@return false if a single record is too large for a page, or the tree couldn't be updated
+*/
+bool storePage(slotted_page* p, address pageAddr, table* t, bool* splitOut) {
+	*splitOut = false;
+	// if the records still fit in the page, mark it and return
+	if (SPFits(p)) {
+		markPage(pageAddr, p, t);
+		return true;
+	}
+	// a record too large for a page even alone fails here, before the tree is changed
+	for (uint32_t i = 0; i < p->header.numRecords; i++) {
+		if (SPRecordBytes(p->slots[i].size, p->slots[i].len) > PAGE_ARR_CAP) return false;
+	}
+	*splitOut = true;
+	slotted_page* current = p;      // the page still being cut down to size
+	address currentAddr = pageAddr;
+	slotted_page* made = NULL;      // the newest page this made, if current is one
+	bool ok = true;
+	while (ok && !SPFits(current)) {
+		uint32_t keep;
+		bool unused;
+		if (!chooseSplit(current, false, 0, 0, &keep, &unused)) {
+			// no even split fits, so the page keeps as many of its records as it has room for
+			uint32_t room = 0;
+			for (keep = 0; keep < current->header.numRecords; keep++) {
+				room += SPRecordBytes(current->slots[keep].size, current->slots[keep].len);
+				if (room > current->header.arrCap) break;
+			}
+			if (keep == 0) { // the first record doesn't fit in a page even alone
+				ok = false;
+				break;
+			}
+		}
+		slotted_page* upper = makeSPage(PAGE_NUM_SLOTS, PAGE_NUM_ENTRIES, PAGE_ARR_CAP);
+		address upperAddr = allocPage(t);
+		SPSplit(current, upper, keep);
+		markPage(currentAddr, current, t);
+		ok = addPageAfter(currentAddr, current->header.maxKey, upperAddr, upper->header.maxKey, t);
+		if (made) {
+			freeSPage(made);
+			free(made);
+		}
+		current = made = upper;
+		currentAddr = upperAddr;
+	}
+	if (ok) markPage(currentAddr, current, t);
+	if (made) {
+		freeSPage(made);
+		free(made);
+	}
+	return ok;
+}
+
+// ##########################################################################################################################################
+// ##########################################################################################################################################
 // B+TREE API
 
-// finds a page in a tree by page number and returns its address
-// returns null if page is not in tree
-address findPage(page_num pageNum, table* t) {
-	node cur = {0};
-	readNode(t->root, &cur, t);
-    if (cur.childCount == 0) {
-        printf("Attempted to find page in invalid tree\n");
-        return 0;
-    }
-    while (!cur.isLeaf) {
-        int found = 0;
-        for (int i = 0; i < cur.childCount - 1; i++) {
-            if (comparePageNums(pageNum, cur.keys[i]) <= 0) {
-                readNode(cur.children[i], &cur, t);
-                found = 1;
-                break;
-            }
-        }
-        if (!found) {
-            readNode(cur.children[cur.childCount - 1], &cur, t);
-        }
-    }
-    for (int i = 0; i < cur.childCount; i++) {
-        if (comparePageNums(cur.keys[i], pageNum) == 0) {
-            return cur.children[i];
-        }
-    }
-	return 0;
-}
-
 /*
-finds a page in a tree by page number and returns its address, along with the
-address of the leaf node whose children array contains it (via leafOut).
-returns 0 (leafOut left untouched) if the page is not in the tree
+finds the page that covers the record's key, checks that the key isn't already in it, and inserts the
+record, splitting the page if it's full
+0 = inserted, 1 = key already exists, 2 = failed, 3 = the record is too large to fit in a page
 */
-address findPageAndLeaf(page_num pageNum, table* t, address* leafOut) {
-	node cur = {0};
-	address nAddr = t->root;
-	readNode(nAddr, &cur, t);
-    if (cur.childCount == 0) {
-        printf("Attempted to find page in invalid tree\n");
-        return 0;
-    }
-    while (!cur.isLeaf) {
-        int found = 0;
-        for (int i = 0; i < cur.childCount - 1; i++) {
-            if (comparePageNums(pageNum, cur.keys[i]) <= 0) {
-                nAddr = cur.children[i];
-                readNode(nAddr, &cur, t);
-                found = 1;
-                break;
-            }
-        }
-        if (!found) {
-            nAddr = cur.children[cur.childCount - 1];
-            readNode(nAddr, &cur, t);
-        }
-    }
-    for (int i = 0; i < cur.childCount; i++) {
-        if (comparePageNums(cur.keys[i], pageNum) == 0) {
-            *leafOut = nAddr;
-            return cur.children[i];
-        }
-    }
-	return 0;
-}
-
-/*
-finds a page in a tree by page number and returns its address
-if the page does not exist, creates a page in the right spot and returns it
-*/
-address findAndInsert(page_num pageNum, table* t) {
-	node cur = {0};
-	address nAddr = t->root;
-	readNode(nAddr, &cur, t);
-    if (cur.childCount == 0) {
-        printf("Attempted to find page in invalid tree\n");
-        return 0;
-    }
-    while (!cur.isLeaf) {
-        int found = 0;
-        for (int i = 0; i < cur.childCount - 1; i++) {
-            if (comparePageNums(pageNum, cur.keys[i]) <= 0) {
-                nAddr = cur.children[i];
-                readNode(nAddr, &cur, t);
-                found = 1;
-                break;
-            }
-        }
-        if (!found) {
-            nAddr = cur.children[cur.childCount - 1];
-            readNode(nAddr, &cur, t);
-        }
-    }
-    for (int i = 0; i < cur.childCount; i++) {
-        page_num key = cur.keys[i];
-        if (comparePageNums(key, pageNum) == 0) {
-            return cur.children[i];
-        } else if (comparePageNums(key, pageNum) > 0) {
-			slotted_page* p = makeSPage(pageNum, PAGE_NUM_SLOTS, PAGE_NUM_ENTRIES, PAGE_ARR_CAP);
-			address pageAddr = allocPage(t);
-			addPage(&cur, nAddr, p, pageAddr, t);
-			markPage(pageAddr, p, t);
-			freeSPage(p); free(p);
-			return pageAddr;
-		}
-    }
-	slotted_page* p = makeSPage(pageNum, PAGE_NUM_SLOTS, PAGE_NUM_ENTRIES, PAGE_ARR_CAP);
-	address pageAddr = allocPage(t);
-    addPage(&cur, nAddr, p, pageAddr, t);
-	markPage(pageAddr, p, t);
-	freeSPage(p); free(p);
-	return pageAddr;
-}
-
-/*
-Searches for a page by number in the tree and deletes it
-@return true - page is found and deleted
-@return false - page deletion was unsuccessful
-*/
-bool findAndDelete(page_num pageNum, table* t) {
-	node cur = {0};
-	address nAddr = t->root;
-	readNode(nAddr, &cur, t);
-    if (cur.childCount == 0) {
-        printf("Attempted to find page in invalid tree\n");
-        return false;
-    }
-    while (!cur.isLeaf) {
-        int found = 0;
-        for (int i = 0; i < cur.childCount - 1; i++) {
-            if (comparePageNums(pageNum, cur.keys[i]) <= 0) {
-                nAddr = cur.children[i];
-                readNode(nAddr, &cur, t);
-                found = 1;
-                break;
-            }
-        }
-        if (!found) {
-            nAddr = cur.children[cur.childCount - 1];
-            readNode(nAddr, &cur, t);
-        }
-    }
-    for (int i = 0; i < cur.childCount; i++) {
-        page_num key = cur.keys[i];
-        if (comparePageNums(key, pageNum) == 0) {
-            return deletePage(&cur, &nAddr, pageNum, t);
-		}
-    }
-	return false;
-}
-
-// 0 = inserted, 1 = key already exists, 2 = failed
 int insertRecord(sp_record* record, ordering_key key, table* t) {
-	// find the right page and create it if necessary
-	address addr = findAndInsert(key.pageNum, t);
-	if (!addr) return 2;
-	// read the page in from disk
-	slotted_page p = {0};
-	if (!readPage(addr, &p, t)) return 2;
-	// if record already exists, reject insertion
-	if (SPSearch(&p, key.offset) >= 0) { freeSPage(&p); return 1; }
-	// else, insert the row and return its success
-	bool out = SPInsert(&p, key.offset, *record);
-	if (out) markPage(addr, &p, t);
-	freeSPage(&p);
-	return out ? 0 : 2;
+	uint32_t needed = SPRecordBytes(record->size, record->len);
+	if (needed > PAGE_ARR_CAP) return 3;
+	// a page whose records can't be divided into two pages that fit, along with the new one, is first split
+	// where the new record belongs. The second time round, the record is at one end of its page
+	for (int attempt = 0; attempt < 3; attempt++) {
+		node leaf = {0};
+		address leafAddr = findLeaf(key, t, &leaf);
+		if (!leafAddr || leaf.childCount == 0) return 2;
+		// a key above every key in the tree goes at the end of the last page
+		uint32_t i = findPageInLeaf(&leaf, key);
+		bool pastEnd = i == leaf.childCount;
+		if (pastEnd) i = leaf.childCount - 1;
+		address pageAddr = leaf.children[i];
+		slotted_page p = {0};
+		if (!readPage(pageAddr, &p, t)) return 2;
+		// if record already exists, reject insertion
+		if (SPSearch(&p, key) >= 0) { freeSPage(&p); return 1; }
+
+		if (SPHasRoom(&p, record->size, record->len)) {
+			SPInsert(&p, key, *record);
+			markPage(pageAddr, &p, t);
+			freeSPage(&p);
+			if (pastEnd) {
+				// the page is now filed under its new largest key, and so is everything above it
+				leaf.keys[i] = key;
+				leaf.maxKey = key;
+				markNode(leafAddr, &leaf, t);
+				propagateMaxKeyUp(leafAddr, key, t);
+			}
+			return 0;
+		}
+		if (p.header.numRecords == 0) { freeSPage(&p); return 3; } // an empty page that still has no room for it
+
+		// the page is full
+		slotted_page* upper = makeSPage(PAGE_NUM_SLOTS, PAGE_NUM_ENTRIES, PAGE_ARR_CAP);
+		address upperAddr = allocPage(t);
+		uint32_t pos = SPPosition(&p, key);
+		uint32_t keep;
+		bool recordInUpper;
+		bool inserted = true;
+		if (pos == p.header.numRecords) {
+			// the record goes after everything in the page, so it starts a new page and the full one is
+			// left as it is: keys inserted in order fill every page completely
+			SPInsert(upper, key, *record);
+		} else if (chooseSplit(&p, true, pos, needed, &keep, &recordInUpper)) {
+			SPSplit(&p, upper, keep);
+			SPInsert(recordInUpper ? upper : &p, key, *record);
+		} else {
+			SPSplit(&p, upper, pos);
+			inserted = false;
+		}
+		markPage(pageAddr, &p, t);
+		markPage(upperAddr, upper, t);
+		bool filed = addPageAfter(pageAddr, p.header.maxKey, upperAddr, upper->header.maxKey, t);
+		freeSPage(&p);
+		freeSPage(upper);
+		free(upper);
+		if (!filed) return 2;
+		if (inserted) return 0;
+	}
+	return 2;
 }
 
 /*
@@ -994,11 +1087,11 @@ searches a table for a record
 returns whether the record was found in the table
 */
 bool searchRecord(ordering_key key, table* t) {
-	address addr = findPage(key.pageNum, t);
+	address addr = findPage(key, t);
 	if (!addr) return false;
 	slotted_page p = {0};
-	readPage(addr, &p, t);
-	int idx = SPSearch(&p, key.offset);
+	if (!readPage(addr, &p, t)) return false;
+	int idx = SPSearch(&p, key);
 	freeSPage(&p);
 	return idx >= 0;
 }
@@ -1006,21 +1099,35 @@ bool searchRecord(ordering_key key, table* t) {
 /*
 Reads a record by key. The caller provides a page buffer that backs the returned sp_record;
 the caller must call freeSPage(page) when done with the record data.
-Returns {0} if the record does not exist (page is left uninitialized in that case).
+Returns {0} if the record does not exist (page is left as it was if no page covers the key).
 */
 sp_record readRecord(ordering_key key, table* t, slotted_page* page) {
-	address addr = findPage(key.pageNum, t);
+	address addr = findPage(key, t);
 	if (!addr) return (sp_record){0};
-	readPage(addr, page, t);
-	return SPRead(page, key.offset);
+	if (!readPage(addr, page, t)) return (sp_record){0};
+	return SPRead(page, key);
 }
 
+/*
+replaces the entries of the record with this key (see SPUpdate()), splitting its page if the record has
+grown too large for it
+@return false if there is no such record, or the record would be too large to fit in a page; nothing has
+        changed, and the new entries are still the caller's. Also false if the page couldn't be stored
+*/
 bool updateRecord(sp_record* record, ordering_key key, table* t) {
-	address addr = findAndInsert(key.pageNum, t);
+	address addr = findPage(key, t);
+	if (!addr) return false;
 	slotted_page p = {0};
 	if (!readPage(addr, &p, t)) return false;
-	bool out = SPUpdate(&p, key.offset, *record);
-	if (out) markPage(addr, &p, t);
+	bool out = false;
+	int index = SPSearch(&p, key);
+	if (index >= 0 && p.slots[index].len >= record->len) {
+		sp_slot slot = p.slots[index];
+		uint32_t size = slot.size;
+		for (uint32_t i = 0; i < record->len; i++) size += record->entries[i].size - p.entries[slot.ptr + i].size;
+		bool split;
+		out = SPRecordBytes(size, slot.len) <= PAGE_ARR_CAP && SPUpdate(&p, key, *record) && storePage(&p, addr, t, &split);
+	}
 	freeSPage(&p);
 	return out;
 }
@@ -1028,23 +1135,28 @@ bool updateRecord(sp_record* record, ordering_key key, table* t) {
 /*
 Deletes a record from the B+ tree.
 page is a caller-provided buffer; on return it holds the post-deletion state of the page.
+A page left with no records is removed from the tree, unless it is the tree's only page.
 @param leafOut - set to the address of the leaf that holds the record's page, or held it if the page
                  was emptied and removed. Removing a page can rebalance the tree, so this may not be
-                 the leaf the page was in before the call. Set to 0 if the page isn't in the tree
-@return true if the record was deleted or did not exist; false on failure.
+                 the leaf the page was in before the call. Set to 0 if no page covers the key
+@return true if the record was deleted or no page covers its key; false on failure, which includes the
+        page that covers the key not holding it
 */
 bool deleteRecord(ordering_key key, table* t, slotted_page* page, address* leafOut) {
-	address leafAddr = 0;
-	address addr = findPageAndLeaf(key.pageNum, t, &leafAddr);
+	*leafOut = 0;
+	node leaf = {0};
+	address leafAddr = findLeaf(key, t, &leaf);
+	if (!leafAddr) return false;
+	uint32_t i = findPageInLeaf(&leaf, key);
+	if (i == leaf.childCount) return true;
 	*leafOut = leafAddr;
-	if (!addr) return true;
+	address addr = leaf.children[i];
 	if (!readPage(addr, page, t)) return false;
-	bool out = SPDelete(page, key.offset);
+	bool out = SPDelete(page, key);
 	if (!out) return false;
-	if (page->header.numRecords == 0) {
-		node leaf = {0};
-		if (!readNode(leafAddr, &leaf, t)) return false;
-		if (!deletePage(&leaf, &leafAddr, key.pageNum, t)) return false;
+	bool onlyPage = isRoot(&leaf) && leaf.childCount == 1; // kept, so that there's always a page to insert into
+	if (page->header.numRecords == 0 && !onlyPage) {
+		if (!deletePage(&leaf, &leafAddr, addr, t)) return false;
 		*leafOut = leafAddr;
 	} else {
 		markPage(addr, page, t);

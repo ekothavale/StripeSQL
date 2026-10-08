@@ -1891,11 +1891,15 @@ void test_interpret_filtered_delete(void) {
     // that match, and leave the others reachable by a scan and by key
     remove(schema_path());
     remove(TABLE_DIRECTORY "fd.tbl");
-    assert(interpret("create table fd (id int primary key, v int)").ir == INTERPRET_OK);
-    char sql[64];
+    // two rows this wide fill a page, so the table's 300 pages are spread over several leaves
+    assert(interpret("create table fd (id int primary key, v int, pad text)").ir == INTERPRET_OK);
+    char pad[1901];
+    memset(pad, 'p', sizeof(pad) - 1);
+    pad[sizeof(pad) - 1] = '\0';
+    char sql[2048];
     assert(interpret("begin transaction").ir == INTERPRET_OK);
     for (int i = 1; i <= 600; i++) {
-        snprintf(sql, sizeof(sql), "insert into fd values (%d, %d)", i, i);
+        snprintf(sql, sizeof(sql), "insert into fd values (%d, %d, '%s')", i, i, pad);
         assert(interpret(sql).ir == INTERPRET_OK);
     }
     assert(interpret("commit").ir == INTERPRET_OK);
@@ -1990,6 +1994,286 @@ void test_interpret_table_cache(void) {
 
 // --- master ---
 
+/* A string of n copies of c, for a text column. The caller frees it. */
+static char* wide_text(int n, char c) {
+    char* out = malloc(n + 1);
+    memset(out, c, n);
+    out[n] = '\0';
+    return out;
+}
+
+// the rows of table ur: 400 of them, and v starts as id % 5
+#define UR_ROWS 400
+
+/*
+Asserts that table ur holds every row exactly once, by a scan and by key, and that each row's v and s are
+what the callbacks say they should be for its id. sLen gives the expected length of s, and sChar the
+character it is filled with, or 0 for the 'row<id>' it was inserted with.
+*/
+static void check_ur(int64_t (*v)(int64_t id), int (*sLen)(int64_t id), char sChar) {
+    result_buffer scan = interpret("select id, v, s from ur");
+    assert(scan.ir == INTERPRET_OK && scan.count == UR_ROWS);
+    bool seen[UR_ROWS + 1] = {0};
+    char original[32];
+    for (int i = 0; i < scan.count; i++) {
+        int64_t id = scan.rows[i][0].as.integer;
+        assert(id >= 1 && id <= UR_ROWS && !seen[id]);
+        seen[id] = true;
+        assert(scan.rows[i][1].as.integer == v(id));
+        const char* text = scan.rows[i][2].as.text;
+        int len = sLen(id);
+        if (len < 0) {
+            snprintf(original, sizeof(original), "row%lld", (long long)id);
+            assert(strcmp(text, original) == 0);
+        } else {
+            assert((int)strlen(text) == len);
+            for (int j = 0; j < len; j++) assert(text[j] == sChar);
+        }
+    }
+    freeVM();
+    char sql[64];
+    for (int id = 1; id <= UR_ROWS; id++) {
+        snprintf(sql, sizeof(sql), "select v, s from ur where id = %d", id);
+        result_buffer one = interpret(sql);
+        assert(one.ir == INTERPRET_OK && one.count == 1 && one.rows[0][0].as.integer == v(id));
+        int len = sLen(id);
+        if (len >= 0) assert((int)strlen(one.rows[0][1].as.text) == len);
+        freeVM();
+    }
+}
+
+static int64_t ur_v_original(int64_t id) { return id % 5; }
+static int64_t ur_v_threes_up(int64_t id) { return id % 5 == 3 ? 13 : id % 5; }
+static int64_t ur_v_all_up(int64_t id)    { return ur_v_threes_up(id) + 100; }
+static int ur_s_original(int64_t id)      { (void)id; return -1; }
+static int ur_s_threes_wide(int64_t id)   { return id % 5 == 3 ? 1500 : -1; }
+static int ur_s_all_900(int64_t id)       { (void)id; return 900; }
+static int ur_s_all_5(int64_t id)         { (void)id; return 5; }
+
+void test_interpret_update_resizes_rows(void) {
+    // a row that an UPDATE makes larger may no longer fit beside the others in its page, and then the page
+    // is split under the scan that drives the UPDATE, moving the row the scanner is on. Every matching
+    // row must be updated exactly once (v counts the updates), and every row must stay reachable by a
+    // scan and by key
+    remove(schema_path());
+    remove(TABLE_DIRECTORY "ur.tbl");
+    assert(interpret("create table ur (id int primary key, v int, s text)").ir == INTERPRET_OK);
+    char* sql = malloc(4200);
+    assert(interpret("begin transaction").ir == INTERPRET_OK);
+    for (int i = 1; i <= UR_ROWS; i++) {
+        snprintf(sql, 4200, "insert into ur values (%d, %d, 'row%d')", i, i % 5, i);
+        assert(interpret(sql).ir == INTERPRET_OK);
+    }
+    assert(interpret("commit").ir == INTERPRET_OK);
+    check_ur(ur_v_original, ur_s_original, 0);
+
+    // one row in five grows to more than a third of a page; the column after the one that grows is
+    // written to the row wherever the split left it
+    char* wide = wide_text(1500, 'w');
+    snprintf(sql, 4200, "update ur set s = '%s', v = v + 10 where v = 3", wide);
+    assert(interpret(sql).ir == INTERPRET_OK);
+    check_ur(ur_v_threes_up, ur_s_threes_wide, 'w');
+
+    // every row changes size, in a transaction that is discarded: nothing is left of it
+    char* medium = wide_text(900, 'm');
+    assert(interpret("begin transaction").ir == INTERPRET_OK);
+    snprintf(sql, 4200, "update ur set v = v + 100, s = '%s'", medium);
+    assert(interpret(sql).ir == INTERPRET_OK);
+    check_ur(ur_v_all_up, ur_s_all_900, 'm');  // as pending in the transaction
+    assert(interpret("discard").ir == INTERPRET_OK);
+    check_ur(ur_v_threes_up, ur_s_threes_wide, 'w');
+
+    // and committed: as reloaded from disk
+    assert(interpret(sql).ir == INTERPRET_OK);
+    check_ur(ur_v_all_up, ur_s_all_900, 'm');
+
+    // rows made smaller stay where they are
+    assert(interpret("update ur set s = 'sssss'").ir == INTERPRET_OK);
+    check_ur(ur_v_all_up, ur_s_all_5, 's');
+
+    free(wide);
+    free(medium);
+    free(sql);
+    assert(interpret("drop table ur").ir == INTERPRET_OK);
+    remove(schema_path());
+}
+
+void test_interpret_row_too_large(void) {
+    // a row has to fit in a page. An INSERT or an UPDATE that would make one larger fails, and the table
+    // is left as it was; a row that only just fits is fine
+    remove(schema_path());
+    remove(TABLE_DIRECTORY "tl.tbl");
+    assert(interpret("create table tl (id int primary key, s text)").ir == INTERPRET_OK);
+    assert(interpret("insert into tl values (1, 'one')").ir == INTERPRET_OK);
+    assert(interpret("insert into tl values (2, 'two')").ir == INTERPRET_OK);
+
+    char* sql = malloc(4200);
+    char* tooWide = wide_text(PAGE_ARR_CAP, 'x');
+    char* wide = wide_text(PAGE_ARR_CAP - 200, 'y');
+
+    snprintf(sql, 4200, "insert into tl values (3, '%s')", tooWide);
+    assert(interpret(sql).ir == INTERPRET_RUNTIME_ERROR);
+    snprintf(sql, 4200, "update tl set s = '%s' where id = 1", tooWide);
+    assert(interpret(sql).ir == INTERPRET_RUNTIME_ERROR);
+    snprintf(sql, 4200, "update tl set s = '%s'", tooWide);
+    assert(interpret(sql).ir == INTERPRET_RUNTIME_ERROR);
+
+    result_buffer r = interpret("select id, s from tl");
+    assert(r.ir == INTERPRET_OK && r.count == 2);
+    for (int i = 0; i < 2; i++) {
+        assert(strcmp(r.rows[i][1].as.text, r.rows[i][0].as.integer == 1 ? "one" : "two") == 0);
+    }
+    freeVM();
+
+    // nearly a page each: the two rows that shared a page now have one apiece
+    snprintf(sql, 4200, "insert into tl values (3, '%s')", wide);
+    assert(interpret(sql).ir == INTERPRET_OK);
+    snprintf(sql, 4200, "update tl set s = '%s'", wide);
+    assert(interpret(sql).ir == INTERPRET_OK);
+    r = interpret("select id, s from tl");
+    assert(r.ir == INTERPRET_OK && r.count == 3);
+    for (int i = 0; i < 3; i++) assert(strcmp(r.rows[i][1].as.text, wide) == 0);
+    freeVM();
+    r = interpret("select s from tl where id = 2");
+    assert(r.ir == INTERPRET_OK && r.count == 1 && strcmp(r.rows[0][0].as.text, wide) == 0);
+    freeVM();
+
+    free(tooWide);
+    free(wide);
+    free(sql);
+    assert(interpret("drop table tl").ir == INTERPRET_OK);
+    remove(schema_path());
+}
+
+/* Asserts that table ko's scan returns exactly the ids from first to last, in ascending order. */
+static void check_ko(int first, int last) {
+    result_buffer scan = interpret("select id, v from ko");
+    assert(scan.ir == INTERPRET_OK && scan.count == last - first + 1);
+    for (int i = 0; i < scan.count; i++) {
+        assert(scan.rows[i][0].as.integer == first + i);
+        assert(scan.rows[i][1].as.integer == (first + i) * 2);
+    }
+    freeVM();
+}
+
+void test_interpret_scans_in_key_order(void) {
+    // rows are stored by primary key, so a scan returns them in primary key order whatever order they
+    // were inserted in: integers as signed numbers, with negative keys first, and text byte by byte
+    remove(schema_path());
+    remove(TABLE_DIRECTORY "ko.tbl");
+    remove(TABLE_DIRECTORY "kt.tbl");
+    assert(interpret("create table ko (id int primary key, v int)").ir == INTERPRET_OK);
+    char sql[96];
+    assert(interpret("begin transaction").ir == INTERPRET_OK);
+    for (int i = 0; i < 600; i++) {
+        int id = (i * 7919) % 600 - 300;  // every key from -300 to 299, scattered
+        snprintf(sql, sizeof(sql), "insert into ko values (%d, %d)", id, id * 2);
+        assert(interpret(sql).ir == INTERPRET_OK);
+    }
+    check_ko(-300, 299);  // as pending in the transaction
+    assert(interpret("commit").ir == INTERPRET_OK);
+    check_ko(-300, 299);  // as reloaded from disk
+
+    int probes[] = { -300, -299, -1, 0, 1, 299 };
+    for (int i = 0; i < 6; i++) {
+        snprintf(sql, sizeof(sql), "select v from ko where id = %d", probes[i]);
+        result_buffer one = interpret(sql);
+        assert(one.ir == INTERPRET_OK && one.count == 1 && one.rows[0][0].as.integer == probes[i] * 2);
+        freeVM();
+    }
+    result_buffer none = interpret("select v from ko where id = -301");
+    assert(none.ir == INTERPRET_OK && none.count == 0);
+
+    // rows deleted from either end, and put back in the middle of what's left
+    assert(interpret("delete from ko where id < -100").ir == INTERPRET_OK);
+    assert(interpret("delete from ko where id > 150").ir == INTERPRET_OK);
+    check_ko(-100, 150);
+    for (int id = -120; id < -100; id++) {
+        snprintf(sql, sizeof(sql), "insert into ko values (%d, %d)", id, id * 2);
+        assert(interpret(sql).ir == INTERPRET_OK);
+    }
+    check_ko(-120, 150);
+
+    // text keys: a string sorts after its own prefixes, and upper case before lower
+    assert(interpret("create table kt (id text primary key, v int)").ir == INTERPRET_OK);
+    const char* sorted[] = { "", "Apple", "Zed", "a", "a b", "aa", "apple", "apples", "b", "key00009", "key0001",
+                             "key00010", "pear", "zzzzzzzzzzzzzzzzzzzzzzzz" };
+    int count = sizeof(sorted) / sizeof(sorted[0]);
+    for (int i = 0; i < count; i++) {
+        int pick = (i * 5) % count;  // every string once, scattered
+        snprintf(sql, sizeof(sql), "insert into kt values ('%s', %d)", sorted[pick], pick);
+        assert(interpret(sql).ir == INTERPRET_OK);
+    }
+    result_buffer scan = interpret("select id, v from kt");
+    assert(scan.ir == INTERPRET_OK && scan.count == count);
+    for (int i = 0; i < count; i++) {
+        assert(strcmp(scan.rows[i][0].as.text, sorted[i]) == 0 && scan.rows[i][1].as.integer == i);
+    }
+    freeVM();
+    for (int i = 0; i < count; i++) {
+        snprintf(sql, sizeof(sql), "select v from kt where id = '%s'", sorted[i]);
+        result_buffer one = interpret(sql);
+        assert(one.ir == INTERPRET_OK && one.count == 1 && one.rows[0][0].as.integer == i);
+        freeVM();
+    }
+
+    assert(interpret("drop table ko").ir == INTERPRET_OK);
+    assert(interpret("drop table kt").ir == INTERPRET_OK);
+    remove(schema_path());
+}
+
+void test_interpret_key_of_wrong_type(void) {
+    // a table's rows are kept in order of a primary key of one type. A row whose key is of another type,
+    // or is text too long to be a key, is refused, and the table goes on taking rows; it used to go into
+    // an empty table under a key nothing could be compared with, after which every insert was refused
+    remove(schema_path());
+    remove(TABLE_DIRECTORY "kw.tbl");
+    remove(TABLE_DIRECTORY "kn.tbl");
+    assert(interpret("create table kw (id text primary key, v int)").ir == INTERPRET_OK);
+    assert(interpret("insert into kw values (5, 1)").ir == INTERPRET_RUNTIME_ERROR);
+    assert(interpret("insert into kw values ('abcdefghijklmnopqrstuvwxy', 2)").ir == INTERPRET_RUNTIME_ERROR);  // 25 bytes
+    assert(interpret("insert into kw values ('abcdefghijklmnopqrstuvwx', 3)").ir == INTERPRET_OK);              // 24
+    assert(interpret("insert into kw values ('pear', 4)").ir == INTERPRET_OK);
+    assert(interpret("insert into kw values (5, 1)").ir == INTERPRET_RUNTIME_ERROR);
+    result_buffer r = interpret("select id, v from kw");
+    assert(r.ir == INTERPRET_OK && r.count == 2);
+    assert(strcmp(r.rows[0][0].as.text, "abcdefghijklmnopqrstuvwx") == 0 && strcmp(r.rows[1][0].as.text, "pear") == 0);
+    freeVM();
+    r = interpret("select v from kw where id = 5");
+    assert(r.ir == INTERPRET_OK && r.count == 0);
+    r = interpret("select v from kw where id = 'abcdefghijklmnopqrstuvwxy'");
+    assert(r.ir == INTERPRET_OK && r.count == 0);
+    r = interpret("select v from kw where id = 'pear'");
+    assert(r.ir == INTERPRET_OK && r.count == 1 && r.rows[0][0].as.integer == 4);
+    freeVM();
+
+    assert(interpret("create table kn (id int primary key, v int)").ir == INTERPRET_OK);
+    assert(interpret("insert into kn values ('one', 1)").ir == INTERPRET_RUNTIME_ERROR);
+    assert(interpret("insert into kn values ('abcdefghijklmnopqrstuvwxy', 1)").ir == INTERPRET_RUNTIME_ERROR);
+    assert(interpret("insert into kn values (1, 1)").ir == INTERPRET_OK);
+    assert(interpret("insert into kn values ('abcdefghijklmnopqrstuvwxy', 1)").ir == INTERPRET_RUNTIME_ERROR);
+    assert(interpret("insert into kn values ('one', 1)").ir == INTERPRET_RUNTIME_ERROR);
+    r = interpret("select v from kn where id = 'one'");
+    assert(r.ir == INTERPRET_OK && r.count == 0);
+    r = interpret("select v from kn where id = 'abcdefghijklmnopqrstuvwxy'");
+    assert(r.ir == INTERPRET_OK && r.count == 0);
+    // not even when the table has a row under the smallest key there is, the most negative integer
+    assert(interpret("insert into kn values (-2147483648 * 4294967296, 9)").ir == INTERPRET_OK);
+    r = interpret("select v from kn");
+    assert(r.ir == INTERPRET_OK && r.count == 2 && r.rows[0][0].as.integer == 9);  // it sorts first
+    freeVM();
+    r = interpret("select v from kn where id = 'abcdefghijklmnopqrstuvwxy'");
+    assert(r.ir == INTERPRET_OK && r.count == 0);
+    assert(interpret("delete from kn where v = 9").ir == INTERPRET_OK);
+    r = interpret("select id from kn");
+    assert(r.ir == INTERPRET_OK && r.count == 1 && r.rows[0][0].as.integer == 1);
+    freeVM();
+
+    assert(interpret("drop table kw").ir == INTERPRET_OK);
+    assert(interpret("drop table kn").ir == INTERPRET_OK);
+    remove(schema_path());
+}
+
 void test_vm(void) {
     test_vm_push_pop_integer();
     test_vm_push_pop_lifo();
@@ -2005,6 +2289,10 @@ void test_vm(void) {
     test_interpret_text_operands_released();
     test_interpret_ordering_comparisons();
     test_interpret_filtered_delete();
+    test_interpret_update_resizes_rows();
+    test_interpret_row_too_large();
+    test_interpret_scans_in_key_order();
+    test_interpret_key_of_wrong_type();
     test_interpret_table_cache();
     printf("All VM tests passed.\n");
 }

@@ -29,6 +29,7 @@ a failed assertion aborts with a non-zero exit status
 
 int main(void) {
     // storage engine
+    test_ordering();
     test_page();
     test_tableio();
     test_table_mgmt();

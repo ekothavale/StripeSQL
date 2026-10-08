@@ -22,16 +22,10 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 #include "../common.h"
 #include "value.h"
 
-#define OFFSET_BITS 6
-#define TEXT_KEY_LENGTH_MINIMUM 16
-#define TEXT_KEY_MAX_LEN 24
-#define TEXT_PAGE_NUM_LEN (TEXT_KEY_MAX_LEN - OFFSET_BITS)
+#define TEXT_KEY_MAX_LEN 24 // maximum size in bytes of a string ordering key
 
-// On-disk serialization sizes (fixed regardless of numeric vs string key type)
-// page_num:    1 byte type + TEXT_PAGE_NUM_LEN bytes data  = 19 bytes
-// page_offset: 1 byte type + 8 bytes data (max of u64/str) =  9 bytes
-#define PAGE_NUM_DISK_SIZE    (1 + TEXT_PAGE_NUM_LEN)
-#define PAGE_OFFSET_DISK_SIZE (1 + 8)
+// On-disk size of an ordering key, the same for every key type: 1 byte type + TEXT_KEY_MAX_LEN bytes of data
+#define ORDERING_KEY_DISK_SIZE (1 + TEXT_KEY_MAX_LEN)
 
 typedef enum {
 	ORDERING_ULONG,
@@ -43,25 +37,11 @@ typedef struct {
 	ordering_type type;
 	union {
 		uint64_t u64;
-		char string[TEXT_PAGE_NUM_LEN + 1];
+		char string[TEXT_KEY_MAX_LEN + 1];
 	} as;
-} page_num;
-
-typedef struct {
-	ordering_type type;
-	union {
-		uint64_t u64;
-		char string[OFFSET_BITS + 1];
-	} as;
-} page_offset;
-
-typedef struct {
-	page_num    pageNum;
-	page_offset offset;
 } ordering_key;
 
 ordering_key pkToOk(value pk);
-int comparePageNums(page_num a, page_num b);
-int compareOffsets(page_offset a, page_offset b);
+int compareOrderingKeys(ordering_key a, ordering_key b);
 
 #endif // ORDERING_H

@@ -125,6 +125,10 @@ void test_interpret_text_results();
 void test_interpret_text_operands_released();
 void test_interpret_ordering_comparisons();
 void test_interpret_filtered_delete();
+void test_interpret_update_resizes_rows();
+void test_interpret_row_too_large();
+void test_interpret_scans_in_key_order();
+void test_interpret_key_of_wrong_type();
 void test_interpret_table_cache();
 
 /* Generator tests */
