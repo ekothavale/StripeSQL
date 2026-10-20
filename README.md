@@ -13,7 +13,7 @@ A SQL query moves through five stages before touching the disk:
   │   SQL Query                                              │
   │      │                                                   │
   │      ▼                                                   │
-  │  ┌────────┐    token    ┌────────┐    AST                │
+  │  ┌────────┐   tokens    ┌────────┐      AST              │
   │  │ Lexer  │ ──────────► │ Parser │ ──────────────┐       │
   │  │lexer.c │             │parser.c│               │       │
   │  └────────┘             └────────┘               ▼       │
@@ -44,12 +44,13 @@ A SQL query moves through five stages before touching the disk:
   │        │   Page    │  │    Node    │  │  Ordering  │     │
   │        │  page.c   │  │   node.h   │  │ordering.c  │     │
   │        └─────┬─────┘  └────────────┘  └────────────┘     │
-  │              │                                           │
+  │              │_______________|_______________|           │
   │              ▼                                           │
-  │        ┌───────────┐                                     │
-  │        │ Table I/O │   (.tbl files in tables/)           │
-  │        │ tableIO.c │                                     │
-  │        └─────┬─────┘                                     │
+  │        ┌───────────┐       ┌────────────┐                │
+  │        │ Table I/O │ ◄───► │ Node cache │                │
+  │        │ tableIO.c │       │  cache.c   │                │
+  │        └─────┬─────┘       └────────────┘                │
+  │              │ (.tbl files in tables/)                   │
   │              │ each commit is logged before the          │
   │              ▼ table files are written                   │
   │        ┌───────────┐                                     │
@@ -62,13 +63,13 @@ A SQL query moves through five stages before touching the disk:
   and VM to resolve column names and primary key positions.
 ```
 
-**Lexer** (`src/SQL_interpreter/lexer.c`) — scans the raw query string into a flat token array, skipping whitespace and comments. Multi-word clauses such as `INSERT INTO` are matched at the parse level, not here.
+**Lexer** (`src/SQL_interpreter/lexer.c`) — scans a raw query string into a token array, skipping whitespace and comments. Multi-word clauses such as `INSERT INTO` are matched at the parse level, not here.
 
 **Parser** (`src/SQL_interpreter/parser.c`) — consumes the token array and produces an AST. Each node carries a type tag, a keyword token, a flag for sub-variants (e.g. `DISTINCT`, `PRIMARY KEY`), and up to seven children.
 
-**Generator** (`src/SQL_interpreter/generator.c`) — walks the AST and emits a bytecode `chunk` against the schema. Detects primary-key equality in `WHERE` clauses and emits `OP_KEY_SEARCH` instead of a scan loop.
+**Generator** (`src/SQL_interpreter/generator.c`) — walks the AST and produces an equivalent bytecode `chunk`. Detects primary-key equality in `WHERE` clauses and emits `OP_KEY_SEARCH` instead of a scan loop.
 
-**VM** (`src/SQL_interpreter/vm.c`) — stack-based interpreter that executes the bytecode chunk. Maintains up to four concurrent scanners, each holding a cursor into a B+ tree (`src/storage_engine/scanner.h`). A session-scoped transaction registry, kept outside the per-statement VM state, lets `BEGIN TRANSACTION` hold a table open — dirty writes uncommitted — across multiple statements until `COMMIT` or `DISCARD`. The schema is loaded once per session and kept in memory; it's reloaded from disk after every `CREATE TABLE` or `DROP TABLE`, whether or not the statement succeeded. Table files stay open between statements too, in a cache of 16: a table is closed and loaded again only when it's dropped, when changes to it are discarded, or when the cache needs its slot.
+**VM** (`src/SQL_interpreter/vm.c`) — stack-based interpreter that runs through the bytecode chunk. Maintains up to four concurrent scanners, each holding a cursor into a B+ tree (`src/storage_engine/scanner.h`). A session-scoped transaction registry, kept outside the per-statement VM state, lets `BEGIN TRANSACTION` hold writes uncommitted across multiple statements until `COMMIT` or `DISCARD`. The database schema is loaded once per session and kept in memory; it's reloaded from disk after every `CREATE TABLE` or `DROP TABLE`, whether or not the statement succeeded.
 
 **B+ tree** (`src/storage_engine/bplus.c`) — the index that finds the page holding any primary key. Rows are kept in primary-key order: each leaf node files its pages under an upper bound for the keys in them and is searched by binary search, and the leaves link bidirectionally for sequential scans. A page that fills up is split and the new page is filed beside it; a page that empties is removed, and nodes split, borrow, and merge to stay at least half full.
 
@@ -77,6 +78,8 @@ A SQL query moves through five stages before touching the disk:
 **Ordering** (`src/storage_engine/ordering.c`) — converts a primary key into the ordering key that nodes and pages compare, keeping the key's own order: an integer has its sign bit flipped so that it sorts as an unsigned number, and text is compared byte by byte. A text key can be at most 24 bytes long. Every key in a table has the same type, so the type is stored once, in the table file's header, and not with each key, and the table's slots, page headers and nodes are sized for its keys: an integer key takes 8 bytes on disk and a text key 24.
 
 **Table I/O** (`src/storage_engine/tableIO.c`) — serialises pages and nodes to `.tbl` files in the `tables/` directory. Each page or node is read with one seek and one read of its fixed on-disk size, then decoded in memory. Writes are buffered in dirty hashmaps until a commit, which sends them through the write-ahead log before writing and syncing (`fsync`) the table files. A new table exists only in memory until its first commit creates its file. While a statement runs, the first change it makes to each page, node, or delete marker saves a copy of that object's prior pending version, so a statement that fails can be rolled back without disturbing earlier statements in the same transaction.
+
+**Node cache** (`src/storage_engine/cache.c`) — keeps the top two levels of each open table's B+ tree in memory: the root and the root's children, at most 46 nodes. Every walk down the tree starts with those two nodes, so they are read far more often than any others. The cache fills as nodes are read from the file, holds each node as it was last committed, is updated whenever a commit writes or deletes one of its nodes, and is emptied when the tree gets a different root. Uncommitted changes stay in the dirty hashmaps, which are checked first, so discarding a transaction or rolling back a statement needs nothing undone in the cache.
 
 **Write-ahead log** (`src/storage_engine/wal.c`) — a redo log in `tables/stripe.log` that makes commits atomic across crashes. At commit, every change is appended as a fixed-size entry with a CRC-32C checksum: the exact bytes of each dirty page, node, delete marker, and table header, plus whole-file operations — creating a new table's file, rewriting the schema file, or removing a dropped table's file. The log is synced, a checksummed commit marker is appended and synced (the commit point), the changes are made to the files, which are synced along with their directory, and the log is truncated. At startup, recovery replays a committed log — every entry is safe to repeat, so it doesn't need to know which changes finished before the crash — or discards an uncommitted one. Uncommitted changes never leave memory, so there is never anything on disk to undo. The log names files within `tables/` and knows nothing about what's in them.
 
@@ -299,12 +302,12 @@ A table `(id int PRIMARY KEY, v int)` is loaded with N rows where `v = id`, so b
 
 | Rows | PK lookup | Full scan | Speedup | Table file |
 |-----:|----------:|----------:|--------:|-----------:|
-| 1,000 | 8.0 µs | 82.2 µs | 10× | 0.1 MB |
-| 10,000 | 9.0 µs | 0.68 ms | 75× | 0.5 MB |
-| 100,000 | 9.2 µs | 6.55 ms | 711× | 4.8 MB |
+| 1,000 | 6.5 µs | 66.7 µs | 10× | 0.1 MB |
+| 10,000 | 6.7 µs | 0.65 ms | 96× | 0.5 MB |
+| 100,000 | 6.8 µs | 6.50 ms | 953× | 4.8 MB |
 
-- **Lookup latency grows slowly.** It rises about 15% across a 100× increase in rows, as the tree gets deeper, while scan time grows roughly linearly — the O(log n) vs. O(n) difference the index exists for. A lookup is read-only, so it never touches the log or syncs, and with the schema and the table already open it opens no files: at 10,000 rows, and still at 100,000, it is three reads, two nodes and the page (`make profile PROFILE=--io`).
-- **A lookup decodes the whole page its row is in.** About 100 of these rows fit in a page, and a page is read and decoded as a unit, so finding one row costs a decode of all of them: that is nearly half of a lookup's time (`make profile PROFILE=lookup`). Nothing is kept between statements, so the next lookup reads and decodes its nodes and page again.
+- **Lookup latency barely grows.** It rises about 5% across a 100× increase in rows, while scan time grows roughly linearly — the O(log n) vs. O(n) difference the index exists for. A lookup is read-only, so it never touches the log or syncs, and with the schema and the table already open it opens no files. The node cache holds the root of the tree and the root's children, which at these sizes is every node, so a lookup reads one thing from the file: the page (`make profile PROFILE=--io`). A deeper tree also reads the nodes below those two levels.
+- **A lookup decodes the whole page its row is in.** About 100 of these rows fit in a page, and a page is read and decoded as a unit, so finding one row costs a decode of all of them: reading and decoding the page is over half of a lookup's time, and freeing it afterwards another fifth (`make profile PROFILE=lookup`). Pages aren't kept between statements, so the next lookup reads and decodes its page again.
 - **A scan reads little more than the rows themselves.** The table file takes about 50 bytes per row (4.8 MB at 100,000 rows) and a scan reads about 40 bytes for each row it visits, because rows inserted in key order fill each page before the next one is started. Rows inserted in a scattered order split pages in the middle and leave them between half and completely full.
 
 ### Transaction batching
@@ -373,7 +376,7 @@ make coverage-full   # coverage report for both test suites (macOS only, under a
 
 | Suite | Source | Covers |
 |-------|--------|--------|
-| Storage engine | `src/storage_engine/testing.c` | Ordering keys and their order; slotted pages; table files, headers, and dirty hashmaps; slots, page headers and nodes sized by the type of the table's keys; creating, loading, and deleting tables; B+ tree search, pages splitting (at the end, in the middle, and three ways), rows resized in place, node splits, deletion, borrowing, and merging, with the whole tree's structure checked while rows are inserted in a scattered order and deleted in order, from the middle, and at random from a three-level tree; the process lock; the write-ahead log and crash recovery, including a forked process whose commit fails after the commit point |
+| Storage engine | `src/storage_engine/testing.c` | Ordering keys and their order; slotted pages; table files, headers, and dirty hashmaps; slots, page headers and nodes sized by the type of the table's keys; the node cache, by itself and checked against the file through commits, rollbacks and changes of root; creating, loading, and deleting tables; B+ tree search, pages splitting (at the end, in the middle, and three ways), rows resized in place, node splits, deletion, borrowing, and merging, with the whole tree's structure checked while rows are inserted in a scattered order and deleted in order, from the middle, and at random from a three-level tree; the process lock; the write-ahead log and crash recovery, including a forked process whose commit fails after the commit point |
 | SQL interpreter | `src/SQL_interpreter/testing.c` | Bytecode chunks, values, the lexer, the parser, the schema hashtable and file, the bytecode generator, the VM, and whole statements run through `interpret()`: result types, comparison operators and `LIKE`, comments, deletes with a `WHERE` clause, updates that resize rows and split pages under the scan, rows too large for a page, scans returning rows in primary-key order, keys of the wrong type, the cache of open tables, who owns the strings in results and expressions, statement rollback, and errors halting statements |
 | Crash recovery | `crashtest/` | The built binary end to end, killed just before every file write and `fsync` of a commit (see *Crash-recovery test* under Usage) |
 
@@ -383,9 +386,9 @@ Measured with clang's source-based coverage (`-fprofile-instr-generate -fcoverag
 
 | Tests | Lines | Functions | Branches |
 |-------|------:|----------:|---------:|
-| Unit tests (`make coverage`) | 82.7% | 92.1% | 73.6% |
-| Crash-recovery test alone | 55.5% | 74.7% | 44.6% |
-| Both (`make coverage-full`) | **81.7%** | **92.0%** | **72.5%** |
+| Unit tests (`make coverage`) | 83.0% | 92.3% | 74.1% |
+| Crash-recovery test alone | 55.8% | 74.9% | 44.8% |
+| Both (`make coverage-full`) | **82.0%** | **92.2%** | **73.0%** |
 
 The unit-test row covers every file except `main.c`, which the unit tests don't link; the other two rows include it. `debug.c`, the bytecode disassembler and execution tracer used only in debug builds, never runs. Without it, both suites together cover 86% of lines and 97% of functions.
 
@@ -400,11 +403,12 @@ The unit-test row covers every file except `main.c`, which the unit tests don't 
 | `SQL_interpreter/parser.c` | 80.1% | 97.7% | 77.4% |
 | `SQL_interpreter/schema.c` | 98.9% | 100.0% | 93.8% |
 | `SQL_interpreter/vm.c` | 82.9% | 100.0% | 72.6% |
-| `storage_engine/bplus.c` | 93.5% | 95.2% | 81.8% |
+| `storage_engine/bplus.c` | 93.5% | 95.3% | 81.8% |
+| `storage_engine/cache.c` | 100.0% | 100.0% | 97.5% |
 | `storage_engine/file.c` | 94.3% | 100.0% | 75.0% |
 | `storage_engine/ordering.c` | 70.6% | 100.0% | 85.3% |
 | `storage_engine/page.c` | 91.3% | 100.0% | 86.8% |
-| `storage_engine/tableIO.c` | 90.2% | 94.7% | 76.7% |
+| `storage_engine/tableIO.c` | 90.6% | 94.7% | 77.3% |
 | `storage_engine/wal.c` | 97.1% | 100.0% | 69.6% |
 | `main.c` | 50.9% | 85.7% | 43.1% |
 | `memory.c` | 75.0% | 100.0% | 75.0% |

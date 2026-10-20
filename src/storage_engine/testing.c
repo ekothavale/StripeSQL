@@ -45,6 +45,12 @@ static ordering_key okey_text(const char* str) {
     return k;
 }
 
+/* A small deterministic generator, so the random tests run the same way everywhere. */
+static uint32_t test_rand(uint32_t* state) {
+    *state = *state * 1664525u + 1013904223u;
+    return *state >> 8;
+}
+
 /* Build the full path "tables/<name>.tbl" into a heap-allocated string. */
 static char* build_tbl_path(const char* name) {
     size_t len = strlen(TABLE_DIRECTORY) + strlen(name) + strlen(TABLE_EXTENSION) + 1;
@@ -482,6 +488,218 @@ void test_page(void) {
     test_page_full_keys();
     test_page_key_bounds();
     printf("=== All slotted page tests passed ===\n");
+}
+
+// ##########################################################################################################################################
+// ##########################################################################################################################################
+// NODE CACHE TESTS
+
+/* A node to cache: a leaf with this parent, recognisable by its one child. */
+static node cache_test_node(address parent, address child) {
+    node n = {0};
+    n.isLeaf = true;
+    n.parent = parent;
+    n.childCount = 1;
+    n.children[0] = child;
+    n.keys[0] = n.maxKey = okey(child);
+    return n;
+}
+
+/* Whether the cache holds a node at addr whose one child is this. */
+static bool cache_has(node_cache* c, address addr, address child) {
+    node got = {0};
+    return nodeCacheGet(c, addr, &got) && got.childCount == 1 && got.children[0] == child;
+}
+
+/*
+A zeroed cache, which is what a table struct that was never given one has, holds nothing and takes
+nothing, and every call on it is safe. So is a cache that has been freed.
+*/
+void test_node_cache_zeroed_is_inert(void) {
+    printf("  test_node_cache_zeroed_is_inert ... ");
+    node_cache c = {0};
+    node n = cache_test_node(0, 7), out = cache_test_node(0, 99);
+    for (int pass = 0; pass < 2; pass++) {
+        assert(!nodeCacheOffer(&c, 100, &n, 100));
+        assert(!nodeCacheGet(&c, 100, &out) && out.children[0] == 99);  // out is left alone
+        assert(!nodeCacheUpdate(&c, 100, &n) && !nodeCacheRemove(&c, 100));
+        nodeCacheClear(&c);
+        assert(c.count == 0);
+        // the second time round, a cache that was set up, used and freed
+        nodeCacheInit(&c, 4);
+        assert(nodeCacheOffer(&c, 100, &n, 100));
+        nodeCacheFree(&c);
+        assert(c.slots == NULL && c.slotCount == 0 && c.count == 0);
+    }
+    nodeCacheFree(&c);  // twice is fine
+    printf("PASS\n");
+}
+
+/*
+The cache keeps the nodes at the top of a tree: the root, and the nodes whose parent is the root. A node
+further down is turned away, and so is everything when the table has no root yet.
+*/
+void test_node_cache_keeps_top_two_levels(void) {
+    printf("  test_node_cache_keeps_top_two_levels ... ");
+    node_cache c;
+    nodeCacheInit(&c, 1 + M_GLOBAL);
+    assert(c.maxNodes == 1 + M_GLOBAL && c.slotCount >= 2 * c.maxNodes && c.count == 0);
+    address root = 68;
+    node rootNode = cache_test_node(0, 1), child = cache_test_node(root, 2), other = cache_test_node(root, 3);
+    node grandchild = cache_test_node(826, 4);  // its parent is the child at 826, not the root
+
+    assert(nodeCacheOffer(&c, root, &rootNode, root));
+    assert(nodeCacheOffer(&c, 826, &child, root));
+    assert(nodeCacheOffer(&c, 1584, &other, root));
+    assert(!nodeCacheOffer(&c, 2342, &grandchild, root));
+    assert(c.count == 3);
+    assert(cache_has(&c, root, 1) && cache_has(&c, 826, 2) && cache_has(&c, 1584, 3));
+    node out = {0};
+    assert(!nodeCacheGet(&c, 2342, &out));
+
+    // offered again, a node's copy is replaced, not added
+    node changed = cache_test_node(root, 22);
+    assert(nodeCacheOffer(&c, 826, &changed, root) && c.count == 3 && cache_has(&c, 826, 22));
+
+    // no root: a node whose parent is 0 isn't "a child of the root"
+    node_cache none;
+    nodeCacheInit(&none, 4);
+    assert(!nodeCacheOffer(&none, root, &rootNode, 0) && !nodeCacheOffer(&none, 0, &rootNode, root) && none.count == 0);
+    nodeCacheFree(&none);
+    nodeCacheFree(&c);
+    printf("PASS\n");
+}
+
+/*
+What comes out of the cache is a copy, and so is what went in: changing either leaves the cached node as
+it was. Each lookup is counted as a hit or a miss.
+*/
+void test_node_cache_get_copies(void) {
+    printf("  test_node_cache_get_copies ... ");
+    node_cache c;
+    nodeCacheInit(&c, 4);
+    node n = cache_test_node(0, 5);
+    assert(nodeCacheOffer(&c, 68, &n, 68));
+    n.children[0] = 500;  // the caller's node
+    node out = {0};
+    assert(nodeCacheGet(&c, 68, &out) && out.children[0] == 5);
+    out.children[0] = 600;  // the caller's copy
+    out.childCount = 0;
+    assert(cache_has(&c, 68, 5));
+    assert(c.hits == 2 && c.misses == 0);
+    assert(!nodeCacheGet(&c, 826, &out) && c.hits == 2 && c.misses == 1);
+    nodeCacheFree(&c);
+    printf("PASS\n");
+}
+
+/*
+Updating replaces a cached node and leaves one that isn't cached out; removing drops one node; clearing
+drops them all, and the cache can be filled again afterwards.
+*/
+void test_node_cache_update_remove_clear(void) {
+    printf("  test_node_cache_update_remove_clear ... ");
+    node_cache c;
+    nodeCacheInit(&c, 8);
+    address root = 68;
+    node a = cache_test_node(0, 1), b = cache_test_node(root, 2), b2 = cache_test_node(root, 20);
+    assert(nodeCacheOffer(&c, root, &a, root) && nodeCacheOffer(&c, 826, &b, root));
+
+    assert(nodeCacheUpdate(&c, 826, &b2) && cache_has(&c, 826, 20) && c.count == 2);
+    assert(!nodeCacheUpdate(&c, 1584, &b2) && c.count == 2);  // not cached, so not added
+    node out = {0};
+    assert(!nodeCacheGet(&c, 1584, &out));
+
+    assert(nodeCacheRemove(&c, 826) && c.count == 1 && !nodeCacheGet(&c, 826, &out));
+    assert(!nodeCacheRemove(&c, 826) && c.count == 1);
+    assert(cache_has(&c, root, 1));
+
+    assert(nodeCacheOffer(&c, 826, &b, root));
+    nodeCacheClear(&c);
+    assert(c.count == 0 && !nodeCacheGet(&c, root, &out) && !nodeCacheGet(&c, 826, &out));
+    assert(nodeCacheOffer(&c, 826, &b, 826) && cache_has(&c, 826, 2));  // usable again, under another root
+    nodeCacheFree(&c);
+    printf("PASS\n");
+}
+
+/* The cache holds as many nodes as it was set up for and no more; a place freed by a removal can be taken. */
+void test_node_cache_full(void) {
+    printf("  test_node_cache_full ... ");
+    node_cache c;
+    nodeCacheInit(&c, 3);
+    address root = 68;
+    node n = cache_test_node(root, 1);
+    assert(nodeCacheOffer(&c, root, &n, root) && nodeCacheOffer(&c, 826, &n, root) && nodeCacheOffer(&c, 1584, &n, root));
+    assert(!nodeCacheOffer(&c, 2342, &n, root) && c.count == 3);
+    node out = {0};
+    assert(!nodeCacheGet(&c, 2342, &out));
+    node changed = cache_test_node(root, 9);
+    assert(nodeCacheOffer(&c, 826, &changed, root) && cache_has(&c, 826, 9));  // one it already holds is still replaced
+    assert(nodeCacheRemove(&c, 1584));
+    assert(nodeCacheOffer(&c, 2342, &n, root) && c.count == 3 && cache_has(&c, 2342, 1));
+    nodeCacheFree(&c);
+    printf("PASS\n");
+}
+
+/*
+Nodes whose addresses land on the same slots are all found, whatever order they went in and came out in:
+offers, updates and removals in a random order, checked against a plain list of what should be cached.
+Covers a full cache, where every removal has to close the gap it leaves for the nodes behind it.
+*/
+void test_node_cache_random_operations(void) {
+    printf("  test_node_cache_random_operations ... ");
+    enum { ADDRESSES = 120 };
+    for (uint32_t maxNodes = 1; maxNodes <= 46; maxNodes += 9) {
+        node_cache c;
+        nodeCacheInit(&c, maxNodes);
+        address root = 68;
+        address expected[ADDRESSES] = {0};  // expected[i]: the child of the node cached at address i, or 0
+        uint32_t held = 0, state = 4242 + maxNodes;
+        for (int round = 0; round < 20000; round++) {
+            uint32_t i = test_rand(&state) % ADDRESSES;
+            address addr = i == 0 ? root : root + (address)i * NODE_DISK_SIZE(NUM_KEY);  // as a table lays nodes out
+            address child = 1 + test_rand(&state) % 1000;
+            node n = cache_test_node(i == 0 ? 0 : root, child);
+            switch (test_rand(&state) % 4) {
+                case 0:
+                case 1: {
+                    bool room = expected[i] != 0 || held < maxNodes;
+                    assert(nodeCacheOffer(&c, addr, &n, root) == room);
+                    if (room) { held += expected[i] == 0; expected[i] = child; }
+                    break;
+                }
+                case 2:
+                    assert(nodeCacheUpdate(&c, addr, &n) == (expected[i] != 0));
+                    if (expected[i] != 0) expected[i] = child;
+                    break;
+                default:
+                    assert(nodeCacheRemove(&c, addr) == (expected[i] != 0));
+                    held -= expected[i] != 0;
+                    expected[i] = 0;
+            }
+            assert(c.count == held && held <= maxNodes);
+            if (round % 97 == 0 || round == 19999) {
+                for (uint32_t k = 0; k < ADDRESSES; k++) {
+                    address a = k == 0 ? root : root + (address)k * NODE_DISK_SIZE(NUM_KEY);
+                    node out = {0};
+                    assert(nodeCacheGet(&c, a, &out) == (expected[k] != 0));
+                    if (expected[k] != 0) assert(out.children[0] == expected[k]);
+                }
+            }
+        }
+        nodeCacheFree(&c);
+    }
+    printf("PASS\n");
+}
+
+void test_node_cache(void) {
+    printf("=== Node Cache Tests ===\n");
+    test_node_cache_zeroed_is_inert();
+    test_node_cache_keeps_top_two_levels();
+    test_node_cache_get_copies();
+    test_node_cache_update_remove_clear();
+    test_node_cache_full();
+    test_node_cache_random_operations();
+    printf("=== All node cache tests passed ===\n");
 }
 
 // ##########################################################################################################################################
@@ -2769,12 +2987,6 @@ static void check_tree(table* t, const bool* present, uint64_t maxKey) {
     for (uint64_t k = 1; k <= maxKey; k += 1 + maxKey / 97) assert(has_row(t, k) == present[k]);
 }
 
-/* A small deterministic generator, so the random tests run the same way everywhere. */
-static uint32_t test_rand(uint32_t* state) {
-    *state = *state * 1664525u + 1013904223u;
-    return *state >> 8;
-}
-
 static void shuffle(uint32_t* a, uint32_t count, uint32_t* state) {
     for (uint32_t i = count - 1; i > 0; i--) {
         uint32_t j = test_rand(state) % (i + 1);
@@ -3068,6 +3280,254 @@ void test_btree_store_page(void) {
     printf("PASS\n");
 }
 
+// ── Group 5b: the node cache ───────────────────────────────────────────────
+
+/* Whether two nodes are the same: the fields a node has on disk, and as many children and keys as it holds. */
+static bool same_node(const node* a, const node* b) {
+    if (a->isLeaf != b->isLeaf || a->childCount != b->childCount || a->parent != b->parent) return false;
+    if (a->prev != b->prev || a->next != b->next || compareOrderingKeys(a->maxKey, b->maxKey) != 0) return false;
+    uint32_t keys = a->isLeaf ? a->childCount : (a->childCount > 0 ? a->childCount - 1 : 0);
+    for (uint32_t i = 0; i < a->childCount; i++) if (a->children[i] != b->children[i]) return false;
+    for (uint32_t i = 0; i < keys; i++) if (compareOrderingKeys(a->keys[i], b->keys[i]) != 0) return false;
+    return true;
+}
+
+/*
+Asserts that a table's node cache agrees with the table's file. Every node it holds must still be in the file
+with the same contents, read here through a second handle whose own cache is empty, must be the root or one
+of the root's children, and must be what readNode() returns. Only for a table with nothing pending.
+@return how many nodes the cache holds
+*/
+static uint32_t check_node_cache(table* t) {
+    assert(t->nodeDirty.count == 0 && t->pageDirty.count == 0 && t->delete.count == 0);
+    table* cold = calloc(1, sizeof(table));
+    assert(loadTable(t->name, cold));
+    assert(cold->root == t->root);
+    node_cache* c = &t->nodeCache;
+    assert(c->count <= c->maxNodes);
+    uint32_t found = 0;
+    for (uint32_t i = 0; i < c->slotCount; i++) {
+        address addr = c->slots[i].addr;
+        if (addr == 0) continue;
+        found++;
+        node onDisk = {0}, viaCache = {0};
+        assert(readNode(addr, &onDisk, cold));
+        assert(same_node(c->slots[i].cached, &onDisk));
+        assert(addr == t->root || onDisk.parent == t->root);
+        assert(readNode(addr, &viaCache, t) && same_node(&viaCache, &onDisk));
+    }
+    assert(found == c->count);
+    close_table_keep_file(cold);
+    return found;
+}
+
+/* How many levels of nodes the tree has. */
+static uint32_t node_levels(table* t) {
+    node n = {0};
+    assert(readNode(t->root, &n, t));
+    uint32_t levels = 1;
+    while (!n.isLeaf) {
+        assert(readNode(n.children[0], &n, t));
+        levels++;
+    }
+    return levels;
+}
+
+/*
+A table loaded from its file starts with an empty cache, which fills as nodes are read: the first lookup
+reads the root and a leaf from the file, and the next lookup under that leaf reads neither. With the root
+and that leaf then damaged in the file, lookups under that leaf still succeed, where a second handle on
+the file can't read the tree at all, and neither can this one once its cache is emptied.
+*/
+void test_btree_node_cache_serves_reads(void) {
+    printf("  test_btree_node_cache_serves_reads ... ");
+    bool present[LARGE_ROWS + 1] = {0};
+    table* built = create_large_row_tree("bt_ncsr", present);
+    assert(node_levels(built) == 2);
+    assert(commit(built));
+    close_table_keep_file(built);
+
+    table* t = calloc(1, sizeof(table));
+    assert(loadTable("bt_ncsr", t));
+    node_cache* c = &t->nodeCache;
+    assert(c->maxNodes == 1 + M_GLOBAL && c->count == 0);
+    assert(has_row(t, 1));
+    assert(c->count == 2 && c->misses == 2 && c->hits > 0);  // the root and one leaf, each read from the file once
+    uint64_t hits = c->hits;
+    assert(has_row(t, 2));
+    assert(c->misses == 2 && c->hits > hits && c->count == 2);  // nothing more was read from the file
+
+    address leafAddr = 0;
+    assert(findPageAndLeaf(okey(1), t, &leafAddr) != 0 && leafAddr != 0 && leafAddr != t->root);
+    char* path = build_tbl_path("bt_ncsr");
+    FILE* f = fopen(path, "rb+");
+    free(path);
+    assert(f != NULL);
+    fseek(f, (long)t->root, SEEK_SET);
+    fputc(9, f);  // neither a page (0), a node (1) nor garbage (2)
+    fseek(f, (long)leafAddr, SEEK_SET);
+    fputc(9, f);
+    fclose(f);
+
+    assert(has_row(t, 1) && has_row(t, 2));  // served from memory
+    assert(has_row(t, LARGE_ROWS));          // the root from memory, another leaf from the file
+    assert(c->count == 3);
+    table* cold = calloc(1, sizeof(table));
+    assert(loadTable("bt_ncsr", cold));
+    node n = {0};
+    assert(!readNode(cold->root, &n, cold));
+    close_table_keep_file(cold);
+    nodeCacheClear(c);
+    assert(!readNode(t->root, &n, t));
+
+    deleteTree(t);
+    printf("PASS\n");
+}
+
+#define CACHE_ROWS 2400
+#define CACHE_BATCH 60
+
+/*
+The cache goes on matching the file through every kind of commit. A table grows from one leaf to a tree
+three levels deep and shrinks back to an empty one, committing every few dozen rows: nodes at the top of
+the tree are changed, split, merged and deleted, and the root is replaced on the way up and on the way
+down. After each commit the cache is checked against the file, lookups find exactly the rows that should
+be there, and from time to time the whole tree is checked.
+*/
+void test_btree_node_cache_follows_commits(void) {
+    printf("  test_btree_node_cache_follows_commits ... ");
+    bool* present = calloc(CACHE_ROWS + 1, sizeof(bool));
+    uint32_t* order = malloc(CACHE_ROWS * sizeof(uint32_t));
+    table* t = create_test_tree("bt_ncfc");
+    uint32_t state = 77, deepest = 1, mostCached = 0;
+    uint64_t hitsBefore = t->nodeCache.hits;
+    for (int pass = 0; pass < 2; pass++) {  // every row inserted, then every row deleted, in a scattered order
+        in_order(order, CACHE_ROWS, 1);
+        shuffle(order, CACHE_ROWS, &state);
+        for (uint32_t done = 0; done < CACHE_ROWS; done += CACHE_BATCH) {
+            for (uint32_t i = done; i < done + CACHE_BATCH; i++) {
+                if (pass == 0) assert(insert_row(t, order[i], LARGE_ROW) == 0);
+                else delete_row(t, order[i]);
+                present[order[i]] = pass == 0;
+            }
+            assert(commit(t));
+            for (uint32_t k = 1; k <= CACHE_ROWS; k += 37) assert(has_row(t, k) == present[k]);  // these fill the cache
+            uint32_t cached = check_node_cache(t);
+            assert(cached >= 1);  // the root at least
+            if (cached > mostCached) mostCached = cached;
+            uint32_t levels = node_levels(t);
+            if (levels > deepest) deepest = levels;
+            if ((done / CACHE_BATCH) % 8 == 0) check_tree(t, present, CACHE_ROWS);
+        }
+        check_tree(t, present, CACHE_ROWS);
+        if (pass == 0) assert(deepest == 3 && node_levels(t) == 3);
+    }
+    assert(node_levels(t) == 1 && mostCached > 2 && t->nodeCache.hits > hitsBefore);
+    deleteTree(t);
+    free(present);
+    free(order);
+    printf("PASS\n");
+}
+
+/*
+The cache holds what is committed, and pending changes are found before it. A node that a transaction has
+changed is read with the change while the cache keeps the committed one, and the committed one is what is
+read again once the change is discarded or its statement is rolled back, with nothing done to the cache.
+*/
+void test_btree_node_cache_pending_changes(void) {
+    printf("  test_btree_node_cache_pending_changes ... ");
+    table* t = create_test_tree("bt_ncpc");
+    for (uint64_t k = 1; k <= 10; k++) assert(insert_row(t, k, SMALL_ROW) == 0);
+    assert(commit(t));
+    node committed = {0}, cached = {0}, now = {0};
+    assert(readNode(t->root, &committed, t));  // from the file, and into the cache
+    assert(nodeCacheGet(&t->nodeCache, t->root, &cached) && same_node(&cached, &committed));
+    assert(compareOrderingKeys(committed.maxKey, okey(10)) == 0);
+
+    // a row past the end raises the root's largest key: pending, so in the dirty hashmap and not the cache
+    assert(insert_row(t, 500, SMALL_ROW) == 0);
+    assert(readNode(t->root, &now, t) && compareOrderingKeys(now.maxKey, okey(500)) == 0);
+    assert(nodeCacheGet(&t->nodeCache, t->root, &cached) && same_node(&cached, &committed));
+    discard(t);
+    assert(readNode(t->root, &now, t) && same_node(&now, &committed));
+    assert(!has_row(t, 500) && has_row(t, 10));
+
+    // the same for a statement that is rolled back inside a transaction, which keeps its earlier change
+    assert(insert_row(t, 600, SMALL_ROW) == 0);
+    beginStatement(t);
+    assert(insert_row(t, 700, SMALL_ROW) == 0);
+    assert(readNode(t->root, &now, t) && compareOrderingKeys(now.maxKey, okey(700)) == 0);
+    rollbackStatement(t);
+    assert(readNode(t->root, &now, t) && compareOrderingKeys(now.maxKey, okey(600)) == 0);
+    assert(nodeCacheGet(&t->nodeCache, t->root, &cached) && same_node(&cached, &committed));
+    assert(commit(t));
+    assert(has_row(t, 600) && !has_row(t, 700));
+    assert(check_node_cache(t) == 1);
+    assert(nodeCacheGet(&t->nodeCache, t->root, &cached) && compareOrderingKeys(cached.maxKey, okey(600)) == 0);
+
+    deleteTree(t);
+    printf("PASS\n");
+}
+
+/*
+When the tree gets a different root, every node is a level higher or lower than it was, so the cache is
+emptied and fills again from the new root. That holds when the change is committed, and when the statement
+that made it is rolled back and the old root returns: here a three-level tree loses most of its rows in one
+statement, which leaves it two levels deep with what were its internal nodes' children under the root, and
+gets them all back.
+*/
+void test_btree_node_cache_root_changes(void) {
+    printf("  test_btree_node_cache_root_changes ... ");
+    bool* present = calloc(DEEP_ROWS + 1, sizeof(bool));
+    uint32_t* order = malloc(DEEP_ROWS * sizeof(uint32_t));
+    table* t = create_test_tree("bt_ncrc");
+    in_order(order, DEEP_ROWS, 1);
+
+    // a root split, pending: the root that was cached is a level down now, so it is gone from the cache
+    for (uint32_t k = 1; k <= 20; k++) { assert(insert_row(t, k, LARGE_ROW) == 0); present[k] = true; }
+    assert(commit(t));
+    address firstRoot = t->root;
+    node n = {0};
+    assert(has_row(t, 1) && nodeCacheGet(&t->nodeCache, firstRoot, &n) && t->nodeCache.count == 1);
+    for (uint32_t k = 21; k <= DEEP_ROWS; k++) { assert(insert_row(t, k, LARGE_ROW) == 0); present[k] = true; }
+    assert(t->root != firstRoot && node_levels(t) == 3);
+    assert(t->nodeCache.count == 0);  // nothing committed is at the top of the pending tree
+    assert(commit(t));
+    for (uint32_t k = 1; k <= DEEP_ROWS; k += 11) assert(has_row(t, k));
+    assert(check_node_cache(t) > 2);
+    assert(nodeCacheGet(&t->nodeCache, t->root, &n) && !nodeCacheGet(&t->nodeCache, firstRoot, &n));
+
+    // one statement deletes nine rows in ten, and the tree is left two levels deep under another root
+    address deepRoot = t->root;
+    uint32_t state = 31;
+    shuffle(order, DEEP_ROWS, &state);
+    beginStatement(t);
+    for (uint32_t i = 0; i < DEEP_ROWS * 9 / 10; i++) delete_row(t, order[i]);
+    assert(t->root != deepRoot && node_levels(t) == 2);
+    for (uint32_t i = DEEP_ROWS * 9 / 10; i < DEEP_ROWS; i++) assert(has_row(t, order[i]));  // fills the cache from that root
+    // the statement fails: every row is back, under the old root, and the cache holds only what is at its top
+    rollbackStatement(t);
+    assert(t->root == deepRoot && node_levels(t) == 3);
+    check_node_cache(t);
+    for (uint32_t k = 1; k <= DEEP_ROWS; k += 11) assert(has_row(t, k));
+    assert(check_node_cache(t) > 2);
+    check_tree(t, present, DEEP_ROWS);
+
+    // and committed this time
+    for (uint32_t i = 0; i < DEEP_ROWS * 9 / 10; i++) { delete_row(t, order[i]); present[order[i]] = false; }
+    assert(commit(t));
+    assert(t->root != deepRoot && node_levels(t) == 2);
+    for (uint32_t k = 1; k <= DEEP_ROWS; k += 11) assert(has_row(t, k) == present[k]);
+    assert(check_node_cache(t) > 1);
+    assert(!nodeCacheGet(&t->nodeCache, deepRoot, &n));
+    check_tree(t, present, DEEP_ROWS);
+
+    deleteTree(t);
+    free(present);
+    free(order);
+    printf("PASS\n");
+}
+
 // ── Group 6: full persistence roundtrip ───────────────────────────────────
 
 /*
@@ -3156,6 +3616,11 @@ void test_btree(void) {
     test_btree_delete_random_deep();
     test_btree_emptied_tree_takes_rows();
     test_btree_store_page();
+    // the node cache
+    test_btree_node_cache_serves_reads();
+    test_btree_node_cache_follows_commits();
+    test_btree_node_cache_pending_changes();
+    test_btree_node_cache_root_changes();
     // full persistence roundtrip
     test_btree_full_roundtrip();
     // cleanup

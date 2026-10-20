@@ -31,6 +31,7 @@ int main(void) {
     // storage engine
     test_ordering();
     test_page();
+    test_node_cache();
     test_tableio();
     test_table_mgmt();
     test_btree();

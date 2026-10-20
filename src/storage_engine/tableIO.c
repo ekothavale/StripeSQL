@@ -430,6 +430,7 @@ frees allocated memory
 */
 void freeTable(table* t) {
 	freeDirtyHashmaps(t);
+	nodeCacheFree(&t->nodeCache);
 	free(t->name);
 	free(t);
 }
@@ -478,6 +479,7 @@ static table* initTable(char* tablename, ordering_type keyType) {
 	t->name          = strdup(tablename);
 
 	initDirtyHashmaps(t);
+	nodeCacheInit(&t->nodeCache, 1 + M_GLOBAL); // the root and as many children as it can have
 	return t;
 }
 
@@ -550,6 +552,7 @@ bool loadTable(char* tablename, table* t) {
 		return false;
 	}
 	initDirtyHashmaps(t);
+	nodeCacheInit(&t->nodeCache, 1 + M_GLOBAL); // the root and as many children as it can have
 	free(fname);
 	return true;
 }
@@ -692,6 +695,10 @@ bool readNode(address addr, node* n, table* t) {
 		return true;
 	}
 
+	// then the cache, which holds the nodes at the top of the tree as they were last committed. A node with
+	// a pending change was found above, so what the cache has is what the file has
+	if (n != NULL && nodeCacheGet(&t->nodeCache, addr, n)) return true;
+
 	// otherwise search disk
 	ubyte raw[t->nodeSize];
 	if (!consumeNodeRaw(raw, addr, t)) {
@@ -743,7 +750,8 @@ bool readNode(address addr, node* n, table* t) {
 		offset += keySize;
 	}
 
-	// cleanup and return
+	// the cache keeps the node if it's the root or one of the root's children, so the next read is from memory
+	nodeCacheOffer(&t->nodeCache, addr, n, t->root);
 	return true;
 }
 // write page
@@ -877,6 +885,8 @@ static void writeNode(node* n, address address, table* t) {
 	char* buffer = serializeNode(n, t);
 	fwrite(buffer, 1, t->nodeSize, t->source);
 	free(buffer);
+	// this is the only place a node's contents in the file change, so a cached copy is replaced here
+	nodeCacheUpdate(&t->nodeCache, address, n);
 }
 
 /*
@@ -1057,6 +1067,9 @@ void rollbackStatement(table* t) {
 	}
 	t->pageFree    = u->pageFree;
 	t->nodeFree    = u->nodeFree;
+	// a statement that gave the tree a different root left the cache filling from that root (see setRoot() in
+	// bplus.c). The old root is back, so the cache starts again from it
+	if (t->root != u->root) nodeCacheClear(&t->nodeCache);
 	t->root        = u->root;
 	t->pageStripes = u->pageStripes;
 	t->nodeStripes = u->nodeStripes;
@@ -1109,6 +1122,7 @@ void deleteObject(address address, table* t) {
 	char code = GARBAGE_MARKER;
 	jump(address, t);
 	fwrite(&code, 1, 1, t->source);
+	nodeCacheRemove(&t->nodeCache, address); // if it was a node at the top of the tree, it's gone from there too
 }
 
 static bool isDirty(table* t) {

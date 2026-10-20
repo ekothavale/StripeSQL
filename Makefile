@@ -5,7 +5,7 @@ CFLAGS = -I$(SRC) -I$(SQL) -I$(STOR) -O3
 
 OBJS = main.o debug.o \
        chunk.o generator.o lexer.o memory.o parser.o schema.o value.o vm.o \
-       bplus.o file.o ordering.o page.o tableIO.o wal.o stor_testing.o sql_testing.o
+       bplus.o cache.o file.o ordering.o page.o tableIO.o wal.o stor_testing.o sql_testing.o
 
 ASAN = -fsanitize=address
 
@@ -114,6 +114,9 @@ vm.o: $(SQL)/vm.c $(SQL)/vm.h $(SQL)/parser.h $(SQL)/chunk.h \
 bplus.o: $(STOR)/bplus.c $(STOR)/bplus.h
 	clang $(CFLAGS) -c $(STOR)/bplus.c -o bplus.o
 
+cache.o: $(STOR)/cache.c $(STOR)/cache.h $(STOR)/node.h $(SRC)/common.h
+	clang $(CFLAGS) -c $(STOR)/cache.c -o cache.o
+
 file.o: $(STOR)/file.c $(STOR)/file.h $(SRC)/common.h $(SRC)/const.h
 	clang $(CFLAGS) -c $(STOR)/file.c -o file.o
 
@@ -123,7 +126,7 @@ ordering.o: $(STOR)/ordering.c $(STOR)/ordering.h $(SRC)/value.h
 page.o: $(STOR)/page.c $(STOR)/page.h $(SRC)/common.h
 	clang $(CFLAGS) -c $(STOR)/page.c -o page.o
 
-tableIO.o: $(STOR)/tableIO.c $(STOR)/tableIO.h $(STOR)/file.h $(STOR)/wal.h
+tableIO.o: $(STOR)/tableIO.c $(STOR)/tableIO.h $(STOR)/cache.h $(STOR)/file.h $(STOR)/wal.h
 	clang $(CFLAGS) -c $(STOR)/tableIO.c -o tableIO.o
 
 wal.o: $(STOR)/wal.c $(STOR)/wal.h $(STOR)/file.h $(SRC)/common.h $(SRC)/const.h

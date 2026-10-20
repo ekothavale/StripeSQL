@@ -31,6 +31,15 @@ void test_ordering_text_keys(void);
 void test_ordering_float_keys(void);
 void test_ordering(void);   /* runs all of the above */
 
+/* Node cache tests */
+void test_node_cache_zeroed_is_inert(void);
+void test_node_cache_keeps_top_two_levels(void);
+void test_node_cache_get_copies(void);
+void test_node_cache_update_remove_clear(void);
+void test_node_cache_full(void);
+void test_node_cache_random_operations(void);
+void test_node_cache(void);   /* runs all of the above */
+
 /* B+ tree integration tests */
 void test_btree();
 void test_btree_find_empty(void);
@@ -53,6 +62,10 @@ void test_btree_smallest_key(void);
 void test_btree_key_of_another_type(void);
 void test_btree_new_tree_before_commit(void);
 void test_btree_rows_per_page_follow_key_size(void);
+void test_btree_node_cache_serves_reads(void);
+void test_btree_node_cache_follows_commits(void);
+void test_btree_node_cache_pending_changes(void);
+void test_btree_node_cache_root_changes(void);
 void test_btree_small_rows_in_random_order(void);
 void test_btree_node_split(void);
 void test_btree_delete_from_the_end(void);

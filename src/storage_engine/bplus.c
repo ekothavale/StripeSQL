@@ -57,6 +57,16 @@ static void propagateMaxKeyUp(address nodeAddr, ordering_key newMaxKey, table* t
 // TREE CREATION FUNCTIONS
 
 /*
+makes the node at addr the tree's root
+the table's node cache holds the top two levels of the tree, the root and its children, and a different root
+puts every node a level higher or lower than it was, so the cache is emptied and fills again from this root
+*/
+static void setRoot(table* t, address addr) {
+	t->root = addr;
+	nodeCacheClear(&t->nodeCache);
+}
+
+/*
 creates a new root node
 */
 static node* newRoot(node* child, address childAddr, table* t) {
@@ -72,7 +82,7 @@ static node* newRoot(node* child, address childAddr, table* t) {
 	child->parent = rootAdd;
 	markNode(childAddr, child, t);
 	markNode(rootAdd, new, t);
-	t->root = rootAdd;
+	setRoot(t, rootAdd);
 	return new;
 }
 
@@ -123,7 +133,7 @@ table* newTree(char* tablename, ordering_type keyType) {
 	root->isLeaf = true;
 	root->maxKey = firstKey;
 
-	t->root = rootAddr;
+	setRoot(t, rootAddr);
 
 	// the dirty hashmaps keep their own copies
 	markNode(rootAddr, root, t);
@@ -773,7 +783,7 @@ static address balanceTreeDelete(node* n, address addr, table* t) {
 		node* r = malloc(sizeof(node));
 		address rAddr = n->children[0];
 		readNode(rAddr, r, t);
-		t->root = n->children[0];
+		setRoot(t, n->children[0]);
 		r->parent = 0;
 		markNode(n->children[0], r, t);
 		free(r);

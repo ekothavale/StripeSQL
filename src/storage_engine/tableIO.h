@@ -23,6 +23,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 #include "common.h"
 #include "page.h"
 #include "node.h"
+#include "cache.h"
 
 /*
 identifies a table file and the layout of what's in it. Change it whenever the on-disk layout of the
@@ -75,6 +76,7 @@ typedef struct table {
 	addr_table pageDirty; // address -> slotted_page* of dirty pages
 	addr_table nodeDirty; // address -> node* of dirty nodes
 	addr_table delete; // address -> NULL; presence marks an object for deletion
+	node_cache nodeCache; // the root and its children as last committed, kept in memory (see cache.h)
 	statement_undo undo; // lets a failed statement's changes be rolled back
 	FILE* source; // physical file (NULL until a new table's first commit creates it)
 	bool isNew; // file doesn't exist yet: it's created when the table is first committed
