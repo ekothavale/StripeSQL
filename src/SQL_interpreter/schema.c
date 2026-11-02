@@ -78,17 +78,19 @@ uint32_t hashString(const char* key, int length) {
 
 /*
 finds an entry in the given table
-resolves collisions via quadratic probing
+resolves collisions by probing with a step that grows by one each time (triangular numbers). The
+capacity is always a power of two, and with one this reaches every slot, so it always finds the entry
+or an empty slot. Probing by the square of the step reaches only a few slots (3 of 8, 4 of 16, 7 of
+32), and never returned once those were all taken by other tables
 */
 static schema* findEntry(uint32_t hash, schema* entries, int capacity) {
-	int velocity = 0;
-	for (;;) {
-		uint32_t index = (hash + velocity * velocity) % capacity;
+	uint32_t index = hash % capacity;
+	for (uint32_t step = 1;; step++) {
 		schema* found = &entries[index];
 		if (found->hash == hash || found->hash == 0) {
 			return found;
 		}
-		velocity++;
+		index = (index + step) % capacity;
 	}
 }
 

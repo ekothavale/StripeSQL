@@ -25,16 +25,18 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 #include "schema.h"
 #include "vm.h"
 
-VM vm;
+static VM vm;
+static resource_cache cache = {0};
 
 /*
 Session-scoped transaction state. Deliberately kept outside the VM struct:
 initVM()/freeVM() run once per statement (every interpret() call), but a
 transaction spans multiple statements/interpret() calls, so its state must
-survive across them. Tables touched during an active transaction stay open
+survive across them. Tables touched during an active transaction are held
 here (dirty writes accumulating in their dirty hashmaps, see tableIO.c)
-instead of being committed and closed at the end of each statement; COMMIT
-or DISCARD is what finally closes them out.
+instead of being committed at the end of each statement; COMMIT or DISCARD
+is what finally settles them. The tables themselves belong to the table
+cache below, which keeps them open between statements either way.
 */
 #define MAX_TXN_TABLES MAX_SCANNERS
 
@@ -62,10 +64,13 @@ static table* findTxnTable(uint32_t tableHash) {
 }
 
 static void statementError(const char* format, ...);
+static bool tableInUse(table* t);
+static void evictTableCache(uint32_t tableNameHash);
+static void scratchFree(scanner* s);
 
 /*
-registers a freshly opened table handle with the active transaction so later
-statements in the same transaction reuse it instead of reloading from disk
+registers a table with the active transaction, so its changes stay uncommitted
+until COMMIT or DISCARD and later statements in the transaction find it here
 */
 static bool registerTxnTable(uint32_t tableHash, table* t) {
 	if (transaction.count >= MAX_TXN_TABLES) {
@@ -126,19 +131,38 @@ void initVM(hashtable* schema) {
 void freeVM() {
 	for (int i = 0; i < MAX_SCANNERS; i++) {
 		if (vm.scanners[i].open) {
-			commit(vm.scanners[i].tbl);
-			fclose(vm.scanners[i].tbl->source);
-			freeTable(vm.scanners[i].tbl);
+			table* t = vm.scanners[i].tbl;
+			bool committed = commit(t);
+			scratchFree(&vm.scanners[i]);
 			vm.scanners[i].tbl = NULL;
 			vm.scanners[i].open = false;
+			if (!committed && !tableInUse(t)) evictTableCache(vm.scanners[i].tblHash); // see closeScanner()
 		}
 	}
+	// the result buffer owns its rows and every string in them (see OP_EMIT_ROW)
 	if (vm.results.rows) {
-		for (int i = 0; i < vm.results.count; i++) free(vm.results.rows[i]);
+		for (int i = 0; i < vm.results.count; i++) {
+			for (int j = 0; j < vm.results.cols; j++) {
+				if (vm.results.rows[i][j].type == VAL_TEXT) free(vm.results.rows[i][j].as.text);
+			}
+			free(vm.results.rows[i]);
+		}
 		free(vm.results.rows);
-		vm.results.rows  = NULL;
-		vm.results.count = 0;
+		vm.results.rows     = NULL;
+		vm.results.count    = 0;
+		vm.results.capacity = 0;
+		vm.results.cols     = 0;
 	}
+}
+
+/*
+reset the schema cache
+*/
+static void invalidateSchema() {
+	if (!cache.schemaCache) return;
+	freeHashTable(cache.schemaCache);
+	free(cache.schemaCache);
+	cache.schemaCache = NULL;
 }
 
 static bool tableAlreadyExists(const char* tablename) {
@@ -167,9 +191,8 @@ static ordering_type sqlTypeToOrdering(SQL_type t) {
 }
 
 /*
-finds the ordering type of a table's primary key column, so the placeholder
-page created at CREATE TABLE time can be tagged with the correct type instead
-of defaulting to ORDERING_ULONG (see createTree() below)
+finds the ordering type of a table's primary key column, which the table
+created at CREATE TABLE time is given as the type of its keys (see newTree())
 */
 static ordering_type getPkOrderingType(schema* s) {
 	for (int i = 0; i < s->count; i++) {
@@ -179,6 +202,14 @@ static ordering_type getPkOrderingType(schema* s) {
 	}
 	statementError("Error: table '%s' has no primary key column\n", s->tablename);
 	return ORDERING_ULONG;
+}
+
+/*
+whether a value is one pkToOk() can convert into an ordering key: text longer than TEXT_KEY_MAX_LEN bytes isn't
+(a value of the wrong type for its table's key does convert, and the B+ tree then refuses the key)
+*/
+static bool fitsInKey(value pk) {
+	return pk.type != VAL_TEXT || strlen(pk.as.text) <= TEXT_KEY_MAX_LEN;
 }
 
 // could potentially be abstracted into a general print value type
@@ -193,6 +224,40 @@ static void printPK(value pk) {
 		case VAL_U32: printf("%u", pk.as.u32); break;
 		default: printf("%llx", pk.as.integer); break;
 	}
+}
+
+/*
+allocates a string that lasts for as long as the scanner stays on its current row
+OP_COLUMN reads a column's text into one of these. No instruction that pops the value has to free it: the
+scanner frees them all when it moves to another row or closes (scratchReset()). Anything that keeps a
+string for longer than that, such as a result row, takes a copy of its own
+*/
+static char* scratchAlloc(scanner* s, size_t size) {
+	if (s->scratchCount == s->scratchCap) {
+		s->scratchCap = s->scratchCap < 8 ? 8 : s->scratchCap * 2;
+		s->scratch = realloc(s->scratch, s->scratchCap * sizeof(char*));
+	}
+	char* str = malloc(size);
+	s->scratch[s->scratchCount++] = str;
+	return str;
+}
+
+/*
+frees every string handed out for the scanner's current row, as the scanner leaves it
+*/
+static void scratchReset(scanner* s) {
+	for (int i = 0; i < s->scratchCount; i++) free(s->scratch[i]);
+	s->scratchCount = 0;
+}
+
+/*
+frees the scanner's strings and the list that tracks them, as the scanner closes
+*/
+static void scratchFree(scanner* s) {
+	scratchReset(s);
+	free(s->scratch);
+	s->scratch    = NULL;
+	s->scratchCap = 0;
 }
 
 static bool loadFirstValidPage(scanner* s) {
@@ -215,6 +280,110 @@ static bool loadFirstValidPage(scanner* s) {
 	}
 }
 
+// ##########################################################################################################################################
+// ##########################################################################################################################################
+// TABLE CACHE
+
+/*
+Tables stay open from one statement to the next. The cache owns every open table: a statement's
+scanners and the active transaction only borrow them. A table in the cache that nothing is using
+has no pending changes and matches its file, so it can be handed to the next statement as it is.
+A table that can't promise that (its changes were discarded, or its file is being removed) is
+closed instead, and the next statement to use it loads it again.
+*/
+
+/*
+closes a table's file and frees the table
+*/
+static void closeTable(table* t) {
+	if (t->source) fclose(t->source);
+	freeTable(t);
+}
+
+/*
+returns whether an open scanner or the active transaction is using a table
+*/
+static bool tableInUse(table* t) {
+	for (int i = 0; i < MAX_SCANNERS; i++) {
+		if (vm.scanners[i].open && vm.scanners[i].tbl == t) return true;
+	}
+	if (!transaction.active) return false;
+	for (int i = 0; i < transaction.count; i++) {
+		if (transaction.tables[i].tbl == t) return true;
+	}
+	return false;
+}
+
+/*
+returns the open table with this name hash, or NULL if the cache doesn't hold it
+*/
+static table* searchTableCache(uint32_t tableNameHash) {
+	for (int i = 0; i < TABLE_CACHE_SIZE; i++) {
+		table_cache_entry* e = &cache.resourceCache[i];
+		if (e->tbl && e->tableNameHash == tableNameHash) return e->tbl;
+	}
+	return NULL;
+}
+
+/*
+puts a newly loaded table into the cache, which owns it from then on
+when the cache is full, tables are closed in turn (FIFO) to make room, skipping any that are in use
+@return false if every table in the cache is in use
+*/
+static bool insertTableCache(uint32_t tableNameHash, table* t) {
+	table_cache_entry* slot = NULL;
+	for (int i = 0; i < TABLE_CACHE_SIZE && !slot; i++) {
+		if (!cache.resourceCache[i].tbl) slot = &cache.resourceCache[i];
+	}
+	for (int i = 0; i < TABLE_CACHE_SIZE && !slot; i++) {
+		table_cache_entry* e = &cache.resourceCache[cache.tableCachePtr];
+		cache.tableCachePtr = (cache.tableCachePtr + 1) % TABLE_CACHE_SIZE;
+		if (tableInUse(e->tbl)) continue;
+		closeTable(e->tbl);
+		slot = e;
+	}
+	if (!slot) return false;
+	slot->tableNameHash = tableNameHash;
+	slot->tbl = t;
+	return true;
+}
+
+/*
+closes a table and takes it out of the cache, if it's there, so that its next use loads it from its file
+for a table that can't be reused: discarding changes leaves the table's header fields as the changes set
+them, and a table that is dropped or created has a different file from the one that's open
+the caller makes sure nothing is using the table
+*/
+static void evictTableCache(uint32_t tableNameHash) {
+	for (int i = 0; i < TABLE_CACHE_SIZE; i++) {
+		table_cache_entry* e = &cache.resourceCache[i];
+		if (!e->tbl || e->tableNameHash != tableNameHash) continue;
+		closeTable(e->tbl);
+		e->tbl = NULL;
+		e->tableNameHash = 0;
+	}
+}
+
+/*
+closes every open table, for the end of a session
+a transaction that was never committed loses its changes, as it does when the process exits
+*/
+void closeTableCache(void) {
+	if (transaction.active) {
+		for (int i = 0; i < transaction.count; i++) discard(transaction.tables[i].tbl);
+	}
+	transaction.active = false;
+	transaction.count = 0;
+	for (int i = 0; i < TABLE_CACHE_SIZE; i++) {
+		table_cache_entry* e = &cache.resourceCache[i];
+		if (!e->tbl) continue;
+		closeTable(e->tbl);
+		e->tbl = NULL;
+		e->tableNameHash = 0;
+	}
+	cache.tableCachePtr = 0;
+}
+
 /*
 opens a new scanner
 */
@@ -226,17 +395,23 @@ void openScanner(uint32_t tableNameHash, uint8_t pkIdx) {
 	}
 	table* t = findTxnTable(tableNameHash);
 	if (!t) {
-		t = malloc(sizeof(table));
-		if (!loadTable((char*)tablename, t)) { // loadTable() reports why
-			free(t);
-			vm.failed = true;
-			return;
+		// only the first statement to use a table loads it; after that it's already open in the cache
+		t = searchTableCache(tableNameHash);
+		if (!t) {
+			t = malloc(sizeof(table));
+			if (!loadTable((char*)tablename, t)) { // loadTable() reports why
+				free(t);
+				vm.failed = true;
+				return;
+			}
+			if (!insertTableCache(tableNameHash, t)) {
+				closeTable(t);
+				statementError("Error: too many tables are in use at once\n");
+				return;
+			}
 		}
-		if (transaction.active && !registerTxnTable(tableNameHash, t)) {
-			fclose(t->source);
-			freeTable(t);
-			return;
-		}
+		// a transaction holds each table it touches uncommitted until COMMIT or DISCARD
+		if (transaction.active && !registerTxnTable(tableNameHash, t)) return;
 	}
 	beginStatement(t); // so the table can be rolled back if this statement fails
 	int idx = vm.numScanners++;
@@ -252,6 +427,9 @@ void openScanner(uint32_t tableNameHash, uint8_t pkIdx) {
 	vm.scanners[idx].pageAddr = 0;
 	vm.scanners[idx].slotIdx  = 0;
 	vm.scanners[idx].pkIdx    = pkIdx;
+	vm.scanners[idx].scratch      = NULL;
+	vm.scanners[idx].scratchCount = 0;
+	vm.scanners[idx].scratchCap   = 0;
 }
 
 /*
@@ -261,14 +439,13 @@ returns false if that commit failed to reach disk
 bool closeScanner(scanner* s) {
 	if (!s->open) return true;
 	bool committed = true;
-	endStatement(s->tbl); // the statement is done with this table, so its changes are kept
-	// tables owned by an active transaction stay open until COMMIT/DISCARD
-	if (!findTxnTable(s->tblHash)) {
-		committed = commit(s->tbl);
-		fclose(s->tbl->source);
-		freeTable(s->tbl);
-	}
+	table* t = s->tbl;
+	uint32_t tblHash = s->tblHash;
+	endStatement(t); // the statement is done with this table, so its changes are kept
+	// a table in an active transaction stays uncommitted until COMMIT/DISCARD
+	if (!findTxnTable(tblHash)) committed = commit(t);
 	freeSPage(&s->page);
+	scratchFree(s);
 	s->page = (slotted_page){0};
 	s->leafNode = (node){0};
 	s->tbl     = NULL;
@@ -277,6 +454,9 @@ bool closeScanner(scanner* s) {
 	s->started = false;
 	s->atEnd   = false;
 	vm.numScanners--;
+	// the table stays open in the cache for the next statement, unless its commit failed: that
+	// discarded its changes, so it has to be loaded again
+	if (!committed && !tableInUse(t)) evictTableCache(tblHash);
 	return committed;
 }
 
@@ -286,6 +466,7 @@ On the first call (started == false), walks from root to the first row.
 Returns true if a valid row is now current, false if the table is exhausted.
 */
 bool advanceScanner(scanner* s) {
+	scratchReset(s); // the scanner is leaving its row, and the row's strings go with it
 	if (s->atEnd) return false;
 	table* t = s->tbl;
 
@@ -324,11 +505,36 @@ bool advanceScanner(scanner* s) {
 searches for and loads a record into the given scanner by primary key lookup
 */
 bool scannerKeySearch(scanner* s, ordering_key key) {
-	address addr = findPage(key.pageNum, s->tbl);
+	scratchReset(s); // the scanner is leaving its row, and the row's strings go with it
+	address addr = findPage(key, s->tbl);
 	if (!addr) return false;
 	s->pageAddr = addr;
 	readPage(addr, &s->page, s->tbl);
-	int slotIdx = SPSearch(&s->page, key.offset);
+	int slotIdx = SPSearch(&s->page, key);
+	if (slotIdx < 0) return false;
+	s->slotIdx = slotIdx;
+	return true;
+}
+
+/*
+puts a scanner back on the row with this key, wherever in the tree that row now is: its leaf, its page
+within the leaf, and its slot within the page
+for after a change that can move rows between pages while the scanner is on one of them
+unlike scannerKeySearch(), this keeps the strings read from the row (the row is the same one) and leaves
+the scanner able to carry on scanning from it
+*/
+static bool seekScanner(scanner* s, ordering_key key) {
+	table* t = s->tbl;
+	address leafAddr = 0;
+	address addr = findPageAndLeaf(key, t, &leafAddr);
+	if (!addr || !readNode(leafAddr, &s->leafNode, t)) return false;
+	s->leafAddr = leafAddr;
+	for (s->childIdx = 0; s->childIdx < s->leafNode.childCount; s->childIdx++) {
+		if (s->leafNode.children[s->childIdx] == addr) break;
+	}
+	s->pageAddr = addr;
+	if (!readPage(addr, &s->page, t)) return false;
+	int slotIdx = SPSearch(&s->page, key);
 	if (slotIdx < 0) return false;
 	s->slotIdx = slotIdx;
 	return true;
@@ -565,20 +771,29 @@ static interpret_result run() {
 				push(BOOL_VAL(!equal(pop(), pop())));
 				break;
 			}
+			// the right operand is on top of the stack, so it's popped first
 			case OP_LESS: {
-				push(BOOL_VAL(lessThan(pop(), pop())));
+				value b = pop();
+				value a = pop();
+				push(BOOL_VAL(lessThan(a, b)));
 				break;
 			}
 			case OP_LESS_EQUAL: {
-				push(BOOL_VAL(!greaterThan(pop(), pop())));
+				value b = pop();
+				value a = pop();
+				push(BOOL_VAL(!greaterThan(a, b)));
 				break;
 			}
 			case OP_GREATER: {
-				push(BOOL_VAL(greaterThan(pop(), pop())));
+				value b = pop();
+				value a = pop();
+				push(BOOL_VAL(greaterThan(a, b)));
 				break;
 			}
 			case OP_GREATER_EQUAL: {
-				push(BOOL_VAL(!lessThan(pop(), pop())));
+				value b = pop();
+				value a = pop();
+				push(BOOL_VAL(!lessThan(a, b)));
 				break;
 			}
 			case OP_LIKE: {
@@ -645,10 +860,10 @@ static interpret_result run() {
 			// search for a record by primary key. if found, load it into scanner. if not found, jump to target
 			case OP_KEY_SEARCH: {
 				value pk = pop();
-				ordering_key ik = pkToOk(pk);
 				uint16_t offset = READ_TWO_BYTES();
 				scanner* s = &vm.scanners[vm.numScanners-1];
-				if (!scannerKeySearch(s, ik)) {
+				// text too long to be a key is no row's key
+				if (!fitsInKey(pk) || !scannerKeySearch(s, pkToOk(pk))) {
 					vm.ip += (int16_t)offset;
 				}
 				break;
@@ -678,7 +893,8 @@ static interpret_result run() {
 					case T_STRING:
 					case T_DATE:
 					case T_TIME: {
-						char* str = malloc(e.size + 1);
+						// the copy belongs to the scanner, which frees it when it leaves this row
+						char* str = scratchAlloc(s, e.size + 1);
 						memcpy(str, e.data, e.size);
 						str[e.size] = '\0';
 						v.type = VAL_TEXT;
@@ -694,6 +910,12 @@ static interpret_result run() {
 				// pop in reverse so row[0] is the leftmost column
 				value* row = malloc(count * sizeof(value));
 				for (int i = count - 1; i >= 0; i--) row[i] = pop();
+				// the result buffer outlives the statement, so it owns every string in its rows. A string
+				// on the stack belongs to a scanner's current row or, for a literal, to the chunk, and
+				// neither lasts that long, so the row takes a copy
+				for (int i = 0; i < count; i++) {
+					if (row[i].type == VAL_TEXT) row[i].as.text = strdup(row[i].as.text);
+				}
 				#ifdef DEBUG_TRACE_EXECUTION
 				for (int i = 0; i < count; i++) {
 					if (i > 0) printf(" | ");
@@ -710,7 +932,7 @@ static interpret_result run() {
 					vm.results.capacity *= 2;
 					vm.results.rows = realloc(vm.results.rows, vm.results.capacity * sizeof(value*));
 				}
-				// transfer ownership of the row array (including any VAL_TEXT pointers) to vm.results
+				// transfer ownership of the row array and its strings to vm.results; freeVM() releases them
 				vm.results.rows[vm.results.count++] = row;
 				break;
 			}
@@ -730,18 +952,34 @@ static interpret_result run() {
 					totalSize += entries[i].size;
 					if (i == s->pkIdx) pk = v; // pkIdx is stored ahead of time in scanner since it's a loop invariant
 				}
+				if (!fitsInKey(pk)) {
+					statementError("Error: a text primary key can be at most %d bytes long\n", TEXT_KEY_MAX_LEN);
+					for (int i = 0; i < count; i++) free(entries[i].data);
+					free(entries);
+					break;
+				}
 				ordering_key ik = pkToOk(pk);
 				sp_record r = { .entries = entries, .len = count, .size = totalSize };
-				if (searchRecord(ik, t)) {
+				int result = insertRecord(&r, ik, t);
+				if (result == 1) {
 					printf("Error: a row with primary key ");
 					printPK(pk);
 					printf(" already exists\n");
 					vm.failed = true;
-				} else if (!insertRecord(&r, ik, t)) {
+				} else if (result == 2) {
 					printf("Error: failed to insert the row with primary key ");
 					printPK(pk);
-					printf(" (page full)\n");
+					printf("\n");
 					vm.failed = true;
+				} else if (result == 3) {
+					printf("Error: the row with primary key ");
+					printPK(pk);
+					printf(" is too large to fit in a page\n");
+					vm.failed = true;
+				}
+				// when insertRecord fails, the data is never freed
+				if (result != 0) {
+					for (int i = 0; i < count; i++) free(entries[i].data);
 				}
 				free(entries);  // page owns the data pointers; release only the metadata array
 				break;
@@ -750,30 +988,54 @@ static interpret_result run() {
 				uint8_t col_idx = READ_BYTE();
 				scanner* s = &vm.scanners[vm.numScanners-1];
 				table* t = s->tbl;
-				sp_slot slot = s->page.slots[s->slotIdx];
-				entry* target = &s->page.entries[slot.ptr + col_idx];
+				sp_slot* slot = &s->page.slots[s->slotIdx];
+				entry* target = &s->page.entries[slot->ptr + col_idx];
+				entry replacement = valueToEntry(pop());
+				// the row's size, and its page's count of data in use, follow the entry's
+				slot->size += replacement.size - target->size;
+				s->page.header.usedData += replacement.size - target->size;
 				free(target->data);
-				*target = valueToEntry(pop());
-				markPage(s->pageAddr, &s->page, t);
+				*target = replacement;
+				// a row that grew may no longer fit beside the others in its page, and then the page is
+				// split. The row can end up in either half, so the scanner finds it again by key
+				ordering_key key = slot->ID;
+				bool split;
+				if (!storePage(&s->page, s->pageAddr, t, &split)) {
+					statementError("Error: the updated row is too large to fit in a page\n");
+					break;
+				}
+				if (split && !seekScanner(s, key)) {
+					statementError("Error: failed to update a row\n");
+				}
 				break;
 			}
 			case OP_DELETE_ROW: {
 				scanner* s = &vm.scanners[vm.numScanners-1];
 				table* t = s->tbl;
-				ordering_key ik = { .pageNum = s->page.header.pageNum, .offset = s->page.slots[s->slotIdx].ID };
+				ordering_key ik = s->page.slots[s->slotIdx].ID;
 				freeSPage(&s->page);
 				s->page = (slotted_page){0};
-				if (!deleteRecord(ik, t, &s->page)) {
+				address leafAddr = 0;
+				// the scanner is on this row, so its page must be in the tree
+				if (!deleteRecord(ik, t, &s->page, &leafAddr) || !leafAddr) {
 					statementError("Error: failed to delete a row\n");
 					break;
 				}
 				if (s->page.header.numRecords == 0) {
-					s->childIdx = (s->childIdx > 0) ? s->childIdx - 1 : (uint32_t)(-1);
-					// deleteRecord()'s rebalancing (borrow/merge) can modify nodes
-					// elsewhere in the tree, including our own current leaf out from
-					// under us. Re-sync from our own address rather than assume our
-					// cached leafNode is still accurate.
-					readNode(s->leafAddr, &s->leafNode, t);
+					// the row was the last in its page, which is removed from the tree unless it's the
+					// tree's only page. deleteRecord()'s rebalancing
+					// (borrow/merge) can shift the pages within the scanner's leaf, or merge
+					// that leaf into another, so neither the scanner's leaf address nor its
+					// index can be trusted. Find the position again by key: in the leaf the
+					// page was removed from, just before the first page past the deleted one.
+					s->leafAddr = leafAddr;
+					if (!readNode(s->leafAddr, &s->leafNode, t)) {
+						statementError("Error: scanner could not read node at address %llu; tree may be corrupt\n", s->leafAddr);
+						break;
+					}
+					uint32_t next = 0;
+					while (next < s->leafNode.childCount && compareOrderingKeys(s->leafNode.keys[next], ik) <= 0) next++;
+					s->childIdx = next - 1; // advanceScanner() steps forward from here (-1 wraps to 0)
 				} else {
 					s->slotIdx = (s->slotIdx > 0) ? s->slotIdx - 1 : (uint32_t)(-1);
 				}
@@ -797,11 +1059,15 @@ static interpret_result run() {
 					statementError("Error: table %s already exists\n", s->tablename);
 					break;
 				}
-				page_num firstKey = { .type = getPkOrderingType(s) };
-				if (vm.failed) break;
+				// a table still open under this name belongs to a file that is gone
+				evictTableCache(hash);
+				ordering_type keyType = getPkOrderingType(s); // kept in the table: every key in it has this type
+				if (vm.failed) {
+					break;
+				}
 				// the new table's file and its schema entry are committed together, so a crash can't
 				// leave one without the other
-				table* t = newTree(s->tablename, firstKey);
+				table* t = newTree(s->tablename, keyType);
 				size_t len;
 				char* bytes = serializeSchema(vm.schema, &len);
 				bool committed = false;
@@ -831,6 +1097,8 @@ static interpret_result run() {
 					statementError("Error: table '%s' not found\n", name);
 					break;
 				}
+				// the table's file is about to be removed, so it can't stay open in the cache
+				evictTableCache(hash);
 				// the schema entry and the table's file are removed together
 				deleteHT(hash, vm.schema);
 				size_t len;
@@ -868,9 +1136,10 @@ static interpret_result run() {
 				table* tables[MAX_TXN_TABLES];
 				for (int i = 0; i < transaction.count; i++) tables[i] = transaction.tables[i].tbl;
 				bool committed = commitTables(tables, transaction.count, NULL, 0);
-				for (int i = 0; i < transaction.count; i++) {
-					fclose(tables[i]->source);
-					freeTable(tables[i]);
+				// the tables stay open in the cache, unless the commit failed: that discarded their
+				// changes, so they have to be loaded again
+				if (!committed) {
+					for (int i = 0; i < transaction.count; i++) evictTableCache(transaction.tables[i].tableHash);
 				}
 				transaction.active = false;
 				transaction.count = 0;
@@ -882,11 +1151,11 @@ static interpret_result run() {
 					statementError("Error: no transaction in progress to discard\n");
 					break;
 				}
+				// discarding leaves each table's header fields as the transaction set them, so the
+				// tables are closed and loaded again the next time they're used
 				for (int i = 0; i < transaction.count; i++) {
-					table* t = transaction.tables[i].tbl;
-					discard(t);
-					fclose(t->source);
-					freeTable(t);
+					discard(transaction.tables[i].tbl);
+					evictTableCache(transaction.tables[i].tableHash);
 				}
 				transaction.active = false;
 				transaction.count = 0;
@@ -912,32 +1181,40 @@ it had before the statement, so a transaction carries on as if the statement nev
 transaction also drops them (none of the statement was committed) and is closed
 */
 static void abortStatement(void) {
+	uint32_t closing[MAX_SCANNERS];
+	int closingCount = 0;
 	for (int i = vm.numScanners - 1; i >= 0; i--) {
 		scanner* s = &vm.scanners[i];
 		if (!s->open) continue;
 		rollbackStatement(s->tbl);
 		if (!findTxnTable(s->tblHash)) {
 			discard(s->tbl);
-			fclose(s->tbl->source);
-			freeTable(s->tbl);
+			closing[closingCount++] = s->tblHash;
 		}
 		freeSPage(&s->page);
+		scratchFree(s);
 		s->page = (slotted_page){0};
 		s->tbl  = NULL;
 		s->open = false;
 	}
 	vm.numScanners = 0;
+	// closed only once every scanner has let go, since two scanners can share a table
+	for (int i = 0; i < closingCount; i++) evictTableCache(closing[i]);
 }
 
 result_buffer interpret(const char* source) {
+	// load up database schema and initialize bytecode chunk
 	chunk c;
-	hashtable* schema = loadSchema();
-	if (!schema) {
+	if (!cache.schemaCache) {
+		cache.schemaCache = loadSchema();
+	}
+	if (!cache.schemaCache) {
 		vm.results.ir = INTERPRET_LOAD_ERROR;
 		return vm.results;
 	}
-	initVM(schema);
+	initVM(cache.schemaCache);
 	initChunk(&c);
+	// lex the query
 	tokenized t = lexQuery(source);
 	if (t.count == 1) { // return if there is no meaningful input TOKEN_EOF is automatic
 		vm.results.ir = INTERPRET_OK;
@@ -946,27 +1223,33 @@ result_buffer interpret(const char* source) {
 		vm.results.ir = INTERPRET_COMPILE_ERROR;
 		return vm.results;
 	}
+	// parse the query into an AST
 	ast_node* root = compile(t);
 	freeTokenized(&t);
 	if (!root) {
 		vm.results.ir = INTERPRET_COMPILE_ERROR;
 		return vm.results;
 	}
-	if (!generate(root, &c, schema)) {
+	// determine whether the query is DDL so we can update the schema
+	ast_node* stmt = root->children[0];
+	bool ddl = stmt->type == TYPE_CREATE_STMT || stmt->type == TYPE_DROP_STMT;
+	// generate bytecode from the AST
+	if (!generate(root, &c, vm.schema)) {
 		freeAST(root);
+		if (ddl) invalidateSchema();
 		vm.results.ir = INTERPRET_COMPILE_ERROR;
 		return vm.results;
 	}
 	freeAST(root);
 
+	// run bytecode 
 	vm.chunk = &c;
 	vm.ip = vm.chunk->code;
 
 	vm.results.ir = run();
 	if (vm.results.ir == INTERPRET_RUNTIME_ERROR) abortStatement();
+	if (ddl) invalidateSchema();
 
-	freeHashTable(schema);
-	free(schema);
 	freeChunk(&c);
 	return vm.results;
 }

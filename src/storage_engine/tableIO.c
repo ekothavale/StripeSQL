@@ -21,9 +21,9 @@ API for reading and writing with database tables
 
 Layout of a table file:
 
- FACE3419 | Metadata Length | Num page rows | Num node rows | Page rows per node row |
+ MAGIC | Metadata Length | Num page rows | Num node rows | Page rows per node row |
  Pages per row | Nodes per row | Page size | Node size | Pointer to free space | Root pointer |
- M |
+ M | Key type |
 
 Addressing:
 
@@ -67,186 +67,105 @@ static bool jump(address address, table* t) {
 	}
 }
 
-/*
-jumps to an offset relative to the cursor's current position in the table's source
-*/
-static bool jumpRel(long offset, table* t) {
-	if (fseek(t->source, offset, SEEK_CUR) == 0) {
-		t->cursor += offset;
-		return true;
-	} else {
-		printf("Error: failed to make relative jump to address: %llu when reading a binary file\n", t->cursor);
-		return false;
-	}
-}
 
+// a page's header and its largest possible contents have to fit in a page on disk (see page.c -> hasSpace())
+// checked for the largest keys there are: a table of smaller keys has a smaller page header and smaller nodes
+_Static_assert(PAGE_HEADER_DISK_SIZE(ORDERING_KEY_MAX_DISK_SIZE) + SP_SLOT_DISK_SIZE(ORDERING_KEY_MAX_DISK_SIZE) < PAGE_SIZE, "a page has no room for records");
+// the write-ahead log carries each node in an entry with room for one page
+_Static_assert(NODE_DISK_SIZE(ORDERING_KEY_MAX_DISK_SIZE) <= PAGE_SIZE, "a node doesn't fit in a log entry");
 
 /*
-Serializes a page_num into exactly PAGE_NUM_DISK_SIZE bytes at buf.
-Layout: [type(1B)][data(18B)] where data is big-endian u64 zero-padded, or raw string bytes.
+the number of bytes each of a table's keys takes on disk, which depends on the type of the table's keys
+the table's slots, page headers and nodes are all sized by it (see the layouts in tableIO.h)
 */
-static void writePageNumBytewise(char* buf, page_num k) {
-	buf[0] = (char)k.type;
-	if (k.type == ORDERING_STRING) {
-		memset(buf + 1, 0, PAGE_NUM_DISK_SIZE - 1);
-		memcpy(buf + 1, k.as.string, TEXT_PAGE_NUM_LEN);
-	} else {
-		writeULongBytewise(buf + 1, k.as.u64);
-		memset(buf + 9, 0, PAGE_NUM_DISK_SIZE - 9);
-	}
+uint32_t keyDiskSize(table* t) {
+	return orderingKeyDiskSize(t->keyType);
 }
 
 /*
-Serializes a page_offset into exactly PAGE_OFFSET_DISK_SIZE bytes at buf.
-Layout: [type(1B)][data(8B)] where data is big-endian u64, or raw string bytes zero-padded.
+the number of bytes of records one of a table's pages holds: what is left of the page after its header
+a page is full when its records' slots and data take up this much (see SPUsedBytes() in page.c)
 */
-static void writePageOffsetBytewise(char* buf, page_offset k) {
-	buf[0] = (char)k.type;
-	if (k.type == ORDERING_STRING) {
-		memset(buf + 1, 0, PAGE_OFFSET_DISK_SIZE - 1);
-		memcpy(buf + 1, k.as.string, OFFSET_BITS);
+uint32_t pageCapacity(table* t) {
+	return t->pageSize - PAGE_HEADER_DISK_SIZE(keyDiskSize(t));
+}
+
+/*
+Serializes an ordering key into exactly orderingKeyDiskSize(type) bytes at buf: a big-endian u64, or the
+string's bytes with zeros after them. The bytes written depend only on the key's value, never on what
+else is in the struct
+@param type - the type of the table's keys (table.keyType). It decides how the key is written, and how
+              many bytes it takes, and isn't written itself: the table's header holds it once for every
+              key in the file. A zeroed key, which stands in where there is no key yet, comes out as
+              zeros whatever the type
+*/
+static void writeOrderingKeyBytewise(char* buf, ordering_key k, ordering_type type) {
+	if (type == ORDERING_STRING) {
+		memset(buf, 0, TEXT_KEY_MAX_LEN);
+		memcpy(buf, k.as.string, strnlen(k.as.string, TEXT_KEY_MAX_LEN));
 	} else {
-		writeULongBytewise(buf + 1, k.as.u64);
+		writeULongBytewise(buf, k.as.u64);
 	}
 }
 
 /*
-Reads a page_num from (cursor + offset), restores cursor.
+reads an unsigned integer from a byte stream in memory
 */
-static page_num readPageNum(long offset, table* t) {
-	unsigned char buf[PAGE_NUM_DISK_SIZE];
-	jumpRel(offset, t);
-	fread(buf, 1, PAGE_NUM_DISK_SIZE, t->source);
-	jumpRel(-(long)offset - PAGE_NUM_DISK_SIZE, t);
-	page_num out;
-	out.type = (ordering_type)buf[0];
-	if (out.type == ORDERING_STRING) {
-		memset(out.as.string, 0, sizeof(out.as.string));
-		memcpy(out.as.string, buf + 1, TEXT_PAGE_NUM_LEN);
-	} else {
-		out.as.u64 = ((uint64_t)buf[1] << 56) | ((uint64_t)buf[2] << 48) |
-		             ((uint64_t)buf[3] << 40) | ((uint64_t)buf[4] << 32) |
-		             ((uint64_t)buf[5] << 24) | ((uint64_t)buf[6] << 16) |
-		             ((uint64_t)buf[7] <<  8) | (uint64_t)buf[8];
-	}
+static uint32_t readUInt(ubyte* bytes) {
+	uint32_t out = (uint32_t) bytes[0] << 24 | (uint32_t) bytes[1] << 16 | (uint32_t) bytes[2] << 8 | (uint32_t) bytes[3];
 	return out;
 }
 
 /*
-Reads a page_offset from (cursor + offset), restores cursor.
+reads an unsigned long from a byte stream in memory
 */
-static page_offset readPageOffset(long offset, table* t) {
-	unsigned char buf[PAGE_OFFSET_DISK_SIZE];
-	jumpRel(offset, t);
-	fread(buf, 1, PAGE_OFFSET_DISK_SIZE, t->source);
-	jumpRel(-(long)offset - PAGE_OFFSET_DISK_SIZE, t);
-	page_offset out;
-	out.type = (ordering_type)buf[0];
-	if (out.type == ORDERING_STRING) {
-		memset(out.as.string, 0, sizeof(out.as.string));
-		memcpy(out.as.string, buf + 1, OFFSET_BITS);
-	} else {
-		out.as.u64 = ((uint64_t)buf[1] << 56) | ((uint64_t)buf[2] << 48) |
-		             ((uint64_t)buf[3] << 40) | ((uint64_t)buf[4] << 32) |
-		             ((uint64_t)buf[5] << 24) | ((uint64_t)buf[6] << 16) |
-		             ((uint64_t)buf[7] <<  8) | (uint64_t)buf[8];
-	}
-	return out;
-}
-
-/*
-reads one byte at the table's cursor + an offset
-returns the cursor to the original position
-*/
-static char readByte(long offset, table* t) {
-	char a;
-	jumpRel(offset, t);
-	fread(&a, 1, 1, t->source);
-	jumpRel(-offset - 1, t);
-	return a;
-}
-
-/*
-reads an unsigned integer at the table's cursor + an offset
-returns the cursor to the original position
-*/
-static uint32_t readUInt(long offset, table* t) {
-	unsigned char a[4];
-	jumpRel(offset, t);
-	fread(a, 4, 1, t->source);
-	jumpRel(-offset - 4, t);
-	uint32_t out = (uint32_t) a[0] << 24 | (uint32_t) a[1] << 16 | (uint32_t) a[2] << 8 | (uint32_t) a[3];
-	return out;
-}
-
-/*
-reads an unsigned long at the table's cursor + an offset
-returns the cursor to the original position
-*/
-static uint64_t readULong(long offset, table* t) {
-	unsigned char a[8];
-	jumpRel(offset, t);
-	fread(a, 8, 1, t->source);
-	jumpRel(-offset - 8, t);
+static uint64_t readULong(ubyte* a) {
 	uint64_t out = (uint64_t) a[0] << 56 | (uint64_t) a[1] << 48 | (uint64_t) a[2] << 40 | (uint64_t) a[3] << 32
 					| (uint64_t) a[4] << 24 | (uint64_t) a[5] << 16 | (uint64_t) a[6] << 8 | (uint64_t) a[7];
 	return out;
 }
 
 /*
-reads an arbitrary number of bytes from the source file into the buffer
-returns the cursor to the original position
+Reads an ordering key from the orderingKeyDiskSize(type) bytes at buf (see writeOrderingKeyBytewise())
+Does not check the bytes for correctness
+@param type - the type of the table's keys (table.keyType), which the key is given
 */
-static void readArbitrary(char* buffer, uint32_t len, long offset, table* t) {
-	jumpRel(offset, t);
-	fread(buffer, 1, len, t->source);
-	jumpRel(-offset-len, t);
+static ordering_key readOrderingKey(ubyte* buf, ordering_type type) {
+	ordering_key out = {0};
+	out.type = type;
+	if (type == ORDERING_STRING) {
+		memcpy(out.as.string, buf, TEXT_KEY_MAX_LEN); // the array has one more byte, left 0, as the terminator
+	} else {
+		out.as.u64 = readULong(buf);
+	}
+	return out;
 }
 
 /*
-reads one byte at the table's cursor + an offset
-does not return the cursor to the original position
+reads a page from disk into a PAGE_SIZE memory blob @param buffer
 */
-static char consumeByte(long offset, table* t) {
-	char a;
-	jumpRel(offset, t);
-	fread(&a, 1, 1, t->source);
-	return a;
+static bool consumePageRaw(ubyte* buffer, address addr, table* t) {
+	if (!jump(addr, t)) return false;
+	size_t back = fread(buffer, 1, t->pageSize, t->source);
+	if (back < t->pageSize) return false;
+	t->cursor += t->pageSize;
+	return true;
 }
 
-/*
-reads an unsigned integer at the table's cursor + an offset
-does not return the cursor to the original position
-*/
-static uint32_t consumeUInt(long offset, table* t) {
-	uint32_t a;
-	jumpRel(offset, t);
-	fread(&a, 4, 1, t->source);
-	return a;
+static bool consumeNodeRaw(ubyte* buffer, address addr, table* t) {
+	if (!jump(addr, t)) return false;
+	size_t back = fread(buffer, 1, t->nodeSize, t->source);
+	if (back < t->nodeSize) return false;
+	t->cursor += t->nodeSize;
+	return true;
 }
 
-/*
-reads an unsigned long at the table's cursor + an offset
-does not return the cursor to the original position
-*/
-static uint64_t consumeULong(long offset, table* t) {
-	uint64_t a;
-	jumpRel(offset, t);
-	fread(&a, 8, 1, t->source);
-	return a;
-}
 
-/*
-reads an arbitrary number of bytes from the source file into the buffer
-does not return the cursor to the original position
-*/
-static void consumeArbitrary(char* buffer, uint32_t len, long offset, table* t) {
-	jumpRel(offset, t);
-	fread(buffer, 1, len, t->source);
-}
 
 /*
 deep copies the contents of the source page into the target page
+the target gets newly allocated arrays, so a target that already holds a page must be released with
+freeSPage() first, or that page's arrays and data are leaked
 */
 static void copyPage(slotted_page* source, slotted_page* target) {
 	target->header = source->header;
@@ -310,8 +229,16 @@ static bool loadMeta(FILE* file, char* fname, table* table) {
 	table->pageNodeRatio = buf[4];
 	table->pageStripeLen = buf[5];
 	table->nodeStripeLen = buf[6];
+	// the key type comes first: how large a page header, a slot and a node are depends on it
+	if (buf[16] != ORDERING_ULONG && buf[16] != ORDERING_STRING && buf[16] != ORDERING_DOUBLE) return false;
+	table->keyType = (ordering_type) buf[16];
+	uint32_t keySize = keyDiskSize(table);
 	table->pageSize = buf[7];
+	if (table->pageSize < PAGE_HEADER_DISK_SIZE(keySize) + SP_SLOT_DISK_SIZE(keySize) || table->pageSize > 1024 * 64) return false;
 	table->nodeSize = buf[8];
+	// room for a full node of the table's keys. A node size that is too small for the key type the header
+	// gives means one of the two is damaged, and nothing in the file could be read at the right size
+	if (table->nodeSize < NODE_DISK_SIZE(keySize) || table->nodeSize > 1024 * 64) return false;
 	table->pageFree = ((uint64_t) (uint32_t) buf[9] << 32) | (uint32_t) buf[10];
 	table->nodeFree = ((uint64_t) (uint32_t) buf[11] << 32) | (uint32_t) buf[12];
 	table->root    = ((uint64_t) (uint32_t) buf[13] << 32) | (uint32_t) buf[14];
@@ -339,7 +266,8 @@ static void fillMeta(table* t, uint32_t* buf) {
 		(uint32_t) (t->nodeFree & 0xFFFFFFFF),
 		(uint32_t) (t->root >> 32),
 		(uint32_t) (t->root & 0xFFFFFFFF),
-		t->M
+		t->M,
+		t->keyType
 	};
 	memcpy(buf, meta, sizeof(meta));
 }
@@ -502,6 +430,7 @@ frees allocated memory
 */
 void freeTable(table* t) {
 	freeDirtyHashmaps(t);
+	nodeCacheFree(&t->nodeCache);
 	free(t->name);
 	free(t);
 }
@@ -523,9 +452,10 @@ static char* tablePath(const char* tablename) {
 
 /*
 initializes the struct for a new, empty table without touching the disk
+@param keyType - the type of the table's keys, which decides how large its nodes are
 mallocs new memory (table)
 */
-static table* initTable(char* tablename) {
+static table* initTable(char* tablename, ordering_type keyType) {
 	table* t = malloc(sizeof(table));
 	t->source        = NULL;
 	t->isNew         = false;
@@ -533,11 +463,12 @@ static table* initTable(char* tablename) {
 	t->metalen       = METALEN * 4;
 	t->pageStripes   = 1;
 	t->nodeStripes   = 1;
-	t->pageStripeLen = 8;
-	t->nodeStripeLen = 8;
-	t->pageNodeRatio = 1;
+	t->pageStripeLen = 1;
+	t->nodeStripeLen = 1;
+	t->pageNodeRatio = M_GLOBAL / 2; // somewhat arbitrary
 	t->pageSize      = PAGE_SIZE;
-	t->nodeSize      = 49 + M_GLOBAL * (8 + PAGE_NUM_DISK_SIZE); // 49B fixed header + M children (8B) + M keys (PAGE_NUM_DISK_SIZE)
+	t->keyType       = keyType;
+	t->nodeSize      = NODE_DISK_SIZE(keyDiskSize(t));
 	t->M             = M_GLOBAL;
 	// layout is [node stripe][pageNodeRatio page stripes][node stripe][pageNodeRatio page stripes]...
 	// stripe 1 starts immediately after the header, page stripe 1 right after that
@@ -548,6 +479,7 @@ static table* initTable(char* tablename) {
 	t->name          = strdup(tablename);
 
 	initDirtyHashmaps(t);
+	nodeCacheInit(&t->nodeCache, 1 + M_GLOBAL); // the root and as many children as it can have
 	return t;
 }
 
@@ -555,7 +487,7 @@ static table* initTable(char* tablename) {
 creates a table's file immediately and writes its header, bypassing the write-ahead log
 for low-level use and testing; the database creates tables with newTable() and a commit instead
 */
-table* createTable(char* tablename) {
+table* createTable(char* tablename, ordering_type keyType) {
 	char* path = tablePath(tablename);
 	mkdir(TABLE_DIRECTORY, 0755); // no-op if directory already exists
 	FILE* f = fopen(path, "wb+");
@@ -564,7 +496,7 @@ table* createTable(char* tablename) {
 		printf("Error: failed to create table file for '%s'\n", tablename);
 		return NULL;
 	}
-	table* t = initTable(tablename);
+	table* t = initTable(tablename, keyType);
 	t->source = f;
 	writeMeta(f, t);
 	return t;
@@ -576,8 +508,8 @@ commitTables()), after the commit point, so a crash beforehand leaves nothing be
 until then, only objects in the dirty hashmaps can be read
 mallocs new memory (table)
 */
-table* newTable(char* tablename) {
-	table* t = initTable(tablename);
+table* newTable(char* tablename, ordering_type keyType) {
+	table* t = initTable(tablename, keyType);
 	t->isNew = true;
 	return t;
 }
@@ -614,8 +546,13 @@ bool loadTable(char* tablename, table* t) {
 	t->isNew  = false;
 	t->cursor = 0;
 	t->name   = strdup(tablename);
-	loadMeta(tfile, fname, t);
+	if (!loadMeta(tfile, fname, t)) {
+		printf("Error: tried to load a table from %s but it contained corrupted metadata\n", fname);
+		free(fname);
+		return false;
+	}
 	initDirtyHashmaps(t);
+	nodeCacheInit(&t->nodeCache, 1 + M_GLOBAL); // the root and as many children as it can have
 	free(fname);
 	return true;
 }
@@ -650,21 +587,26 @@ bool deleteTable(table* t) {
 
 /*
 reads a page from an address into a chunk of memory
-@param: p - a slotted page to load the data from disk into
+@param: p - a slotted page to load the data from disk into. It must either be zeroed or hold a page from
+            an earlier readPage(), which this one replaces
 mallocs page entries, page slots, and page entry data
 */
 bool readPage(address addr, slotted_page* p, table* t) {
 	// checking dirty table
 	slotted_page* dirty = (slotted_page*)findAddrTable(addr, &t->pageDirty);
 	if (dirty) {
+		freeSPage(p); // a scanner reads one page after another into the same struct
 		copyPage(dirty, p);
 		return true;
 	}
 
 	// otherwise read from disk
-	address prev = t->cursor;
-	jump(addr, t);
-	if (readByte(0, t) != 0) {
+	ubyte raw[t->pageSize];
+	// read page from disk with a single seek and read
+	if (!consumePageRaw(raw, addr, t)) {
+		return false;
+	}
+	if (raw[0] != 0) {
 		printf("Error: attempted to read page at address %llu but page was invalid\n", addr);
 		return false;
 	}
@@ -673,56 +615,77 @@ bool readPage(address addr, slotted_page* p, table* t) {
 		return false;
 	}
 	// header
-	// page header layout: 0(1B) | pageNum(19B) | usedData(4B) | numRecords(4B) |
-	//                     numEntries(4B) | arrCap(4B) | maxEntries(4B) | maxSlots(4B)  = 44B
-	p->header.pageNum    = readPageNum(1, t);
-	p->header.usedData   = readUInt(20, t);
-	p->header.numRecords = readUInt(24, t);
-	p->header.numEntries = readUInt(28, t);
-	p->header.arrCap     = readUInt(32, t);
-	p->header.maxEntries = readUInt(36, t);
-	p->header.maxSlots   = readUInt(40, t);
-	// slots (each slot on disk: ID(9B) | len(4B) | size(4B) | ptr(4B) = 21B)
-	if (!p->slots) {
-		p->slots = calloc(p->header.maxSlots, sizeof(sp_slot));
+	// page header layout: 0(1B) | minKey | maxKey | usedData(4B) | numRecords(4B) |
+	//                     numEntries(4B) | arrCap(4B) | maxEntries(4B) | maxSlots(4B)  = PAGE_HEADER_DISK_SIZE
+	// each key takes keySize bytes, which depends on the type of the table's keys
+	// it's decoded and checked before p is touched, so a page that can't be read leaves p as it was
+	uint32_t keySize = keyDiskSize(t);
+	uint32_t slotSize = SP_SLOT_DISK_SIZE(keySize);
+	header h;
+	ubyte* fields = raw + 1 + 2 * keySize; // the fixed-size fields that follow the two keys
+	h.keySize    = keySize; // not in the page on disk: it's the same for every page of the table
+	h.minKey     = readOrderingKey(raw+1, t->keyType);
+	h.maxKey     = readOrderingKey(raw+1 + keySize, t->keyType);
+	h.usedData   = readUInt(fields);
+	h.numRecords = readUInt(fields+4);
+	h.numEntries = readUInt(fields+8);
+	h.arrCap     = readUInt(fields+12);
+	h.maxEntries = readUInt(fields+16);
+	h.maxSlots   = readUInt(fields+20);
+	// the two capacities size the arrays allocated below, so a damaged one mustn't be trusted with any size
+	if (h.numRecords > h.maxSlots || h.numEntries > h.maxEntries ||
+	    h.maxSlots > 1024 * 64 || h.maxEntries > 1024 * 64 ||
+	    h.numRecords > (t->pageSize - PAGE_HEADER_DISK_SIZE(keySize)) / slotSize) {
+		printf("Error: tried to read a page into a chunk of memory but it had corrupted metadata\n");
+		return false;
 	}
-	int offset = 44;
+	// p may still hold the last page read into it. Pages differ in how many slots and entries they have room
+	// for, so its arrays can't be reused: it's released and given arrays of this page's own size
+	freeSPage(p);
+	p->header  = h;
+	p->slots   = calloc(h.maxSlots, sizeof(sp_slot));
+	p->entries = calloc(h.maxEntries, sizeof(entry));
+	// slots (each slot on disk: ID(keySize) | len(4B) | size(4B) | ptr(4B) = SP_SLOT_DISK_SIZE)
+	int offset = PAGE_HEADER_DISK_SIZE(keySize);
 	for (int i = 0; i < p->header.numRecords; i++) {
-		p->slots[i].ID   = readPageOffset(offset,    t);
-		p->slots[i].len  = readUInt(offset + 9,  t);
-		p->slots[i].size = readUInt(offset + 13, t);
-		p->slots[i].ptr  = readUInt(offset + 17, t);
-		offset += SP_SLOT_DISK_SIZE;
+		p->slots[i].ID   = readOrderingKey(raw+offset, t->keyType);
+		p->slots[i].len  = readUInt(raw+offset + keySize);
+		p->slots[i].size = readUInt(raw+offset + keySize + 4);
+		p->slots[i].ptr  = readUInt(raw+offset + keySize + 8);
+		offset += slotSize;
 	}
 	// records
-	int entryOffset = 0;
-	jump(addr + t->pageSize, t); // navigating to 1 byte after the end of the page
-	if(!p->entries) {
-		p->entries = calloc(p->header.maxEntries, sizeof(entry));
-	}
+	int entryCursor = t->pageSize;
+	uint32_t slotEnd = PAGE_HEADER_DISK_SIZE(keySize) + slotSize * p->header.numRecords;
 	for (int i = 0; i < p->header.numEntries; i++) {
 		// entry: <--  data | size (4B) | type (2B)  <--
-		char code = readByte(-1, t);
-		jumpRel(-2, t);
+		if (entryCursor - 6 < slotEnd) {
+			printf("Error: tried to read a page into a chunk of memory but it had corrupted metadata\n");
+			return false;
+		}
+		char code = raw[entryCursor-1];
+		entryCursor -= 2;
 		for (int j = 0; j < NUM_DATATYPES; j++) {
 			if (DATATYPE_CODES[j] == code) p->entries[i].type = j;
 		}
 
-		uint32_t size = readUInt(-4, t);
-		jumpRel(-4, t);
+		entryCursor -= 4;
+		uint32_t size = readUInt(raw + entryCursor);
 		p->entries[i].size = size;
-		if (p->entries[i].data) free(p->entries[i].data);
+		if (size > entryCursor - slotEnd) {
+			printf("Error: tried to read a page into a chunk of memory but it had corrupted metadata\n");
+			return false;
+		}
 		p->entries[i].data = malloc(size);
-		readArbitrary(p->entries[i].data, size, -(long)size, t);
-		jumpRel(-(long)size, t);
+		entryCursor -= size;
+		memcpy(p->entries[i].data, raw+entryCursor, size);
 	}
-	jump(prev, t);
 	return true;
 }
 
 /*
-reads a page from an address into a chunk of memory
-@param: p - a slotted page to load the data from disk into
+reads a node from an address into a chunk of memory
+@param: n - a node e to load the data from disk into
 */
 bool readNode(address addr, node* n, table* t) {
 	// checking dirty table
@@ -732,11 +695,17 @@ bool readNode(address addr, node* n, table* t) {
 		return true;
 	}
 
-	// otherwise search disk
-	address prev = t->cursor;
-	jump(addr, t);
+	// then the cache, which holds the nodes at the top of the tree as they were last committed. A node with
+	// a pending change was found above, so what the cache has is what the file has
+	if (n != NULL && nodeCacheGet(&t->nodeCache, addr, n)) return true;
 
-	if (readByte(0, t) != 1) {
+	// otherwise search disk
+	ubyte raw[t->nodeSize];
+	if (!consumeNodeRaw(raw, addr, t)) {
+		return false;
+	}
+
+	if (raw[0] != 1) {
 		printf("Error: attempted to read page at address %llu but page was invalid\n", addr);
 		return false;
 	}
@@ -746,40 +715,50 @@ bool readNode(address addr, node* n, table* t) {
 	}
 
 	// read metadata
-	// node layout: 0(1B) | parent(8B) | prev(8B) | next(8B) | childCount(4B) | maxKey(19B) | isLeaf(1B) |
-	//              children(8B each) | keys(19B each)
-	n->parent = readULong(1, t);
-	n->prev = readULong(9, t);
-	n->next = readULong(17, t);
-	n->childCount = readUInt(25, t);
-	n->maxKey = readPageNum(29, t);
-	n->isLeaf = readByte(48, t);
-
-	// read children
-	int offset = 49;
-	for (int i = 0; i < n->childCount; i++) {
-		n->children[i] = readULong(offset, t);
-		offset += 8;
+	// node layout: 1(1B) | parent(8B) | prev(8B) | next(8B) | childCount(4B) | maxKey | isLeaf(1B) |
+	//              children(8B each) | keys
+	// each key takes keySize bytes, which depends on the type of the table's keys
+	uint32_t keySize = keyDiskSize(t);
+	n->parent = readULong(raw+1);
+	n->prev = readULong(raw+9);
+	n->next = readULong(raw+17);
+	n->childCount = readUInt(raw+25);
+	if (n->childCount > M_GLOBAL) {
+		return false;
 	}
-	// read keys
+	n->maxKey = readOrderingKey(raw+29, t->keyType);
+	n->isLeaf = raw[NODE_HEADER_DISK_SIZE(keySize) - 1];
+
+	// check node size to prevent out of bounds accesses
 	int keylim = n->childCount;
 	if (!n->isLeaf) {
 		keylim--;
 	}
-	for (int i = 0; i < keylim; i++) {
-		n->keys[i] = readPageNum(offset, t);
-		offset += PAGE_NUM_DISK_SIZE;
+	if (NODE_HEADER_DISK_SIZE(keySize) + n->childCount*8 + keylim * keySize > t->nodeSize) {
+		return false;
 	}
 
-	// return to original cursor position
-	jump(prev, t);
+	// read children
+	int offset = NODE_HEADER_DISK_SIZE(keySize);
+	for (int i = 0; i < n->childCount; i++) {
+		n->children[i] = readULong(raw+offset);
+		offset += 8;
+	}
+	// read keys
+	for (int i = 0; i < keylim; i++) {
+		n->keys[i] = readOrderingKey(raw+offset, t->keyType);
+		offset += keySize;
+	}
+
+	// the cache keeps the node if it's the root or one of the root's children, so the next read is from memory
+	nodeCacheOffer(&t->nodeCache, addr, n, t->root);
 	return true;
 }
 // write page
 /*
 serializes the given page into a newly allocated buffer of exactly t->pageSize bytes (caller frees)
 page layout:
- | 0 | pageNum | usedData | numRecords | numEntries | arrCap |
+ | 0 | minKey | maxKey | usedData | numRecords | numEntries | arrCap |
  | maxEntries | maxSlots | slots | ... | records |
 
 the code in page.c -> hasSpace() relies on the number of bytes used to represent entry type and length
@@ -789,24 +768,28 @@ please feel free to change the design of this system because I feel unclean usin
 static char* serializePage(slotted_page* p, table* t) {
 	char* buffer = calloc(t->pageSize, 1);
 	// write header
-	// page header layout: 0(1B) | pageNum(19B) | usedData(4B) | numRecords(4B) |
-	//                     numEntries(4B) | arrCap(4B) | maxEntries(4B) | maxSlots(4B)  = 44B
+	// page header layout: 0(1B) | minKey | maxKey | usedData(4B) | numRecords(4B) |
+	//                     numEntries(4B) | arrCap(4B) | maxEntries(4B) | maxSlots(4B)  = PAGE_HEADER_DISK_SIZE
+	// each key takes keySize bytes, which depends on the type of the table's keys
+	uint32_t keySize = keyDiskSize(t);
 	header h = p->header;
-	writePageNumBytewise(buffer+1, h.pageNum);
-	writeUIntBytewise(buffer+20, h.usedData);
-	writeUIntBytewise(buffer+24, h.numRecords);
-	writeUIntBytewise(buffer+28, h.numEntries);
-	writeUIntBytewise(buffer+32, h.arrCap);
-	writeUIntBytewise(buffer+36, h.maxEntries);
-	writeUIntBytewise(buffer+40, h.maxSlots);
-	// write slots (each slot on disk: ID(9B) | len(4B) | size(4B) | ptr(4B) = 21B)
-	int offset = 44;
+	char* fields = buffer + 1 + 2 * keySize; // the fixed-size fields that follow the two keys
+	writeOrderingKeyBytewise(buffer+1, h.minKey, t->keyType);
+	writeOrderingKeyBytewise(buffer+1 + keySize, h.maxKey, t->keyType);
+	writeUIntBytewise(fields,    h.usedData);
+	writeUIntBytewise(fields+4,  h.numRecords);
+	writeUIntBytewise(fields+8,  h.numEntries);
+	writeUIntBytewise(fields+12, h.arrCap);
+	writeUIntBytewise(fields+16, h.maxEntries);
+	writeUIntBytewise(fields+20, h.maxSlots);
+	// write slots (each slot on disk: ID(keySize) | len(4B) | size(4B) | ptr(4B) = SP_SLOT_DISK_SIZE)
+	int offset = PAGE_HEADER_DISK_SIZE(keySize);
 	for (int i = 0; i < h.numRecords; i++) {
-		writePageOffsetBytewise(buffer+offset,    p->slots[i].ID);
-		writeUIntBytewise(buffer+offset+9,  p->slots[i].len);
-		writeUIntBytewise(buffer+offset+13, p->slots[i].size);
-		writeUIntBytewise(buffer+offset+17, p->slots[i].ptr);
-		offset += SP_SLOT_DISK_SIZE;
+		writeOrderingKeyBytewise(buffer+offset, p->slots[i].ID, t->keyType);
+		writeUIntBytewise(buffer+offset + keySize,     p->slots[i].len);
+		writeUIntBytewise(buffer+offset + keySize + 4, p->slots[i].size);
+		writeUIntBytewise(buffer+offset + keySize + 8, p->slots[i].ptr);
+		offset += SP_SLOT_DISK_SIZE(keySize);
 	}
 	// write records
 	int entryOffset = 0;
@@ -867,17 +850,19 @@ serializes the given node into a newly allocated buffer of exactly t->nodeSize b
 static char* serializeNode(node* n, table* t) {
 	char* buffer = calloc(t->nodeSize, 1);
 	// write metadata
-	// node layout: 0(1B) | parent(8B) | prev(8B) | next(8B) | childCount(4B) | maxKey(19B) | isLeaf(1B) |
-	//              children(8B each) | keys(19B each)
+	// node layout: 1(1B) | parent(8B) | prev(8B) | next(8B) | childCount(4B) | maxKey | isLeaf(1B) |
+	//              children(8B each) | keys
+	// each key takes keySize bytes, which depends on the type of the table's keys
+	uint32_t keySize = keyDiskSize(t);
 	buffer[0] = 1;
 	writeULongBytewise(buffer+1,  n->parent);
 	writeULongBytewise(buffer+9,  n->prev);
 	writeULongBytewise(buffer+17, n->next);
 	writeUIntBytewise(buffer+25,  n->childCount);
-	writePageNumBytewise(buffer+29, n->maxKey);
-	buffer[48] = n->isLeaf;
+	writeOrderingKeyBytewise(buffer+29, n->maxKey, t->keyType);
+	buffer[NODE_HEADER_DISK_SIZE(keySize) - 1] = n->isLeaf;
 	// write children
-	int offset = 49;
+	int offset = NODE_HEADER_DISK_SIZE(keySize);
 	for (int i = 0; i < n->childCount; i++) {
 		writeULongBytewise(buffer+offset, n->children[i]);
 		offset += 8;
@@ -886,8 +871,8 @@ static char* serializeNode(node* n, table* t) {
 	int keylim = n->childCount;
 	if (!n->isLeaf) keylim--;
 	for (int i = 0; i < keylim; i++) {
-		writePageNumBytewise(buffer+offset, n->keys[i]);
-		offset += PAGE_NUM_DISK_SIZE;
+		writeOrderingKeyBytewise(buffer+offset, n->keys[i], t->keyType);
+		offset += keySize;
 	}
 	return buffer;
 }
@@ -900,6 +885,8 @@ static void writeNode(node* n, address address, table* t) {
 	char* buffer = serializeNode(n, t);
 	fwrite(buffer, 1, t->nodeSize, t->source);
 	free(buffer);
+	// this is the only place a node's contents in the file change, so a cached copy is replaced here
+	nodeCacheUpdate(&t->nodeCache, address, n);
 }
 
 /*
@@ -1080,6 +1067,9 @@ void rollbackStatement(table* t) {
 	}
 	t->pageFree    = u->pageFree;
 	t->nodeFree    = u->nodeFree;
+	// a statement that gave the tree a different root left the cache filling from that root (see setRoot() in
+	// bplus.c). The old root is back, so the cache starts again from it
+	if (t->root != u->root) nodeCacheClear(&t->nodeCache);
 	t->root        = u->root;
 	t->pageStripes = u->pageStripes;
 	t->nodeStripes = u->nodeStripes;
@@ -1092,9 +1082,13 @@ void rollbackStatement(table* t) {
 
 // mark page dirty
 void markPage(address address, slotted_page* p, table* t) {
+	// remember page incase a statement-level rollback is necessary
 	rememberPage(address, t);
+	// look to see if page has already been modified
 	slotted_page* existing = (slotted_page*)findAddrTable(address, &t->pageDirty);
 	if (existing) {
+		if (existing == p) return; // p is the pending version itself
+		freeSPage(existing); // the pending version is replaced, not added to
 		copyPage(p, existing);
 		return;
 	}
@@ -1128,6 +1122,7 @@ void deleteObject(address address, table* t) {
 	char code = GARBAGE_MARKER;
 	jump(address, t);
 	fwrite(&code, 1, 1, t->source);
+	nodeCacheRemove(&t->nodeCache, address); // if it was a node at the top of the tree, it's gone from there too
 }
 
 static bool isDirty(table* t) {

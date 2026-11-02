@@ -92,6 +92,7 @@ static void repl() {
         clock_gettime(CLOCK_MONOTONIC, &end); // end timer
 
         if (result.print) printResult(result);
+        freeVM(); // the result has been printed, so its rows and their strings can go
         printTime(&start, &end);
     }
 }
@@ -107,15 +108,17 @@ static char* isolateQuery(int* start, int len, const char* source) {
     bool lineComment = false;
     bool multiLineComment = false;
     for (int i = *start; i <= len; i++) {
-        if (lineComment) {
-            if (source[i] != '\n') continue;
-            lineComment = false;
+        // a comment ends at its terminator or at the end of the file, where the '\0' case below
+        // returns what's left
+        if (lineComment && source[i] != '\0') {
+            if (source[i] == '\n') lineComment = false;
             continue;
-
         }
-        if (multiLineComment) {
-            if (source[i] != '*' || PEEK() != '/') continue;
-            multiLineComment = false;
+        if (multiLineComment && source[i] != '\0') {
+            if (source[i] == '*' && PEEK() == '/') {
+                i++; // the closing '/' is part of the comment, so it can't open another one
+                multiLineComment = false;
+            }
             continue;
         }
         switch (source[i]) {
@@ -127,18 +130,19 @@ static char* isolateQuery(int* start, int len, const char* source) {
                 if (PEEK() == '\'') i++;
                 break;
             }
+            // comments don't start inside a string
             case '-':
-                if (PEEK() == '-') {
+                if (!singleQuote && PEEK() == '-') {
                     i++;
                     lineComment = true;
                 }
                 break;
             case '/': {
-                if (PEEK() == '*') {
+                if (!singleQuote && PEEK() == '*') {
                     i++;
                     multiLineComment = true;
-                    break;
                 }
+                break; // a lone '/' is division; without this it fell through and ended the statement
             }
             case ';': {
                 if (singleQuote) continue;
@@ -242,29 +246,20 @@ static void runFile(const char* path) {
         }
         if (result.print) printResult(result);
         queriesProcessed++;
+        freeVM(); // the result has been printed, so its rows and their strings can go
     }
     clock_gettime(CLOCK_MONOTONIC, &end); // end timer
     if (queriesProcessed > 0) printTime(&start, &end);
     // cleanup
     free(source);
-    if (exCode) exit(exCode);
+    if (exCode) {
+        closeTableCache();
+        exit(exCode);
+    }
 }
 
 int main(int argc, char** argv) {
-    /*test_page();
-    test_tableio();
-    test_table_mgmt();
-    test_btree();
-    test_file();
-    test_wal();
-    test_chunk();
-    test_value();
-    test_lexer();
-    test_parser();
-    test_hashtable();
-    test_schema();
-    test_generator();
-    test_vm();*/
+    // the unit tests have their own entry point: src/run_tests.c, run with `make test`
 
     // only one process may use the database at a time; the lock is held until this process exits,
     // and the OS releases it even after a crash. It's taken before recovery so recovery can never
@@ -302,5 +297,6 @@ int main(int argc, char** argv) {
     } else {
         printf("Usage: ./main [SQL file] [-d]\n");
     }
+    closeTableCache();
     return 0;
 }

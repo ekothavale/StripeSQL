@@ -5,7 +5,7 @@ CFLAGS = -I$(SRC) -I$(SQL) -I$(STOR) -O3
 
 OBJS = main.o debug.o \
        chunk.o generator.o lexer.o memory.o parser.o schema.o value.o vm.o \
-       bplus.o file.o ordering.o page.o tableIO.o wal.o stor_testing.o sql_testing.o
+       bplus.o cache.o file.o ordering.o page.o tableIO.o wal.o stor_testing.o sql_testing.o
 
 ASAN = -fsanitize=address
 
@@ -20,7 +20,54 @@ clean:
 crashtest: main
 	python3 crashtest/crashtest.py
 
-.PHONY: clean crashtest
+# --- tests and coverage ---
+# the unit tests (src/run_tests.c) create and delete tables and the schema file, so every target
+# below builds and runs in a throwaway directory and never touches tables/
+
+MAIN_SRCS = $(filter-out $(SRC)/run_tests.c, $(wildcard $(SRC)/*.c)) $(wildcard $(SQL)/*.c) $(wildcard $(STOR)/*.c)
+TEST_SRCS = $(filter-out $(SRC)/main.c, $(wildcard $(SRC)/*.c)) $(wildcard $(SQL)/*.c) $(wildcard $(STOR)/*.c)
+COVFLAGS  = -I$(SRC) -I$(SQL) -I$(STOR) -O0 -g -fprofile-instr-generate -fcoverage-mapping
+COV_IGNORE = 'testing\.c|run_tests\.c'
+LLVM_PROFDATA ?= xcrun llvm-profdata
+LLVM_COV ?= xcrun llvm-cov
+
+test:
+	@dir=$$(mktemp -d); mkdir $$dir/tables; \
+	clang $(CFLAGS) -g $(TEST_SRCS) -o $$dir/run_tests && (cd $$dir && ./run_tests); \
+	status=$$?; rm -rf $$dir; exit $$status
+
+# line, function and branch coverage of the unit tests (test code excluded)
+coverage:
+	@dir=$$(mktemp -d); mkdir $$dir/tables; \
+	clang $(COVFLAGS) $(TEST_SRCS) -o $$dir/run_tests && \
+	(cd $$dir && LLVM_PROFILE_FILE=$$dir/unit.profraw ./run_tests > /dev/null) && \
+	$(LLVM_PROFDATA) merge -sparse $$dir/unit.profraw -o $$dir/all.profdata && \
+	$(LLVM_COV) report $$dir/run_tests -instr-profile=$$dir/all.profdata -ignore-filename-regex=$(COV_IGNORE); \
+	status=$$?; rm -rf $$dir; exit $$status
+
+# the unit tests plus the crash-recovery test, run against an instrumented binary (macOS only, under a minute)
+# processes the crash test kills can leave unreadable profiles, so merging skips them (--failure-mode=all)
+coverage-full:
+	@dir=$$(mktemp -d); mkdir $$dir/tables $$dir/profiles; \
+	clang $(COVFLAGS) $(TEST_SRCS) -o $$dir/run_tests && \
+	clang $(COVFLAGS) $(MAIN_SRCS) -o $$dir/main && \
+	(cd $$dir && LLVM_PROFILE_FILE=$$dir/profiles/unit.profraw ./run_tests > /dev/null) && \
+	LLVM_PROFILE_FILE=$$dir/profiles/crash-%p.profraw STRIPESQL_BIN=$$dir/main python3 crashtest/crashtest.py && \
+	$(LLVM_PROFDATA) merge -sparse --failure-mode=all $$dir/profiles/*.profraw -o $$dir/all.profdata 2>/dev/null && \
+	$(LLVM_COV) report $$dir/main -object $$dir/run_tests -instr-profile=$$dir/all.profdata -ignore-filename-regex=$(COV_IGNORE); \
+	status=$$?; rm -rf $$dir; exit $$status
+
+# --- benchmarks and profiling (see bench/) ---
+# make bench BENCH="lookup batch" runs a subset; make profile PROFILE="lookup --io" likewise
+
+bench: main
+	python3 bench/bench.py $(BENCH)
+
+# macOS only
+profile: main
+	python3 bench/profile.py $(PROFILE)
+
+.PHONY: clean crashtest test coverage coverage-full bench profile
 
 # --- core ---
 
@@ -67,6 +114,9 @@ vm.o: $(SQL)/vm.c $(SQL)/vm.h $(SQL)/parser.h $(SQL)/chunk.h \
 bplus.o: $(STOR)/bplus.c $(STOR)/bplus.h
 	clang $(CFLAGS) -c $(STOR)/bplus.c -o bplus.o
 
+cache.o: $(STOR)/cache.c $(STOR)/cache.h $(STOR)/node.h $(SRC)/common.h
+	clang $(CFLAGS) -c $(STOR)/cache.c -o cache.o
+
 file.o: $(STOR)/file.c $(STOR)/file.h $(SRC)/common.h $(SRC)/const.h
 	clang $(CFLAGS) -c $(STOR)/file.c -o file.o
 
@@ -76,7 +126,7 @@ ordering.o: $(STOR)/ordering.c $(STOR)/ordering.h $(SRC)/value.h
 page.o: $(STOR)/page.c $(STOR)/page.h $(SRC)/common.h
 	clang $(CFLAGS) -c $(STOR)/page.c -o page.o
 
-tableIO.o: $(STOR)/tableIO.c $(STOR)/tableIO.h $(STOR)/file.h $(STOR)/wal.h
+tableIO.o: $(STOR)/tableIO.c $(STOR)/tableIO.h $(STOR)/cache.h $(STOR)/file.h $(STOR)/wal.h
 	clang $(CFLAGS) -c $(STOR)/tableIO.c -o tableIO.o
 
 wal.o: $(STOR)/wal.c $(STOR)/wal.h $(STOR)/file.h $(SRC)/common.h $(SRC)/const.h

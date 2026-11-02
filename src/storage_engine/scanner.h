@@ -45,4 +45,10 @@ typedef struct scanner {
 
 	// CHANGE TO UINT8_T for consistency
 	int pkIdx;			 // the column containing the primary key in the input query (-1 = no pk)
+
+	// strings copied out of the current row for the VM's stack (scanner-owned). They are freed when the
+	// scanner moves to another row or closes, so nothing that pops one has to free it
+	char** scratch;
+	int scratchCount;
+	int scratchCap;
 } scanner;

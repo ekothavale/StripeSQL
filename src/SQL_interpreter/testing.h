@@ -67,6 +67,7 @@ void test_read_ht_missing();
 void test_read_ht_correct_data();
 void test_delete_ht_removes_entry();
 void test_delete_ht_zeroes_fields();
+void test_insert_ht_many_entries();
 void test_delete_ht_nonexistent();
 
 /* Value tests */
@@ -96,6 +97,9 @@ void test_scan_empty_string();
 void test_scan_unterminated_string();
 void test_scan_skips_whitespace();
 void test_scan_skips_comment();
+void test_scan_skips_block_comment();
+void test_scan_unterminated_block_comment();
+void test_scan_slash_is_still_division();
 void test_scan_line_tracking();
 void test_init_tokenized();
 void test_add_token_count();
@@ -116,6 +120,16 @@ void test_interpret_no_schema_returns_load_error();
 void test_interpret_select_projection_types();
 void test_interpret_failed_statement_rolls_back();
 void test_interpret_errors_halt_statements();
+void test_interpret_block_comments();
+void test_interpret_text_results();
+void test_interpret_text_operands_released();
+void test_interpret_ordering_comparisons();
+void test_interpret_filtered_delete();
+void test_interpret_update_resizes_rows();
+void test_interpret_row_too_large();
+void test_interpret_scans_in_key_order();
+void test_interpret_key_of_wrong_type();
+void test_interpret_table_cache();
 
 /* Generator tests */
 void test_generator();

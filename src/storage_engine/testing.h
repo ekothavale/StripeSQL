@@ -25,10 +25,25 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 #include "bplus.h"
 #include "page.h"
 
+/* Ordering key tests */
+void test_ordering_int_keys(void);
+void test_ordering_text_keys(void);
+void test_ordering_float_keys(void);
+void test_ordering(void);   /* runs all of the above */
+
+/* Node cache tests */
+void test_node_cache_zeroed_is_inert(void);
+void test_node_cache_keeps_top_two_levels(void);
+void test_node_cache_get_copies(void);
+void test_node_cache_update_remove_clear(void);
+void test_node_cache_full(void);
+void test_node_cache_random_operations(void);
+void test_node_cache(void);   /* runs all of the above */
+
 /* B+ tree integration tests */
 void test_btree();
-void test_btree_find_initial(void);
-void test_btree_find_nonexistent(void);
+void test_btree_find_empty(void);
+void test_btree_find_covering_page(void);
 void test_btree_record_add(void);
 void test_btree_record_update(void);
 void test_btree_record_delete(void);
@@ -37,15 +52,28 @@ void test_btree_commit_persist(void);
 void test_btree_commit_delete_persist(void);
 void test_btree_commit_skips_clean(void);
 void test_btree_commit_apply_failure_recovers(void);
-void test_btree_insert_new_page(void);
-void test_btree_insert_existing_page(void);
-void test_btree_split_structure(void);
-void test_btree_split_find_all(void);
-void test_btree_split_linked_list(void);
-void test_btree_split_non_last_child(void);
-void test_btree_delete_page(void);
-void test_btree_delete_triggers_borrow(void);
-void test_btree_delete_triggers_merge(void);
+void test_btree_insert_fills_one_page(void);
+void test_btree_insert_too_large(void);
+void test_btree_page_split_in_order(void);
+void test_btree_page_split_in_the_middle(void);
+void test_btree_page_split_three_ways(void);
+void test_btree_update_grows_row(void);
+void test_btree_smallest_key(void);
+void test_btree_key_of_another_type(void);
+void test_btree_new_tree_before_commit(void);
+void test_btree_rows_per_page_follow_key_size(void);
+void test_btree_node_cache_serves_reads(void);
+void test_btree_node_cache_follows_commits(void);
+void test_btree_node_cache_pending_changes(void);
+void test_btree_node_cache_root_changes(void);
+void test_btree_small_rows_in_random_order(void);
+void test_btree_node_split(void);
+void test_btree_delete_from_the_end(void);
+void test_btree_delete_from_the_middle(void);
+void test_btree_delete_alternating(void);
+void test_btree_delete_random_deep(void);
+void test_btree_emptied_tree_takes_rows(void);
+void test_btree_store_page(void);
 void test_btree_full_roundtrip(void);
 void test_btree_delete_tree(void);
 void test_btree_delete_tree_not_reloadable(void);
@@ -70,6 +98,8 @@ void test_page_read();
 void test_page_delete();
 void test_page_update();
 void test_page_multiple_records();
+void test_page_full_keys(void);
+void test_page_key_bounds(void);
 void test_page();   /* runs all of the above */
 
 /* TableIO tests */

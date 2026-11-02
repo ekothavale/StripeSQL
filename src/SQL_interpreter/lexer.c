@@ -128,7 +128,23 @@ static void skipWhitespace() {
                     return;
                 }
                 break;
-            // multi-line comment support to-be-added
+            case '/': // multi-line comments are '/* ... */' and don't nest
+                if (peekNext() == '*') {
+                    advance();
+                    advance();
+                    while (!isAtEnd() && !(peek() == '*' && peekNext() == '/')) {
+                        if (peek() == '\n') lex.line++;
+                        advance();
+                    }
+                    // step past the closing '*/'; a comment that is never closed runs to the end of the input
+                    if (!isAtEnd()) {
+                        advance();
+                        advance();
+                    }
+                } else {
+                    return;
+                }
+                break;
             default:
                 return;
         }
