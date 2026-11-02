@@ -463,9 +463,9 @@ static table* initTable(char* tablename, ordering_type keyType) {
 	t->metalen       = METALEN * 4;
 	t->pageStripes   = 1;
 	t->nodeStripes   = 1;
-	t->pageStripeLen = 8;
-	t->nodeStripeLen = 8;
-	t->pageNodeRatio = 1;
+	t->pageStripeLen = 1;
+	t->nodeStripeLen = 1;
+	t->pageNodeRatio = M_GLOBAL / 2; // somewhat arbitrary
 	t->pageSize      = PAGE_SIZE;
 	t->keyType       = keyType;
 	t->nodeSize      = NODE_DISK_SIZE(keyDiskSize(t));
